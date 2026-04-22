@@ -10,6 +10,24 @@ Published image:
 ghcr.io/bwbama85/unraid-cache-cleaner:latest
 ```
 
+## Fastest Install
+
+Run this on your Unraid server over SSH:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BWBama85/unraid-cache-cleaner/main/scripts/install-unraid-template.sh | bash
+```
+
+That installs the XML template into Unraid's user template folder. After that:
+
+1. Open the Docker tab.
+2. Click Add Container.
+3. Select `unraid-cache-cleaner`.
+4. Set your qBittorrent URL, username, password, and host download path.
+5. Start with `DRY_RUN=true`.
+
+If you prefer to inspect the script first, it lives at [scripts/install-unraid-template.sh](../scripts/install-unraid-template.sh).
+
 Example:
 
 - qBittorrent writes to `/data`
@@ -67,9 +85,8 @@ Let it run in dry-run mode for a while. Review `/config/last-run.json`. Once the
 
 ## Community Applications Template
 
-A starter XML template is included at [contrib/unraid-cache-cleaner.xml](../contrib/unraid-cache-cleaner.xml). It already points at the published GHCR image and repo URLs. You will still need to set:
+A starter XML template is included at [contrib/unraid-cache-cleaner.xml](../contrib/unraid-cache-cleaner.xml). It already points at the published GHCR image and repo URLs. The install script above copies this file into Unraid's standard user-template location for you. You will still need to set:
 
-- your image repository
 - qBittorrent URL
 - credentials
 - the correct host paths

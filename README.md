@@ -28,6 +28,16 @@ The safety rule is simple: content that still belongs to any torrent present in 
 
 ## Quick Start
 
+### Unraid one-line install
+
+On your Unraid server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BWBama85/unraid-cache-cleaner/main/scripts/install-unraid-template.sh | bash
+```
+
+That drops the Docker template into Unraid for you. Then go to the Docker tab, add the `unraid-cache-cleaner` container from the template, fill in your qBittorrent connection details, and leave `DRY_RUN=true` for the first start.
+
 ### 1. Mount the same internal path qBittorrent uses
 
 If qBittorrent writes to `/data`, mount that exact same host path into this container at `/data` too. That removes most path mapping ambiguity.
