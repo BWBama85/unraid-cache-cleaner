@@ -4,6 +4,12 @@
 
 Run `unraid-cache-cleaner` as its own container and mount the same download path qBittorrent uses at the same internal path.
 
+Published image:
+
+```text
+ghcr.io/bwbama85/unraid-cache-cleaner:latest
+```
+
 Example:
 
 - qBittorrent writes to `/data`
@@ -61,7 +67,7 @@ Let it run in dry-run mode for a while. Review `/config/last-run.json`. Once the
 
 ## Community Applications Template
 
-A starter XML template is included at [contrib/unraid-cache-cleaner.xml](../contrib/unraid-cache-cleaner.xml). You will still need to set:
+A starter XML template is included at [contrib/unraid-cache-cleaner.xml](../contrib/unraid-cache-cleaner.xml). It already points at the published GHCR image and repo URLs. You will still need to set:
 
 - your image repository
 - qBittorrent URL
@@ -81,4 +87,3 @@ The cleaner can still work, but it has less context for protecting extracted out
 ### Credentials left empty
 
 The service will not use container-local unauthenticated access. Configure WebUI credentials.
-

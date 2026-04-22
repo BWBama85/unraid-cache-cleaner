@@ -1,18 +1,18 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>unraid-cache-cleaner</Name>
-  <Repository>ghcr.io/your-user/unraid-cache-cleaner:latest</Repository>
+  <Repository>ghcr.io/bwbama85/unraid-cache-cleaner:latest</Repository>
   <Registry>https://ghcr.io</Registry>
   <Network>bridge</Network>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/your-user/unraid-cache-cleaner/issues</Support>
-  <Project>https://github.com/your-user/unraid-cache-cleaner</Project>
+  <Support>https://github.com/BWBama85/unraid-cache-cleaner/issues</Support>
+  <Project>https://github.com/BWBama85/unraid-cache-cleaner</Project>
   <Overview>Polls qBittorrent and safely deletes untracked leftovers from a mounted Unraid cache/download path after a grace period.</Overview>
   <Category>Downloaders:</Category>
   <WebUI />
-  <TemplateURL>https://raw.githubusercontent.com/your-user/unraid-cache-cleaner/main/contrib/unraid-cache-cleaner.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/your-user/unraid-cache-cleaner/main/docs/icon.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/BWBama85/unraid-cache-cleaner/main/contrib/unraid-cache-cleaner.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/BWBama85/unraid-cache-cleaner/main/docs/icon.svg</Icon>
   <ExtraParams />
   <PostArgs />
   <CPUset />

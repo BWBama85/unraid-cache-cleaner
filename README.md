@@ -93,6 +93,14 @@ If `WATCH_PATHS` is empty, the service falls back to qBittorrent's default save 
 
 ## Packaging
 
+### Hosted Container
+
+The repo publishes a container image automatically from GitHub Actions to:
+
+```bash
+ghcr.io/bwbama85/unraid-cache-cleaner:latest
+```
+
 ### Local
 
 ```bash
@@ -117,7 +125,7 @@ docker run --rm \
 
 ### Unraid
 
-See [docs/unraid.md](docs/unraid.md). A starter container template is included at [contrib/unraid-cache-cleaner.xml](contrib/unraid-cache-cleaner.xml).
+See [docs/unraid.md](docs/unraid.md). A starter container template is included at [contrib/unraid-cache-cleaner.xml](contrib/unraid-cache-cleaner.xml), and the default repository path is the published GHCR image.
 
 ## Project Layout
 

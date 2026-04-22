@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title>Unraid Cache Cleaner</title>
+  <desc>Blue storage container with a white sweep arc and an orange cleanup badge.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#17324d"/>
+      <stop offset="100%" stop-color="#2f7dbd"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#ffb347"/>
+      <stop offset="100%" stop-color="#ff7a1a"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <rect x="22" y="34" width="84" height="50" rx="8" fill="#eff7ff" opacity="0.15"/>
+  <path d="M28 44h72v30H28z" fill="#dbeeff"/>
+  <path d="M28 44h72v9H28z" fill="#7ab4e3"/>
+  <path d="M38 60h52" stroke="#2f7dbd" stroke-width="6" stroke-linecap="round"/>
+  <path d="M38 72h40" stroke="#2f7dbd" stroke-width="6" stroke-linecap="round" opacity="0.7"/>
+  <path d="M42 100c18 0 33-14 35-32" fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
+  <path d="M70 63l12 4-5 11" fill="none" stroke="#ffffff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="94" cy="94" r="16" fill="url(#accent)"/>
+  <path d="M87 94h14" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+  <path d="M94 87v14" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+
