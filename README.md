@@ -133,6 +133,12 @@ docker run --rm \
   unraid-cache-cleaner scan
 ```
 
+The published image also supports:
+
+```bash
+docker run --rm ghcr.io/bwbama85/unraid-cache-cleaner:latest scan
+```
+
 ### Unraid
 
 See [docs/unraid.md](docs/unraid.md). A starter container template is included at [contrib/unraid-cache-cleaner.xml](contrib/unraid-cache-cleaner.xml), and the default repository path is the published GHCR image.

@@ -19,4 +19,5 @@ RUN pip install --no-cache-dir .
 
 VOLUME ["/config", "/data"]
 
-CMD ["unraid-cache-cleaner", "service"]
+ENTRYPOINT ["unraid-cache-cleaner"]
+CMD ["service"]
