@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.mypy_cache/
+.venv/
+build/
+dist/
+*.sqlite3
+*.json
+!.github/
+

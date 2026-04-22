@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>unraid-cache-cleaner</Name>
+  <Repository>ghcr.io/your-user/unraid-cache-cleaner:latest</Repository>
+  <Registry>https://ghcr.io</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/your-user/unraid-cache-cleaner/issues</Support>
+  <Project>https://github.com/your-user/unraid-cache-cleaner</Project>
+  <Overview>Polls qBittorrent and safely deletes untracked leftovers from a mounted Unraid cache/download path after a grace period.</Overview>
+  <Category>Downloaders:</Category>
+  <WebUI />
+  <TemplateURL>https://raw.githubusercontent.com/your-user/unraid-cache-cleaner/main/contrib/unraid-cache-cleaner.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/your-user/unraid-cache-cleaner/main/docs/icon.png</Icon>
+  <ExtraParams />
+  <PostArgs />
+  <CPUset />
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/unraid-cache-cleaner" Mode="rw" Description="Persistent state and reports" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/unraid-cache-cleaner</Config>
+  <Config Name="Downloads" Target="/data" Default="/mnt/cache/downloads" Mode="rw" Description="Mount the same path qBittorrent uses internally" Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/downloads</Config>
+  <Config Name="QBITTORRENT_URL" Target="QBITTORRENT_URL" Default="http://qbittorrent:8080" Mode="" Description="qBittorrent WebUI URL" Type="Variable" Display="always" Required="true" Mask="false">http://qbittorrent:8080</Config>
+  <Config Name="QBITTORRENT_USERNAME" Target="QBITTORRENT_USERNAME" Default="" Mode="" Description="qBittorrent WebUI username" Type="Variable" Display="always" Required="true" Mask="false" />
+  <Config Name="QBITTORRENT_PASSWORD" Target="QBITTORRENT_PASSWORD" Default="" Mode="" Description="qBittorrent WebUI password" Type="Variable" Display="always" Required="true" Mask="true" />
+  <Config Name="WATCH_PATHS" Target="WATCH_PATHS" Default="/data" Mode="" Description="Comma-separated mounted roots to scan" Type="Variable" Display="advanced" Required="false" Mask="false">/data</Config>
+  <Config Name="DRY_RUN" Target="DRY_RUN" Default="true" Mode="" Description="Set false only after reviewing dry-run output" Type="Variable" Display="always" Required="true" Mask="false">true</Config>
+  <Config Name="ORPHAN_GRACE_SECONDS" Target="ORPHAN_GRACE_SECONDS" Default="21600" Mode="" Description="Seconds a file must stay orphaned before deletion" Type="Variable" Display="advanced" Required="false" Mask="false">21600</Config>
+  <Config Name="MIN_FILE_AGE_SECONDS" Target="MIN_FILE_AGE_SECONDS" Default="1800" Mode="" Description="Minimum file age before deletion" Type="Variable" Display="advanced" Required="false" Mask="false">1800</Config>
+  <Config Name="POLL_INTERVAL_SECONDS" Target="POLL_INTERVAL_SECONDS" Default="300" Mode="" Description="Delay between scans in service mode" Type="Variable" Display="advanced" Required="false" Mask="false">300</Config>
+</Container>
