@@ -44,10 +44,17 @@ def _parse_path_list(value: Optional[str]) -> tuple[Path, ...]:
 
 
 def _parse_glob_list(value: Optional[str]) -> tuple[str, ...]:
-    if value is None or value.strip() == "":
-        return DEFAULT_EXCLUDED_GLOBS
-    parts = [item.strip() for item in value.split(",")]
-    return tuple(item for item in parts if item)
+    user_globs = []
+    if value is not None:
+        user_globs = [item.strip() for item in value.split(",") if item.strip()]
+    # User-provided globs are added to the built-in defaults, not substituted for
+    # them, so common junk (*.part, *.!qB, .DS_Store, ...) stays excluded even when
+    # EXCLUDED_GLOBS is set. Order is preserved and duplicates are dropped.
+    merged: list[str] = []
+    for glob in (*DEFAULT_EXCLUDED_GLOBS, *user_globs):
+        if glob not in merged:
+            merged.append(glob)
+    return tuple(merged)
 
 
 @dataclass(frozen=True)

@@ -72,6 +72,8 @@ DRY_RUN=true
 
 If your mounted download root also contains non-torrent files you want to keep, exclude them explicitly. This matters when you keep helper scripts or log folders directly under `/data`.
 
+`EXCLUDED_GLOBS` is **added to** a built-in default list (`.DS_Store`, `Thumbs.db`, `*.part`, `*.!qB`, and other junk/temp patterns), so you only need to list your own extras — the defaults stay in effect either way.
+
 Patterns without a slash match by basename. Patterns with a slash match the full in-container path.
 
 ## Recommended First Run
