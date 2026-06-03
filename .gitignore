@@ -9,4 +9,5 @@ dist/
 *.sqlite3
 *.json
 !.github/
+.DS_Store
 

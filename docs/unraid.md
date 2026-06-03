@@ -66,8 +66,13 @@ QBITTORRENT_URL=http://qbittorrent:8080
 QBITTORRENT_USERNAME=admin
 QBITTORRENT_PASSWORD=change-me
 WATCH_PATHS=/data
+EXCLUDED_GLOBS=/data/logs/*,/data/orphaned-files/*,find_duplicates.sh,rar_extractor.sh,video_folders.log
 DRY_RUN=true
 ```
+
+If your mounted download root also contains non-torrent files you want to keep, exclude them explicitly. This matters when you keep helper scripts or log folders directly under `/data`.
+
+Patterns without a slash match by basename. Patterns with a slash match the full in-container path.
 
 ## Recommended First Run
 
@@ -81,6 +86,12 @@ DELETE_EMPTY_DIRS=true
 PROTECT_SINGLE_FILE_PARENT_DIRS=true
 ```
 
+For a qB root that also contains helper files, add:
+
+```text
+EXCLUDED_GLOBS=/data/logs/*,/data/orphaned-files/*,find_duplicates.sh,rar_extractor.sh,video_folders.log
+```
+
 Let it run in dry-run mode for a while. Review `/config/last-run.json`. Once the results are clean, switch `DRY_RUN=false`.
 
 ## Community Applications Template
@@ -90,6 +101,7 @@ A starter XML template is included at [contrib/unraid-cache-cleaner.xml](../cont
 - qBittorrent URL
 - credentials
 - the correct host paths
+- any `EXCLUDED_GLOBS` needed to keep non-torrent files under the watch root
 
 ## Common Misconfiguration
 

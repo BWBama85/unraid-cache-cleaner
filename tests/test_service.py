@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.config import Config
 from unraid_cache_cleaner.models import TorrentRecord
+from unraid_cache_cleaner.planner import normalize_path
 from unraid_cache_cleaner.service import CleanerService
 from unraid_cache_cleaner.state import StateStore
 
@@ -115,6 +116,47 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(orphan_dir.exists())
             self.assertTrue(active_file.exists())
             self.assertEqual({action.action for action in report.actions}, {"delete", "rmdir"})
+
+    def test_excluded_globs_keep_non_torrent_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watch_root = root / "data"
+            config_root = root / "config"
+            logs_dir = watch_root / "logs"
+            logs_dir.mkdir(parents=True)
+            config_root.mkdir()
+
+            excluded_file = logs_dir / "script.log"
+            orphan_file = watch_root / "orphan.mkv"
+            excluded_file.write_text("keep")
+            orphan_file.write_text("delete")
+
+            config = Config(
+                qbittorrent_url="http://qbt:8080",
+                qbittorrent_username="admin",
+                qbittorrent_password="secret",
+                qbittorrent_timeout_seconds=15,
+                qbittorrent_verify_tls=True,
+                watch_paths=(watch_root,),
+                poll_interval_seconds=300,
+                orphan_grace_seconds=0,
+                min_file_age_seconds=0,
+                dry_run=True,
+                delete_empty_dirs=True,
+                protect_single_file_parent_dirs=True,
+                excluded_globs=("script.log",),
+                state_db_path=config_root / "state.sqlite3",
+                report_path=config_root / "last-run.json",
+                log_level="INFO",
+            )
+            config.ensure_directories()
+            service = CleanerService(config, FakeClient([], watch_root), StateStore(config.state_db_path))
+
+            report = service.run_once()
+
+            self.assertEqual(report.eligible_count, 1)
+            self.assertEqual(report.actions[0].path, normalize_path(orphan_file))
+            self.assertNotEqual(report.actions[0].path, normalize_path(excluded_file))
 
 
 if __name__ == "__main__":

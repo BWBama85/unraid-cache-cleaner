@@ -22,6 +22,7 @@
   <Config Name="QBITTORRENT_USERNAME" Target="QBITTORRENT_USERNAME" Default="" Mode="" Description="qBittorrent WebUI username" Type="Variable" Display="always" Required="true" Mask="false" />
   <Config Name="QBITTORRENT_PASSWORD" Target="QBITTORRENT_PASSWORD" Default="" Mode="" Description="qBittorrent WebUI password" Type="Variable" Display="always" Required="true" Mask="true" />
   <Config Name="WATCH_PATHS" Target="WATCH_PATHS" Default="/data" Mode="" Description="Comma-separated mounted roots to scan" Type="Variable" Display="advanced" Required="false" Mask="false">/data</Config>
+  <Config Name="EXCLUDED_GLOBS" Target="EXCLUDED_GLOBS" Default="" Mode="" Description="Comma-separated basename or full-path globs to skip, useful for helper scripts or log folders living under /data" Type="Variable" Display="advanced" Required="false" Mask="false" />
   <Config Name="DRY_RUN" Target="DRY_RUN" Default="true" Mode="" Description="Set false only after reviewing dry-run output" Type="Variable" Display="always" Required="true" Mask="false">true</Config>
   <Config Name="QBITTORRENT_TIMEOUT_SECONDS" Target="QBITTORRENT_TIMEOUT_SECONDS" Default="15" Mode="" Description="HTTP timeout when polling qBittorrent" Type="Variable" Display="advanced" Required="false" Mask="false">15</Config>
   <Config Name="QBITTORRENT_VERIFY_TLS" Target="QBITTORRENT_VERIFY_TLS" Default="true" Mode="" Description="Disable only if your qBittorrent WebUI uses a self-signed certificate" Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>

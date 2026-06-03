@@ -50,6 +50,7 @@ QBITTORRENT_USERNAME=admin
 QBITTORRENT_PASSWORD=change-me
 DRY_RUN=true
 WATCH_PATHS=/data
+EXCLUDED_GLOBS=/data/logs/*,/data/orphaned-files/*,find_duplicates.sh,rar_extractor.sh,video_folders.log
 ```
 
 A starter env file is included at [.env.example](.env.example).
@@ -101,6 +102,14 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 
 If `WATCH_PATHS` is empty, the service falls back to qBittorrent's default save path plus any `save_path` values currently used by torrents. In practice, explicitly setting `WATCH_PATHS` is better on Unraid.
 
+If your watch root also contains helper scripts, logs, or scratch folders that are not managed by qBittorrent, add them to `EXCLUDED_GLOBS`. Patterns without a slash match by basename. Patterns with a slash match against the full path inside the container.
+
+Example:
+
+```bash
+EXCLUDED_GLOBS=/data/logs/*,/data/orphaned-files/*,find_duplicates.sh,rar_extractor.sh,video_folders.log
+```
+
 ## Packaging
 
 ### Hosted Container
@@ -127,6 +136,7 @@ docker run --rm \
   -e QBITTORRENT_USERNAME=admin \
   -e QBITTORRENT_PASSWORD=change-me \
   -e WATCH_PATHS=/data \
+  -e EXCLUDED_GLOBS='/data/logs/*,/data/orphaned-files/*,find_duplicates.sh,rar_extractor.sh,video_folders.log' \
   -e DRY_RUN=true \
   -v /mnt/user/appdata/unraid-cache-cleaner:/config \
   -v /mnt/cache/downloads:/data \
