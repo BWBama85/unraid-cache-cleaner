@@ -116,3 +116,19 @@ The cleaner can still work, but it has less context for protecting extracted out
 ### Credentials left empty
 
 The service will not use container-local unauthenticated access. Configure WebUI credentials.
+
+## Troubleshooting
+
+Three read-only scripts in [`scripts/`](../scripts) help diagnose a cleaner that connects to qBittorrent but flags the wrong files (or nothing). Run them on the Unraid server. None of them delete anything.
+
+| Script | What it checks |
+| --- | --- |
+| `inspect-mounts.sh` | Both containers' networks and `/data` host paths side by side. Run as `CLEANER=<name> QBIT=<name> bash inspect-mounts.sh` if your container names differ. |
+| `diagnose-unraid.sh` | Queries the qBittorrent API from inside the cleaner container and reports whether any flagged orphan is actually a live torrent. |
+| `fresh-check.sh` | Forces a fresh dry-run, prints what it would delete, and shows hardlink counts so you can see whether deleting each file is safe. Refuses to run unless `DRY_RUN=true`. |
+
+Common real-world causes of a broken or misleading run:
+
+- **`Name or service not known`** — `QBITTORRENT_URL` uses a Docker container name (e.g. `http://qbittorrent:8080`) but the cleaner is on the plain `bridge` network, where container-name DNS does not resolve, or the qBittorrent container has a different name. Use the Unraid host IP and the published WebUI port instead, e.g. `http://192.168.1.10:8080`, or put both containers on the same user-defined Docker network.
+- **Every torrent looks like an orphan / `/data` appears empty** — the cleaner's `/data` mount points at a different host path than qBittorrent's. On Unraid this often means one container mounts a cache-only path (`/mnt/cache/...`) while the other mounts the user share (`/mnt/user/...`), or simply a different folder. Mount the cleaner's `/data` at the exact same host path qBittorrent uses.
+- **`qBittorrent login failed:` with an empty message** — qBittorrent is bypassing authentication for the cleaner's subnet/localhost and returns an empty `204` from `/api/v2/auth/login`. Update to a build that accepts the bypass response (handled since the auth-bypass fix).
