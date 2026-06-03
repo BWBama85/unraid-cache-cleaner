@@ -95,14 +95,14 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `DRY_RUN` | `true` | Report only, no deletes |
 | `DELETE_EMPTY_DIRS` | `true` | Remove empty directories after file deletion |
 | `PROTECT_SINGLE_FILE_PARENT_DIRS` | `true` | Protect dedicated subdirs that contain tracked single-file torrents |
-| `EXCLUDED_GLOBS` | system/temp patterns | Basename or full-path glob patterns to skip |
+| `EXCLUDED_GLOBS` | _(adds to defaults)_ | Extra basename or full-path glob patterns to skip, merged with the built-in defaults |
 | `STATE_DB_PATH` | `/config/state.sqlite3` | SQLite state database |
 | `REPORT_PATH` | `/config/last-run.json` | JSON summary of the last run |
 | `LOG_LEVEL` | `INFO` | Python log level |
 
 If `WATCH_PATHS` is empty, the service falls back to qBittorrent's default save path plus any `save_path` values currently used by torrents. In practice, explicitly setting `WATCH_PATHS` is better on Unraid.
 
-If your watch root also contains helper scripts, logs, or scratch folders that are not managed by qBittorrent, add them to `EXCLUDED_GLOBS`. Patterns without a slash match by basename. Patterns with a slash match against the full path inside the container.
+If your watch root also contains helper scripts, logs, or scratch folders that are not managed by qBittorrent, add them to `EXCLUDED_GLOBS`. Your patterns are merged with a built-in default list (`.DS_Store`, `*.part`, `*.!qB`, and other junk/temp patterns), so the defaults stay in effect and you only list your extras. Patterns without a slash match by basename. Patterns with a slash match against the full path inside the container.
 
 Example:
 

@@ -11,10 +11,24 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from unraid_cache_cleaner.config import Config
+from unraid_cache_cleaner.config import DEFAULT_EXCLUDED_GLOBS, Config, _parse_glob_list
 
 
 class ConfigTests(unittest.TestCase):
+    def test_excluded_globs_default_when_unset(self) -> None:
+        self.assertEqual(_parse_glob_list(None), DEFAULT_EXCLUDED_GLOBS)
+        self.assertEqual(_parse_glob_list(""), DEFAULT_EXCLUDED_GLOBS)
+
+    def test_excluded_globs_merge_with_defaults(self) -> None:
+        result = _parse_glob_list("*.nfo, *.part , keep.log")
+        # defaults come first, in order
+        self.assertEqual(result[: len(DEFAULT_EXCLUDED_GLOBS)], DEFAULT_EXCLUDED_GLOBS)
+        # user globs are appended
+        self.assertIn("*.nfo", result)
+        self.assertIn("keep.log", result)
+        # a user glob that is already a default is not duplicated
+        self.assertEqual(result.count("*.part"), 1)
+
     def test_from_env_parses_lists_and_booleans(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             env = {
