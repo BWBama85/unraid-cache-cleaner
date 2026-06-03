@@ -3,29 +3,25 @@
 # Diagnose whether unraid-cache-cleaner is about to delete files that still
 # belong to live qBittorrent torrents.
 #
-# It runs on the Unraid host, reads the qBittorrent credentials out of the
-# running cleaner container, queries the qBittorrent API directly, and compares
-# what qBittorrent actually reports against the orphans flagged in last-run.json.
+# The qBittorrent URL is usually a Docker DNS name (e.g. http://qbittorrent:8080)
+# that only resolves inside the cleaner container's network, so this script runs
+# the check INSIDE the cleaner container. That also means it sees exactly what
+# the cleaner sees: same env, same /data mount, same /config/last-run.json.
 #
 # Nothing is deleted. This is read-only.
 #
 # Usage (on the Unraid server):
 #   bash diagnose-unraid.sh
 #
-# Override defaults with environment variables if needed:
-#   CONTAINER   cleaner container name (default: unraid-cache-cleaner)
-#   REPORT      path to last-run.json  (default: /mnt/user/appdata/<CONTAINER>/last-run.json)
-#
-# Only requirements: docker and python3 (both already present on Unraid).
+# Override the container name if yours differs:
+#   CONTAINER=<name> bash diagnose-unraid.sh
 
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-unraid-cache-cleaner}"
-REPORT="${REPORT:-/mnt/user/appdata/${CONTAINER}/last-run.json}"
 
 echo "== unraid-cache-cleaner diagnosis =="
 echo "container: ${CONTAINER}"
-echo "report:    ${REPORT}"
 echo
 
 if ! docker inspect "${CONTAINER}" >/dev/null 2>&1; then
@@ -35,29 +31,9 @@ if ! docker inspect "${CONTAINER}" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -f "${REPORT}" ]]; then
-  echo "ERROR: report not found at ${REPORT}"
-  echo "Re-run with the correct path:"
-  echo "  REPORT=/path/to/last-run.json bash ${0##*/}"
-  exit 1
-fi
-
-Q_URL="$(docker exec "${CONTAINER}" printenv QBITTORRENT_URL 2>/dev/null || true)"
-Q_USER="$(docker exec "${CONTAINER}" printenv QBITTORRENT_USERNAME 2>/dev/null || true)"
-Q_PASS="$(docker exec "${CONTAINER}" printenv QBITTORRENT_PASSWORD 2>/dev/null || true)"
-Q_VERIFY="$(docker exec "${CONTAINER}" printenv QBITTORRENT_VERIFY_TLS 2>/dev/null || echo true)"
-
-if [[ -z "${Q_URL}" ]]; then
-  echo "ERROR: could not read QBITTORRENT_URL from the container environment."
-  exit 1
-fi
-
-echo "qBittorrent URL: ${Q_URL}"
-echo
-
-export Q_URL Q_USER Q_PASS Q_VERIFY REPORT
-
-python3 - <<'PY'
+# Everything below runs inside the cleaner container via 'docker exec':
+# it already has the qBittorrent credentials, network access, and the report.
+docker exec -i "${CONTAINER}" python3 - <<'PY'
 import json
 import os
 import ssl
@@ -66,11 +42,22 @@ import urllib.request
 from http.cookiejar import CookieJar
 from pathlib import PurePosixPath
 
-url = os.environ["Q_URL"].rstrip("/")
+url = os.environ.get("QBITTORRENT_URL", "").rstrip("/")
+user = os.environ.get("QBITTORRENT_USERNAME", "")
+pw = os.environ.get("QBITTORRENT_PASSWORD", "")
+verify = os.environ.get("QBITTORRENT_VERIFY_TLS", "true").strip().lower()
+report_path = os.environ.get("REPORT_PATH", "/config/last-run.json")
+
+if not url:
+    raise SystemExit("ERROR: QBITTORRENT_URL is not set inside the container.")
+
+print(f"qBittorrent URL (from inside container): {url}")
+print(f"report:                                  {report_path}")
+print()
 
 # --- talk to qBittorrent ---------------------------------------------------
 ctx = ssl.create_default_context()
-if os.environ.get("Q_VERIFY", "true").strip().lower() in ("0", "false", "no", "off"):
+if verify in ("0", "false", "no", "off"):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
@@ -82,25 +69,21 @@ opener.addheaders = [("Referer", url), ("User-Agent", "uccc-diagnose/1.0")]
 
 login = opener.open(
     url + "/api/v2/auth/login",
-    data=urllib.parse.urlencode(
-        {"username": os.environ["Q_USER"], "password": os.environ["Q_PASS"]}
-    ).encode(),
+    data=urllib.parse.urlencode({"username": user, "password": pw}).encode(),
     timeout=20,
 ).read().decode().strip()
 if login != "Ok.":
     raise SystemExit(f"ERROR: qBittorrent login failed (response: {login!r})")
 
-torrents = json.load(
-    opener.open(url + "/api/v2/torrents/info?filter=all", timeout=30)
-)
+torrents = json.load(opener.open(url + "/api/v2/torrents/info?filter=all", timeout=30))
 
 # --- load what the cleaner wants to delete ---------------------------------
-report = json.load(open(os.environ["REPORT"]))
+report = json.load(open(report_path))
 watch_roots = [r.rstrip("/") for r in report.get("watch_roots", [])] or ["/data"]
 deletes = [a for a in report.get("actions", []) if a.get("action") == "delete"]
 
 
-def release_under_roots(path: str):
+def release_under_roots(path):
     """First path segment beneath any watch root (e.g. /data/Foo/bar -> Foo)."""
     for root in watch_roots:
         if path == root:
@@ -118,7 +101,7 @@ for action in deletes:
 
 
 # --- summarize what qBittorrent reports ------------------------------------
-def root_of(p: str) -> str:
+def root_of(p):
     if p.startswith("/") and "/" in p[1:]:
         return "/" + p.split("/")[1]
     return p or "(empty)"
