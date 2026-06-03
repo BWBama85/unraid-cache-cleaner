@@ -122,7 +122,12 @@ class QbittorrentClient:
             },
             allow_reauth=False,
         ).strip()
-        if response != "Ok.":
+        # "Ok." is the normal success response. When this client is exempt from
+        # authentication (qBittorrent's "bypass authentication for localhost" or a
+        # whitelisted subnet), the login endpoint instead returns an empty 204
+        # body. Treat that as success too; only a non-empty, non-"Ok." body such
+        # as "Fails." is an actual login failure.
+        if response not in ("Ok.", ""):
             raise QbittorrentClientError(f"qBittorrent login failed: {response}")
         self._authenticated = True
 
