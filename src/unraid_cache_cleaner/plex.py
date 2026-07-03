@@ -174,12 +174,19 @@ class PlexClient:
                 raise
 
             container = payload.get("MediaContainer", {})
-            page = container.get("Metadata", [])
+            page = container.get("Metadata") or []
             items.extend(page)
+            if not page:
+                break
 
-            total = int(container.get("totalSize", container.get("size", len(page))))
-            start += page_size
-            if not page or start >= total:
+            # Advance by the number of items actually returned, not the requested
+            # page_size: a server that caps the page below page_size would
+            # otherwise make us skip the items in between (and one that ignores
+            # paging entirely would double-count them). totalSize, when present,
+            # bounds the loop so we avoid a trailing empty request.
+            start += len(page)
+            total = container.get("totalSize")
+            if total is not None and start >= int(total):
                 break
 
         return items

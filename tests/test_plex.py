@@ -131,6 +131,47 @@ class PlexClientTests(unittest.TestCase):
             self.assertEqual(q["includeGuids"], ["1"])
             self.assertEqual(urlparse(req.full_url).path, "/library/sections/1/all")
 
+    def test_fetch_duplicates_handles_short_pages(self) -> None:
+        # Server caps each page at 100 even though we request 200; the client
+        # must advance by the returned count, not the requested size, or it
+        # would skip the items in between.
+        total = 250
+        server_cap = 100
+
+        def responder(req) -> bytes:
+            start = int(req.get_header("X-plex-container-start"))
+            page = [
+                {"ratingKey": str(i)}
+                for i in range(start, min(start + server_cap, total))
+            ]
+            return json.dumps(
+                {"MediaContainer": {"totalSize": total, "size": len(page), "Metadata": page}}
+            ).encode("utf-8")
+
+        client = _client(_RecordingOpener(responder))
+
+        items = client.fetch_duplicates("1", 1, page_size=200)
+
+        keys = [item["ratingKey"] for item in items]
+        self.assertEqual(keys, [str(i) for i in range(total)])
+
+    def test_fetch_duplicates_tolerates_null_total_size(self) -> None:
+        # A server that omits/nulls totalSize must not crash: iterate until an
+        # empty page instead of int(None).
+        pages = [
+            {"MediaContainer": {"totalSize": None, "Metadata": [{"ratingKey": "1"}]}},
+            {"MediaContainer": {"totalSize": None, "Metadata": []}},
+        ]
+
+        def responder(req) -> bytes:
+            return json.dumps(pages.pop(0)).encode("utf-8")
+
+        client = _client(_RecordingOpener(responder))
+
+        items = client.fetch_duplicates("1", 1)
+
+        self.assertEqual(items, [{"ratingKey": "1"}])
+
     def test_fetch_duplicates_single_page(self) -> None:
         page = [{"ratingKey": "1"}, {"ratingKey": "2"}]
         body = json.dumps(
@@ -177,7 +218,7 @@ class PlexClientTests(unittest.TestCase):
         self.assertNotIn("SECRET-TOKEN-123", opener.requests[0].full_url)
 
     def test_token_never_in_http_error_message(self) -> None:
-        opener = _RecordingOpener(lambda req: (_ for _ in ()).throw(_http_error(500, b"boom")))
+        opener = _RecordingOpener(_raiser(_http_error(500, b"boom")))
         client = _client(opener)
 
         with self.assertRaises(PlexClientError) as ctx:
