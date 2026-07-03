@@ -105,6 +105,52 @@ class ConfigTests(unittest.TestCase):
                 )
                 self.assertTrue(config.plex_duplicate_report_path.parent.exists())
 
+    def test_arr_defaults_when_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                self.assertEqual(config.radarr_url, "")
+                self.assertEqual(config.radarr_api_key, "")
+                self.assertEqual(config.radarr_timeout_seconds, 30)
+                self.assertTrue(config.radarr_verify_tls)
+                self.assertEqual(config.sonarr_url, "")
+                self.assertEqual(config.sonarr_api_key, "")
+                self.assertEqual(config.sonarr_timeout_seconds, 30)
+                self.assertTrue(config.sonarr_verify_tls)
+
+    def test_arr_env_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+                "RADARR_URL": "http://radarr:7878",
+                "RADARR_API_KEY": "rkey",
+                "RADARR_TIMEOUT_SECONDS": "20",
+                "RADARR_VERIFY_TLS": "false",
+                "SONARR_URL": "http://sonarr:8989",
+                "SONARR_API_KEY": "skey",
+                "SONARR_TIMEOUT_SECONDS": "25",
+                "SONARR_VERIFY_TLS": "false",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                self.assertEqual(config.radarr_url, "http://radarr:7878")
+                self.assertEqual(config.radarr_api_key, "rkey")
+                self.assertEqual(config.radarr_timeout_seconds, 20)
+                self.assertFalse(config.radarr_verify_tls)
+                self.assertEqual(config.sonarr_url, "http://sonarr:8989")
+                self.assertEqual(config.sonarr_api_key, "skey")
+                self.assertEqual(config.sonarr_timeout_seconds, 25)
+                self.assertFalse(config.sonarr_verify_tls)
+
 
 if __name__ == "__main__":
     unittest.main()

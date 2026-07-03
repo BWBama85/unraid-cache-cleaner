@@ -1,0 +1,263 @@
+"""Optional Radarr/Sonarr association layer.
+
+Enriches a Plex duplicate report (#7) with whether each copy is tracked by
+Radarr (movies) or Sonarr (TV) — so a redundant copy that an ``*arr`` tracks is
+flagged as "delete via the ``*arr`` or it re-downloads", while an untracked
+copy is confirmed safe. This is read-only enrichment: nothing here deletes,
+moves, or unmonitors anything, and a missing/unreachable ``*arr`` degrades the
+report to Plex-only rather than failing it.
+
+Two thin ``urllib`` clients mirror :mod:`qbittorrent` / :mod:`plex` (custom
+``ArrClientError``, TLS-verify toggle, timeouts, ``X-Api-Key`` header never in a
+URL). :func:`annotate` is a pure transform over analyzed
+:class:`~unraid_cache_cleaner.models.DuplicateGroup` records.
+
+Join strategy differs by kind, because the two ``*arr`` id joins are not equally
+reliable:
+
+* **Movies (Radarr).** Plex's movie ``tmdb://`` guid is the same TMDB id Radarr
+  keys on, so movies are *id-anchored*: within a group whose TMDB id Radarr
+  tracks, the copy whose basename matches Radarr's file is ``tracked`` and the
+  other redundant copies are ``untracked`` (safe). If the id is absent, not in
+  Radarr, or no copy basename matches, every copy is ``unknown``.
+* **Episodes (Sonarr).** Plex's episode ``Guid`` entries are *episode-level* ids,
+  not the *series* TVDB id Sonarr keys on, so an id-anchored join is unreliable.
+  Episodes instead match by basename against every tracked episode file: a copy
+  whose basename Sonarr tracks is ``tracked``; any other copy is ``unknown``
+  (never ``untracked``, so a TV copy is never falsely labeled safe).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import replace
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+
+from . import dedupe
+from .models import DuplicateGroup, MediaCopy
+
+LOGGER = logging.getLogger(__name__)
+
+TRACKED = "tracked"
+UNTRACKED = "untracked"
+UNKNOWN = "unknown"
+
+RADARR = "radarr"
+SONARR = "sonarr"
+
+
+class ArrClientError(RuntimeError):
+    """Raised when a Radarr/Sonarr instance cannot be queried safely."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _ArrClient:
+    """Shared ``urllib`` plumbing for the Radarr/Sonarr v3 APIs.
+
+    Read-only: only issues GETs. The API key travels as an ``X-Api-Key`` header
+    (never in the URL query, so it stays out of request logs) and JSON is
+    requested via ``Accept: application/json``.
+    """
+
+    service_name = "arr"
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout_seconds: int = 30,
+        verify_tls: bool = True,
+    ) -> None:
+        if not base_url or not api_key:
+            raise ArrClientError(f"{self.service_name} URL and API key are required")
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+        self.verify_tls = verify_tls
+        self._opener = self._build_opener()
+
+    def _build_opener(self) -> urllib.request.OpenerDirector:
+        handlers: list[urllib.request.BaseHandler] = []
+
+        if self.base_url.startswith("https://"):
+            context = ssl.create_default_context()
+            if not self.verify_tls:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            handlers.append(urllib.request.HTTPSHandler(context=context))
+
+        opener = urllib.request.build_opener(*handlers)
+        opener.addheaders = [
+            ("X-Api-Key", self.api_key),
+            ("Accept", "application/json"),
+            ("User-Agent", "unraid-cache-cleaner/0.1.0"),
+        ]
+        return opener
+
+    def _get_json(self, api_path: str, params: Optional[Dict[str, str]] = None) -> object:
+        encoded_params = urllib.parse.urlencode(params or {})
+        url = f"{self.base_url}{api_path}"
+        if encoded_params:
+            url = f"{url}?{encoded_params}"
+
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with self._opener.open(request, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise ArrClientError(
+                    f"{self.service_name} rejected the API key (401). Re-copy the API key.",
+                    status_code=401,
+                ) from exc
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise ArrClientError(
+                f"HTTP {exc.code} from {self.service_name}: {detail}", status_code=exc.code
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ArrClientError(
+                f"Unable to connect to {self.service_name} at {self.base_url}: {exc.reason}"
+            ) from exc
+
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ArrClientError(
+                f"{self.service_name} returned invalid JSON from {api_path}: {exc}"
+            ) from exc
+
+
+class RadarrClient(_ArrClient):
+    """Radarr v3 client: TMDB id -> tracked movie-file basenames."""
+
+    service_name = "Radarr"
+
+    def fetch_tracked_index(self) -> Dict[str, Set[str]]:
+        """Map each movie's TMDB id to the basename(s) of its tracked file.
+
+        Movies Radarr has not imported (no ``movieFile``) are skipped: their id
+        never anchors an association, so those copies stay ``unknown``.
+        """
+
+        movies = self._get_json("/api/v3/movie")
+        index: Dict[str, Set[str]] = {}
+        for movie in movies or []:
+            if not isinstance(movie, dict):
+                continue
+            tmdb_id = movie.get("tmdbId")
+            if not tmdb_id:
+                continue
+            movie_file = movie.get("movieFile") or {}
+            path = movie_file.get("path") or movie_file.get("relativePath")
+            if not path:
+                continue
+            index.setdefault(str(tmdb_id), set()).add(Path(str(path)).name)
+        return index
+
+
+class SonarrClient(_ArrClient):
+    """Sonarr v3 client: the set of all tracked episode-file basenames.
+
+    Sonarr keys series by TVDB id, but Plex's episode guids are episode-level,
+    so this deliberately returns a flat basename set for a basename-only join
+    rather than an id-keyed index (see the module docstring).
+    """
+
+    service_name = "Sonarr"
+
+    def fetch_tracked_index(self) -> Set[str]:
+        series_list = self._get_json("/api/v3/series")
+        basenames: Set[str] = set()
+        for series in series_list or []:
+            if not isinstance(series, dict):
+                continue
+            series_id = series.get("id")
+            if series_id is None:
+                continue
+            files = self._get_json("/api/v3/episodefile", {"seriesId": str(series_id)})
+            for episode_file in files or []:
+                if not isinstance(episode_file, dict):
+                    continue
+                path = episode_file.get("path")
+                if path:
+                    basenames.add(Path(str(path)).name)
+        return basenames
+
+
+def _refresh(group: DuplicateGroup, copies: tuple[MediaCopy, ...]) -> DuplicateGroup:
+    """Re-run the (idempotent) dedupe analysis so ``keeper`` carries the new
+    per-copy association too. Size/resolution are untouched, so classification
+    and reclaimable math are unchanged."""
+
+    return dedupe.analyze_group(replace(group, copies=copies))
+
+
+def _annotate_by_id(
+    group: DuplicateGroup,
+    index: Dict[str, Set[str]],
+    namespace: str,
+    arr_name: str,
+) -> DuplicateGroup:
+    plex_id = group.external_ids.get(namespace)
+    tracked_basenames = index.get(plex_id) if plex_id else None
+
+    if tracked_basenames and any(c.file.name in tracked_basenames for c in group.copies):
+        copies = tuple(
+            replace(c, association=TRACKED, arr_tracked=arr_name)
+            if c.file.name in tracked_basenames
+            else replace(c, association=UNTRACKED, arr_tracked=None)
+            for c in group.copies
+        )
+    else:
+        # Id absent in Plex, id not in the *arr, or no copy basename matches
+        # (mount map ambiguous): never claim safe.
+        copies = tuple(replace(c, association=UNKNOWN, arr_tracked=None) for c in group.copies)
+    return _refresh(group, copies)
+
+
+def _annotate_by_basename(
+    group: DuplicateGroup,
+    tracked_basenames: Set[str],
+    arr_name: str,
+) -> DuplicateGroup:
+    copies = tuple(
+        replace(c, association=TRACKED, arr_tracked=arr_name)
+        if c.file.name in tracked_basenames
+        else replace(c, association=UNKNOWN, arr_tracked=None)
+        for c in group.copies
+    )
+    return _refresh(group, copies)
+
+
+def annotate(
+    groups: List[DuplicateGroup],
+    radarr_index: Dict[str, Set[str]],
+    sonarr_basenames: Set[str],
+) -> List[DuplicateGroup]:
+    """Return ``groups`` with each copy's association filled in.
+
+    ``radarr_index`` maps TMDB id -> tracked movie-file basenames;
+    ``sonarr_basenames`` is the flat set of tracked episode-file basenames. An
+    empty index/set (e.g. that ``*arr`` unconfigured or unreachable) leaves the
+    relevant kind ``unknown``. Non-movie/episode kinds pass through untouched.
+    """
+
+    out: List[DuplicateGroup] = []
+    for group in groups:
+        if group.kind == "movie":
+            out.append(_annotate_by_id(group, radarr_index, "tmdb", RADARR))
+        elif group.kind == "episode":
+            out.append(_annotate_by_basename(group, sonarr_basenames, SONARR))
+        else:
+            out.append(group)
+    return out

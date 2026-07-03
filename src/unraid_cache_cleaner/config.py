@@ -93,6 +93,17 @@ class Config:
     plex_timeout_seconds: int = 30
     plex_verify_tls: bool = True
     plex_duplicate_report_path: Path = Path("/config/plex-duplicates.json")
+    # Optional Radarr/Sonarr association for the plex-duplicates report (#8).
+    # Each is inert unless both its URL and API key are set; appended with
+    # defaults so existing Config(...) calls and from_env keep working.
+    radarr_url: str = ""
+    radarr_api_key: str = ""
+    radarr_timeout_seconds: int = 30
+    radarr_verify_tls: bool = True
+    sonarr_url: str = ""
+    sonarr_api_key: str = ""
+    sonarr_timeout_seconds: int = 30
+    sonarr_verify_tls: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -126,6 +137,14 @@ class Config:
             plex_duplicate_report_path=Path(
                 os.getenv("PLEX_DUPLICATE_REPORT_PATH", "/config/plex-duplicates.json")
             ),
+            radarr_url=os.getenv("RADARR_URL", ""),
+            radarr_api_key=os.getenv("RADARR_API_KEY", ""),
+            radarr_timeout_seconds=_parse_int(os.getenv("RADARR_TIMEOUT_SECONDS"), 30),
+            radarr_verify_tls=_parse_bool(os.getenv("RADARR_VERIFY_TLS"), True),
+            sonarr_url=os.getenv("SONARR_URL", ""),
+            sonarr_api_key=os.getenv("SONARR_API_KEY", ""),
+            sonarr_timeout_seconds=_parse_int(os.getenv("SONARR_TIMEOUT_SECONDS"), 30),
+            sonarr_verify_tls=_parse_bool(os.getenv("SONARR_VERIFY_TLS"), True),
         )
         config.ensure_directories()
         return config

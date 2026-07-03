@@ -7,6 +7,7 @@ import logging
 import sys
 from typing import List, Optional
 
+from .arr import ArrClientError, RadarrClient, SonarrClient
 from .config import Config
 from .plex import PlexClient, PlexClientError
 from .plex_report import PlexDuplicateReporter
@@ -100,6 +101,32 @@ def run_cleaner(config: Config, command: str) -> int:
     return 0
 
 
+def _build_radarr(config: Config) -> Optional[RadarrClient]:
+    """Construct a Radarr client only when both its URL and API key are set."""
+
+    if config.radarr_url and config.radarr_api_key:
+        return RadarrClient(
+            config.radarr_url,
+            config.radarr_api_key,
+            timeout_seconds=config.radarr_timeout_seconds,
+            verify_tls=config.radarr_verify_tls,
+        )
+    return None
+
+
+def _build_sonarr(config: Config) -> Optional[SonarrClient]:
+    """Construct a Sonarr client only when both its URL and API key are set."""
+
+    if config.sonarr_url and config.sonarr_api_key:
+        return SonarrClient(
+            config.sonarr_url,
+            config.sonarr_api_key,
+            timeout_seconds=config.sonarr_timeout_seconds,
+            verify_tls=config.sonarr_verify_tls,
+        )
+    return None
+
+
 def run_plex_duplicates(config: Config, args: argparse.Namespace) -> int:
     """Run the read-only Plex duplicate report."""
 
@@ -109,7 +136,12 @@ def run_plex_duplicates(config: Config, args: argparse.Namespace) -> int:
         timeout_seconds=config.plex_timeout_seconds,
         verify_tls=config.plex_verify_tls,
     )
-    reporter = PlexDuplicateReporter(config, client)
+    reporter = PlexDuplicateReporter(
+        config,
+        client,
+        radarr_client=_build_radarr(config),
+        sonarr_client=_build_sonarr(config),
+    )
     report = reporter.generate(section_overrides=args.section or None)
     reporter.write_report(report)
     reporter.log_report(report)
@@ -133,7 +165,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if command == "plex-duplicates":
             return run_plex_duplicates(config, args)
         return run_cleaner(config, command)
-    except (QbittorrentClientError, PlexClientError) as exc:
+    except (QbittorrentClientError, PlexClientError, ArrClientError) as exc:
         logger.error(str(exc))
         return 2
     except RuntimeError as exc:

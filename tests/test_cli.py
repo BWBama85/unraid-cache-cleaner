@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner import cli
+from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.models import PlexSection
 from unraid_cache_cleaner.plex import PlexClientError
 
@@ -109,6 +110,57 @@ class PlexDuplicatesCliTests(unittest.TestCase):
             fake = FakePlexClient(error=RuntimeError("unexpected"))
             code, _, _, _ = _run(["plex-duplicates"], fake)
             self.assertEqual(code, 3)
+
+
+class _FakeArr:
+    def __init__(self, index, *, raises=None) -> None:
+        self._index = index
+        self._raises = raises
+
+    def fetch_tracked_index(self):
+        if self._raises is not None:
+            raise self._raises
+        return type(self._index)(self._index)
+
+
+class ArrCliTests(unittest.TestCase):
+    def test_radarr_configured_enables_association(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, _env(Path(tmpdir)):
+            tmp = Path(tmpdir)
+            arr_env = {"RADARR_URL": "http://radarr:7878", "RADARR_API_KEY": "rkey"}
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, arr_env, clear=False), \
+                    mock.patch.object(cli, "PlexClient", return_value=FakePlexClient()), \
+                    mock.patch.object(cli, "RadarrClient", return_value=_FakeArr({"1": {"x"}})) as radarr, \
+                    mock.patch.object(cli, "QbittorrentClient"), \
+                    mock.patch.object(cli, "StateStore"), \
+                    contextlib.redirect_stdout(out):
+                code = cli.main(["plex-duplicates", "--json-only"])
+
+            self.assertEqual(code, 0)
+            # client built from config (url, key, and the per-service knobs)
+            radarr.assert_called_once()
+            payload = json.loads((tmp / "plex-duplicates.json").read_text())
+            self.assertTrue(payload["arr_enabled"])
+
+    def test_arr_outage_degrades_gracefully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, _env(Path(tmpdir)):
+            tmp = Path(tmpdir)
+            arr_env = {"SONARR_URL": "http://sonarr:8989", "SONARR_API_KEY": "skey"}
+            fake = _FakeArr(set(), raises=ArrClientError("down", status_code=500))
+            with mock.patch.dict(os.environ, arr_env, clear=False), \
+                    mock.patch.object(cli, "PlexClient", return_value=FakePlexClient()), \
+                    mock.patch.object(cli, "SonarrClient", return_value=fake), \
+                    mock.patch.object(cli, "QbittorrentClient"), \
+                    mock.patch.object(cli, "StateStore"), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = cli.main(["plex-duplicates", "--json-only"])
+
+            # a *arr outage never fails the read-only report
+            self.assertEqual(code, 0)
+            payload = json.loads((tmp / "plex-duplicates.json").read_text())
+            self.assertTrue(payload["arr_enabled"])
+            self.assertTrue(any("Sonarr association skipped" in w for w in payload["warnings"]))
 
 
 class SafePrintTests(unittest.TestCase):
