@@ -12,44 +12,54 @@ counted as reclaimable.
 
 from __future__ import annotations
 
-import logging
 import re
 from dataclasses import replace
-from typing import Dict, List, Set
+from typing import Dict, List, Tuple
 
 from .models import DedupeSummary, DuplicateGroup, MediaCopy, SectionSummary
-
-LOGGER = logging.getLogger(__name__)
 
 IDENTICAL = "identical"
 UPGRADE = "upgrade"
 MISMATCH = "mismatch"
 
-#: Plex ``videoResolution`` value -> sortable rank. Higher is better; an unknown
-#: or missing value ranks ``0`` and therefore sorts last.
+#: Non-numeric Plex ``videoResolution`` labels -> sortable rank. Purely numeric
+#: labels ("1080", "2160", "576", …) are ranked by their integer value instead,
+#: so a value the map does not list still sorts sensibly rather than as unknown.
+#: Higher is better; a label that is neither listed nor numeric ranks ``0`` and
+#: sorts last.
 RES_RANK: Dict[str, int] = {
     "4k": 2160,
-    "1080": 1080,
-    "720": 720,
-    "480": 480,
     "sd": 1,
 }
 
-# ``{imdb-tt1234567}`` / ``{tmdb-123}`` tags embedded in Plex file paths. Two
-# distinct ids in one group mean Plex stacked different titles together.
-_ID_RE = re.compile(r"\{(?:imdb-(tt\d+)|tmdb-(\d+))\}")
+# ``{imdb-tt123}`` / ``{tmdb-123}`` / ``{tvdb-123}`` tags embedded in Plex file
+# paths (Radarr/Sonarr folder naming). Two distinct ids *within one namespace*
+# in a group mean Plex merged different titles. A single title tagged with
+# several namespaces at once (e.g. ``{imdb-…} {tmdb-…}``) is NOT a mismatch.
+_ID_RE = re.compile(r"\{(?:imdb-(tt\d+)|tmdb-(\d+)|tvdb-(\d+))\}")
+
+
+def _norm_res(resolution: str) -> str:
+    """Normalize a resolution label: lowercase, trim, drop a trailing ``p``."""
+
+    key = resolution.strip().lower()
+    if key.endswith("p") and key[:-1].isdigit():
+        key = key[:-1]
+    return key
 
 
 def resolution_rank(resolution: str) -> int:
     """Map a Plex resolution label to a sortable rank (unknown -> ``0``)."""
 
-    key = resolution.strip().lower()
-    if key.endswith("p") and key[:-1].isdigit():
-        key = key[:-1]
-    return RES_RANK.get(key, 0)
+    key = _norm_res(resolution)
+    if key in RES_RANK:
+        return RES_RANK[key]
+    if key.isdigit():
+        return int(key)
+    return 0
 
 
-def copy_sort_key(copy: MediaCopy) -> tuple:
+def copy_sort_key(copy: MediaCopy) -> Tuple[int, int, int]:
     """Best-first ordering key: ``(resolution_rank, bitrate, size)``.
 
     Size alone is misleading — a 1080p x265 encode can be smaller than a 720p
@@ -59,7 +69,7 @@ def copy_sort_key(copy: MediaCopy) -> tuple:
     return (resolution_rank(copy.resolution), copy.bitrate, copy.size)
 
 
-def _merge_stacks(copies: tuple) -> List[MediaCopy]:
+def _merge_stacks(copies: Tuple[MediaCopy, ...]) -> List[MediaCopy]:
     """Collapse stacked parts into one logical copy each.
 
     Parts sharing a non-zero ``media_id`` belong to the same Plex ``Media``
@@ -90,21 +100,32 @@ def rank_copies(group: DuplicateGroup) -> List[MediaCopy]:
     return sorted(_merge_stacks(group.copies), key=copy_sort_key, reverse=True)
 
 
-def _external_ids(group: DuplicateGroup) -> Set[str]:
-    """Namespaced external ids parsed from every copy's file path."""
+def _is_mismatch(group: DuplicateGroup) -> bool:
+    """True when the group's copies reference different titles.
 
-    ids: Set[str] = set()
+    Compared per id namespace: two distinct ``imdb`` ids (or two distinct
+    ``tmdb`` / ``tvdb`` ids) across the copies mean Plex merged different titles.
+    A single title carrying several namespaces at once — Radarr/Sonarr routinely
+    write ``{imdb-…} {tmdb-…}`` / ``{tvdb-…}`` together — is NOT a mismatch,
+    because each namespace still resolves to one value.
+    """
+
+    namespaces: Tuple[set, set, set] = (set(), set(), set())
     for copy in group.copies:
-        for imdb, tmdb in _ID_RE.findall(str(copy.file)):
-            ids.add(f"imdb:{imdb}" if imdb else f"tmdb:{tmdb}")
-    return ids
+        for imdb, tmdb, tvdb in _ID_RE.findall(str(copy.file)):
+            for value, seen in zip((imdb, tmdb, tvdb), namespaces):
+                if value:
+                    seen.add(value)
+    return any(len(seen) >= 2 for seen in namespaces)
 
 
 def _all_same_res_and_size(copies: List[MediaCopy]) -> bool:
-    first = copies[0]
-    first_rank = resolution_rank(first.resolution)
+    if len(copies) <= 1:
+        return True
+    first_res = _norm_res(copies[0].resolution)
+    first_size = copies[0].size
     return all(
-        resolution_rank(copy.resolution) == first_rank and copy.size == first.size
+        _norm_res(copy.resolution) == first_res and copy.size == first_size
         for copy in copies[1:]
     )
 
@@ -112,14 +133,14 @@ def _all_same_res_and_size(copies: List[MediaCopy]) -> bool:
 def classify(group: DuplicateGroup) -> str:
     """Classify a group as ``mismatch`` / ``identical`` / ``upgrade``.
 
-    ``mismatch`` wins outright: if two or more distinct external ids appear in
-    the copies' paths the group is treated as different titles and protected
-    from reclaim. Otherwise a group whose logical copies all share resolution
-    and size is ``identical`` (redundant copies); anything else is an
-    ``upgrade`` (a better copy supersedes a worse one).
+    ``mismatch`` wins outright: if the copies' paths carry conflicting external
+    ids the group is treated as different titles and protected from reclaim.
+    Otherwise a group whose logical copies all share resolution and size is
+    ``identical`` (redundant copies); anything else is an ``upgrade`` (a better
+    copy supersedes a worse one).
     """
 
-    if len(_external_ids(group)) >= 2:
+    if _is_mismatch(group):
         return MISMATCH
     logical = _merge_stacks(group.copies)
     if _all_same_res_and_size(logical):

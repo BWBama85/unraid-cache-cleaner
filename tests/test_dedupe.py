@@ -50,6 +50,23 @@ class ResolutionRankTests(unittest.TestCase):
         self.assertEqual(dedupe.resolution_rank(""), 0)
         self.assertEqual(dedupe.resolution_rank("potato"), 0)
 
+    def test_numeric_labels_rank_by_value(self) -> None:
+        # A source emitting numeric "2160"/"576" instead of "4k" must still
+        # outrank lower resolutions, not fall back to unknown (rank 0).
+        self.assertEqual(dedupe.resolution_rank("2160"), 2160)
+        self.assertGreater(dedupe.resolution_rank("2160"), dedupe.resolution_rank("720"))
+        self.assertGreater(dedupe.resolution_rank("576"), dedupe.resolution_rank("480"))
+
+    def test_numeric_4k_keeps_the_uhd_copy(self) -> None:
+        group = _group(
+            "movie",
+            "Numeric 4k label",
+            _copy(1, "/m/f {imdb-tt1}/uhd.mkv", 40 * GB, "2160"),
+            _copy(2, "/m/f {imdb-tt1}/hd.mkv", 8 * GB, "720"),
+        )
+        self.assertEqual(dedupe.rank_copies(group)[0].resolution, "2160")
+        self.assertEqual(dedupe.reclaimable_bytes(group), 8 * GB)
+
 
 class RankingTests(unittest.TestCase):
     def test_1080_x265_beats_larger_720(self) -> None:
@@ -112,14 +129,41 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(dedupe.reclaimable_bytes(group), 0)
         self.assertEqual(dedupe.reclaimable_keep_smallest(group), 0)
 
-    def test_mismatch_across_id_namespaces(self) -> None:
+    def test_mismatch_distinct_tvdb_ids(self) -> None:
+        # Sonarr tags TV with {tvdb-…}; Plex merging two different shows must be
+        # caught, or the whole TV library's reclaim math would be unsafe.
         group = _group(
-            "movie",
-            "Cross-namespace ids differ",
-            _copy(1, "/m/a {imdb-tt5}/x.mkv", 5 * GB, "1080"),
-            _copy(2, "/m/b {tmdb-777}/y.mkv", 9 * GB, "1080"),
+            "episode",
+            "Two different shows merged",
+            _copy(1, "/tv/Show A {tvdb-111}/s01e01.mkv", 5 * GB, "1080"),
+            _copy(2, "/tv/Show B {tvdb-222}/s01e01.mkv", 9 * GB, "1080"),
         )
         self.assertEqual(dedupe.classify(group), dedupe.MISMATCH)
+        self.assertEqual(dedupe.reclaimable_bytes(group), 0)
+
+    def test_dual_tagged_same_title_is_not_mismatch(self) -> None:
+        # Radarr's default folder naming writes BOTH ids together. The same
+        # movie carrying {imdb-…} and {tmdb-…} must not be flagged a mismatch,
+        # or genuinely reclaimable duplicates are silently protected.
+        group = _group(
+            "movie",
+            "Radarr dual-tagged same movie",
+            _copy(1, "/m/Film (2020) {imdb-tt3} {tmdb-456}/1080.mkv", 8 * GB, "1080"),
+            _copy(2, "/m/Film (2020) {imdb-tt3} {tmdb-456}/4k.mkv", 40 * GB, "4k"),
+        )
+        self.assertEqual(dedupe.classify(group), dedupe.UPGRADE)
+        self.assertEqual(dedupe.reclaimable_bytes(group), 8 * GB)
+
+    def test_disjoint_namespaces_are_not_flagged(self) -> None:
+        # One copy tagged only imdb, the other only tmdb: neither namespace has
+        # two distinct values, so we do not (cannot) claim a mismatch.
+        group = _group(
+            "movie",
+            "Disjoint single-namespace tags",
+            _copy(1, "/m/a {imdb-tt5}/x.mkv", 5 * GB, "1080"),
+            _copy(2, "/m/b {tmdb-777}/y.mkv", 5 * GB, "1080"),
+        )
+        self.assertNotEqual(dedupe.classify(group), dedupe.MISMATCH)
 
     def test_same_single_id_is_not_mismatch(self) -> None:
         group = _group(
@@ -130,12 +174,30 @@ class ClassifyTests(unittest.TestCase):
         )
         self.assertNotEqual(dedupe.classify(group), dedupe.MISMATCH)
 
+    def test_classify_tolerates_degenerate_groups(self) -> None:
+        # Public entry points must not crash on 0- or 1-copy groups.
+        self.assertEqual(dedupe.classify(_group("movie", "Empty")), dedupe.IDENTICAL)
+        one = _group("movie", "One", _copy(1, "/m/x/a.mkv", 5 * GB, "1080"))
+        self.assertEqual(dedupe.classify(one), dedupe.IDENTICAL)
+        self.assertEqual(dedupe.reclaimable_bytes(one), 0)
+
     def test_absent_ids_are_not_mismatch(self) -> None:
         group = _group(
             "movie",
             "No id tags anywhere",
             _copy(1, "/m/film/1080.mkv", 8 * GB, "1080"),
             _copy(2, "/m/film/4k.mkv", 40 * GB, "4k"),
+        )
+        self.assertEqual(dedupe.classify(group), dedupe.UPGRADE)
+
+    def test_distinct_unknown_resolutions_are_not_identical(self) -> None:
+        # Two different unmapped labels of equal size must not collapse to
+        # "identical" just because both rank 0 — that would skew the counts.
+        group = _group(
+            "movie",
+            "Different unknown resolutions",
+            _copy(1, "/m/f {imdb-tt7}/a.mkv", 5 * GB, "1080i"),
+            _copy(2, "/m/f {imdb-tt7}/b.mkv", 5 * GB, ""),
         )
         self.assertEqual(dedupe.classify(group), dedupe.UPGRADE)
 
