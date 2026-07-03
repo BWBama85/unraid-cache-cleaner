@@ -99,6 +99,14 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `STATE_DB_PATH` | `/config/state.sqlite3` | SQLite state database |
 | `REPORT_PATH` | `/config/last-run.json` | JSON summary of the last run |
 | `LOG_LEVEL` | `INFO` | Python log level |
+| `PLEX_URL` | empty | Plex server base URL (e.g. `http://192.168.1.10:32400`) |
+| `PLEX_TOKEN` | empty | Plex `X-Plex-Token` (sent as a header, never in the URL) |
+| `PLEX_SECTIONS` | empty | Comma-separated library section **IDs** to scan; empty ⇒ auto-detect video sections |
+| `PLEX_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Plex |
+| `PLEX_VERIFY_TLS` | `true` | Verify TLS certificates (set `false` for a self-signed reverse proxy) |
+| `PLEX_DUPLICATE_REPORT_PATH` | `/config/plex-duplicates.json` | JSON duplicate report output path |
+
+> **Note:** the `PLEX_*` variables are groundwork for the upcoming Plex duplicate report ([#4](https://github.com/BWBama85/unraid-cache-cleaner/issues/4)). No command consumes them yet — setting them has no effect until the `plex-duplicates` subcommand ships ([#7](https://github.com/BWBama85/unraid-cache-cleaner/issues/7)).
 
 If `WATCH_PATHS` is empty, the service falls back to qBittorrent's default save path plus any `save_path` values currently used by torrents. In practice, explicitly setting `WATCH_PATHS` is better on Unraid.
 

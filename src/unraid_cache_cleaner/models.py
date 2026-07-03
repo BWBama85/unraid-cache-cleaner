@@ -71,3 +71,53 @@ class RunReport:
     actions: list[ActionRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PlexSection:
+    """A Plex library section (Movies, TV Shows, ...)."""
+
+    key: str
+    type: str
+    title: str
+
+
+@dataclass(frozen=True)
+class MediaCopy:
+    """One physical file backing a Plex media item."""
+
+    part_id: int
+    file: Path
+    size: int
+    resolution: str = ""
+    bitrate: int = 0
+    codec: str = ""
+    container: str = ""
+
+
+@dataclass(frozen=True)
+class DuplicateGroup:
+    """A Plex item that resolves to more than one media copy on disk."""
+
+    rating_key: str
+    kind: str
+    title: str
+    copies: tuple[MediaCopy, ...]
+    year: int | None = None
+    season: int | None = None
+    episode: int | None = None
+    external_ids: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class DuplicateReport:
+    """Mutable result from a Plex duplicate scan, serialized like RunReport."""
+
+    generated_at: float
+    sections: tuple[PlexSection, ...] = ()
+    groups: list[DuplicateGroup] = field(default_factory=list)
+    total_groups: int = 0
+    total_copies: int = 0
+    reclaimable_bytes: int = 0
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)

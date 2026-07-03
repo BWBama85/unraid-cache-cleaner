@@ -43,6 +43,13 @@ def _parse_path_list(value: Optional[str]) -> tuple[Path, ...]:
     return tuple(Path(part) for part in parts if part)
 
 
+def _parse_str_list(value: Optional[str]) -> tuple[str, ...]:
+    if value is None or value.strip() == "":
+        return ()
+    parts = [item.strip() for item in value.split(",")]
+    return tuple(part for part in parts if part)
+
+
 def _parse_glob_list(value: Optional[str]) -> tuple[str, ...]:
     user_globs = []
     if value is not None:
@@ -77,6 +84,15 @@ class Config:
     state_db_path: Path
     report_path: Path
     log_level: str
+    # Plex duplicate report (in progress, #4). Inert until the plex-duplicates
+    # subcommand (#7) consumes them; appended with defaults so existing
+    # Config(...) calls and from_env keep working.
+    plex_url: str = ""
+    plex_token: str = ""
+    plex_sections: tuple[str, ...] = ()
+    plex_timeout_seconds: int = 30
+    plex_verify_tls: bool = True
+    plex_duplicate_report_path: Path = Path("/config/plex-duplicates.json")
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -102,6 +118,14 @@ class Config:
             state_db_path=Path(os.getenv("STATE_DB_PATH", "/config/state.sqlite3")),
             report_path=Path(os.getenv("REPORT_PATH", "/config/last-run.json")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            plex_url=os.getenv("PLEX_URL", ""),
+            plex_token=os.getenv("PLEX_TOKEN", ""),
+            plex_sections=_parse_str_list(os.getenv("PLEX_SECTIONS")),
+            plex_timeout_seconds=_parse_int(os.getenv("PLEX_TIMEOUT_SECONDS"), 30),
+            plex_verify_tls=_parse_bool(os.getenv("PLEX_VERIFY_TLS"), True),
+            plex_duplicate_report_path=Path(
+                os.getenv("PLEX_DUPLICATE_REPORT_PATH", "/config/plex-duplicates.json")
+            ),
         )
         config.ensure_directories()
         return config
@@ -111,3 +135,4 @@ class Config:
 
         self.state_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.report_path.parent.mkdir(parents=True, exist_ok=True)
+        self.plex_duplicate_report_path.parent.mkdir(parents=True, exist_ok=True)
