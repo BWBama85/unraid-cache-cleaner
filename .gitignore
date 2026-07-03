@@ -9,5 +9,9 @@ dist/
 *.sqlite3
 *.json
 !.github/
+!.claude/settings.json
 .DS_Store
+
+# /implement-issue runtime state (markers, gh-err temp) — never committed
+.claude/state/
 
