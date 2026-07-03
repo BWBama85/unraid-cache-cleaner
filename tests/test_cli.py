@@ -111,5 +111,24 @@ class PlexDuplicatesCliTests(unittest.TestCase):
             self.assertEqual(code, 3)
 
 
+class SafePrintTests(unittest.TestCase):
+    class _AsciiStdout(io.StringIO):
+        """Stand-in for a non-UTF-8 terminal: rejects non-ASCII on write."""
+
+        encoding = "ascii"
+
+        def write(self, s):  # type: ignore[override]
+            s.encode("ascii")  # raises UnicodeEncodeError on non-ASCII
+            return super().write(s)
+
+    def test_non_ascii_output_does_not_raise(self) -> None:
+        out = self._AsciiStdout()
+        with mock.patch("sys.stdout", out):
+            cli._safe_print("Amélie duplicate report")  # must not raise
+        printed = out.getvalue()
+        self.assertIn("Am", printed)
+        self.assertIn("?", printed)  # é replaced, not crashed
+
+
 if __name__ == "__main__":
     unittest.main()

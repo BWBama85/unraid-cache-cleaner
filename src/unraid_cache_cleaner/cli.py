@@ -54,6 +54,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_print(text: str) -> None:
+    """Print, degrading gracefully when stdout cannot encode some characters.
+
+    The rendered table interpolates raw Plex titles and file paths (e.g.
+    ``Amélie``), so on a non-UTF-8 stdout (``PYTHONIOENCODING=ascii``, a C-locale
+    console) a plain ``print`` would raise ``UnicodeEncodeError`` and turn a
+    successful, already-written report into a traceback. Fall back to replacing
+    only the characters the stream cannot represent.
+    """
+
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(encoding, "replace").decode(encoding))
+
+
 def configure_logging(level: str) -> None:
     """Initialize process logging."""
 
@@ -97,7 +114,7 @@ def run_plex_duplicates(config: Config, args: argparse.Namespace) -> int:
     reporter.write_report(report)
     reporter.log_report(report)
     if not args.json_only:
-        print(reporter.render_table(report, limit=args.limit))
+        _safe_print(reporter.render_table(report, limit=args.limit))
     return 0
 
 
