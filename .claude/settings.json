@@ -1,0 +1,79 @@
+{
+	"$schema": "https://json.schemastore.org/claude-code-settings.json",
+	"hooks": {
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": ".claude/scripts/precommit-gate.sh",
+						"args": [],
+						"timeout": 120,
+						"statusMessage": "Running compileall + unittest gate"
+					},
+					{
+						"type": "command",
+						"command": ".claude/scripts/implement-issue-gate.sh",
+						"args": [],
+						"timeout": 30,
+						"statusMessage": "Checking /implement-issue completion invariant"
+					}
+				]
+			}
+		]
+	},
+	"permissions": {
+		"allow": [
+			"Bash(python3 -m unittest*)",
+			"Bash(python3 -m compileall*)",
+			"Bash(python3 -m unraid_cache_cleaner*)",
+			"Bash(python -m unittest*)",
+
+			"Bash(git status)",
+			"Bash(git status:*)",
+			"Bash(git diff)",
+			"Bash(git diff:*)",
+			"Bash(git log)",
+			"Bash(git log:*)",
+			"Bash(git show)",
+			"Bash(git show:*)",
+			"Bash(git branch)",
+			"Bash(git branch:*)",
+			"Bash(git fetch)",
+			"Bash(git fetch:*)",
+			"Bash(git rev-parse:*)",
+			"Bash(git rev-list:*)",
+			"Bash(git ls-files:*)",
+			"Bash(git blame:*)",
+			"Bash(git switch:*)",
+			"Bash(git add:*)",
+			"Bash(git commit:*)",
+
+			"Bash(gh issue view:*)",
+			"Bash(gh issue list:*)",
+			"Bash(gh issue create:*)",
+			"Bash(gh issue comment:*)",
+			"Bash(gh issue edit:*)",
+			"Bash(gh pr view:*)",
+			"Bash(gh pr list:*)",
+			"Bash(gh pr diff:*)",
+			"Bash(gh pr checks:*)",
+			"Bash(gh pr create:*)",
+			"Bash(gh api:*)",
+			"Bash(gh auth status)",
+			"Bash(gh repo view:*)",
+			"Bash(gh label list)",
+
+			"Bash(codex exec:*)",
+
+			"Bash(ls:*)",
+			"Bash(find:*)",
+			"Bash(grep:*)",
+			"Bash(rg:*)",
+			"Bash(head:*)",
+			"Bash(tail:*)",
+			"Bash(wc:*)",
+			"Bash(jq:*)"
+		]
+	}
+}
