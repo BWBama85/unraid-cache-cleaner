@@ -245,7 +245,9 @@ class StackTests(unittest.TestCase):
         self.assertEqual(len(analyzed), 1)
         result = analyzed[0]
         self.assertEqual(result.classification, dedupe.MISMATCH)
+        # keeper is the sole merged logical copy: the two parts summed (5+9 GB).
         self.assertIsNotNone(result.keeper)
+        self.assertEqual(result.keeper.size, 14 * GB)
         self.assertEqual(result.reclaimable_bytes, 0)
         self.assertEqual(result.reclaimable_keep_smallest, 0)
 
