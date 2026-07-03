@@ -106,7 +106,7 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `PLEX_VERIFY_TLS` | `true` | Verify TLS certificates (set `false` for a self-signed reverse proxy) |
 | `PLEX_DUPLICATE_REPORT_PATH` | `/config/plex-duplicates.json` | JSON duplicate report output path |
 
-> **Note:** the `PLEX_*` variables are groundwork for the upcoming Plex duplicate report ([#4](https://github.com/BWBama85/unraid-cache-cleaner/issues/4)). No command consumes them yet — setting them has no effect until the `plex-duplicates` subcommand ships ([#7](https://github.com/BWBama85/unraid-cache-cleaner/issues/7)).
+> **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup.
 
 If `WATCH_PATHS` is empty, the service falls back to qBittorrent's default save path plus any `save_path` values currently used by torrents. In practice, explicitly setting `WATCH_PATHS` is better on Unraid.
 
@@ -117,6 +117,45 @@ Example:
 ```bash
 EXCLUDED_GLOBS=/data/logs/*,/data/orphaned-files/*,find_duplicates.sh,rar_extractor.sh,video_folders.log
 ```
+
+## Plex Duplicate Report
+
+`plex-duplicates` is a **read-only** subcommand that asks Plex which library items
+resolve to more than one file on disk, ranks each item's copies (resolution →
+bitrate → size, so a smaller-but-better encode is never mistaken for the worse
+copy), and reports how much space you could reclaim by keeping only the best
+copy. **It never deletes, moves, or unmonitors anything** — it only writes a
+report and prints a table.
+
+```bash
+PLEX_URL=http://192.168.1.10:32400 \
+PLEX_TOKEN=your-x-plex-token \
+PYTHONPATH=src python3 -m unraid_cache_cleaner plex-duplicates
+```
+
+With no `PLEX_SECTIONS` set it auto-detects your movie and TV libraries. It
+writes a JSON report to `PLEX_DUPLICATE_REPORT_PATH` (default
+`/config/plex-duplicates.json`) and prints a reclaimable-sorted table with three
+sections:
+
+- **Reclaimable (safe)** — duplicate/upgrade copies you can safely remove.
+- **Review — possible mismatches (not counted)** — items Plex merged from
+  *different* titles (e.g. the 1990 and 2014 *TMNT*). These are **never** counted
+  as reclaimable; check them by hand.
+- **⚠️ arr-tracked (Radarr/Sonarr)** — a placeholder, populated by a future
+  release ([#8](https://github.com/BWBama85/unraid-cache-cleaner/issues/8)).
+
+Flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--json-only` | Write the JSON report only; suppress the printed table |
+| `--limit N` | Cap printed rows per section (the JSON report is unaffected) |
+| `--section ID` | Scan a specific library section ID; repeatable; overrides `PLEX_SECTIONS` |
+
+Getting your token: open any item in Plex Web → **⋯ → Get Info → View XML**, and
+copy the `X-Plex-Token` value from the URL. It travels as a request header, never
+in a logged URL.
 
 ## Packaging
 

@@ -8,9 +8,10 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Dict, List, Optional
 
-from .models import PlexSection
+from .models import DuplicateGroup, MediaCopy, PlexSection
 
 LOGGER = logging.getLogger(__name__)
 
@@ -190,3 +191,104 @@ class PlexClient:
                 break
 
         return items
+
+
+def _as_int(value: object) -> int:
+    """Coerce a Plex numeric field to ``int``; ``None``/garbage -> ``0``."""
+
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_opt_int(value: object) -> Optional[int]:
+    """Coerce an optional Plex numeric field to ``int`` or ``None``."""
+
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _group_title(item: dict, kind: str, season: Optional[int], episode: Optional[int]) -> str:
+    """Human-friendly title. Episodes prefix the show and ``SxxEyy`` marker."""
+
+    title = str(item.get("title", "") or "")
+    if kind != "episode":
+        return title
+    show = str(item.get("grandparentTitle", "") or "")
+    marker = ""
+    if season is not None and episode is not None:
+        marker = f"S{season:02d}E{episode:02d}"
+    parts = [part for part in (show, marker, title) if part]
+    return " - ".join(parts) if parts else title
+
+
+def build_duplicate_group(item: dict, kind: str) -> Optional[DuplicateGroup]:
+    """Parse one raw Plex ``Metadata`` item into a :class:`DuplicateGroup`.
+
+    Walks ``Media -> Part`` into :class:`MediaCopy` records — one per ``Part``,
+    with every part of the same ``Media`` sharing its ``id`` as ``media_id`` so
+    the dedupe engine merges a stacked copy rather than counting its parts as
+    duplicates. ``Guid`` entries (from ``includeGuids=1``) become ``external_ids``.
+    A part without a ``file`` is skipped; an item that yields no parts returns
+    ``None`` so callers can drop it. Missing numeric fields default to ``0`` and
+    a missing resolution to ``""`` — the dedupe engine already handles both.
+    """
+
+    copies: List[MediaCopy] = []
+    for media_index, media in enumerate(item.get("Media") or []):
+        # A ``Media`` element normally carries a non-zero ``id`` that ties its
+        # parts together as one logical copy. If Plex omits it, fall back to a
+        # per-element negative id so this element's parts still merge (and stay
+        # distinct from other elements) instead of collapsing onto the ``0``
+        # sentinel the dedupe engine reads as "ungrouped, stands alone" — which
+        # would misread a stacked multi-part copy as separate duplicates.
+        raw_id = _as_int(media.get("id"))
+        media_id = raw_id if raw_id != 0 else -(media_index + 1)
+        resolution = str(media.get("videoResolution", "") or "")
+        bitrate = _as_int(media.get("bitrate"))
+        codec = str(media.get("videoCodec", "") or "")
+        container = str(media.get("container", "") or "")
+        for part in media.get("Part") or []:
+            file_path = part.get("file")
+            if not file_path:
+                continue
+            copies.append(
+                MediaCopy(
+                    part_id=_as_int(part.get("id")),
+                    file=Path(str(file_path)),
+                    size=_as_int(part.get("size")),
+                    resolution=resolution,
+                    bitrate=bitrate,
+                    codec=codec,
+                    container=container,
+                    media_id=media_id,
+                )
+            )
+    if not copies:
+        return None
+
+    external_ids: Dict[str, str] = {}
+    for guid in item.get("Guid") or []:
+        scheme, _, value = str(guid.get("id", "")).partition("://")
+        if scheme and value:
+            external_ids.setdefault(scheme, value)
+
+    season = _as_opt_int(item.get("parentIndex"))
+    episode = _as_opt_int(item.get("index"))
+    return DuplicateGroup(
+        rating_key=str(item.get("ratingKey", "")),
+        kind=kind,
+        title=_group_title(item, kind, season, episode),
+        copies=tuple(copies),
+        year=_as_opt_int(item.get("year")),
+        season=season,
+        episode=episode,
+        external_ids=external_ids,
+    )
