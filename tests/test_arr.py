@@ -13,6 +13,8 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from _fake_http import FakeHTTPHandler as _FakeHTTPHandler
+from _fake_http import FakeHTTPResponse as _FakeHTTPResponse
 from unraid_cache_cleaner import arr, dedupe
 from unraid_cache_cleaner.arr import (
     ArrClientError,
@@ -177,6 +179,70 @@ class ArrClientTests(unittest.TestCase):
 
         self.assertIn("Unable to reach Radarr", str(ctx.exception))
         self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
+
+
+# --------------------------------------------------------------------------- #
+# Redirect safety — real opener, fake socket layer (see tests/_fake_http.py)    #
+# --------------------------------------------------------------------------- #
+
+def _radarr_with_fake(base_url: str, responder):
+    client = RadarrClient(base_url, "SECRET-KEY-123")
+    fake = _FakeHTTPHandler(responder)
+    client._opener.add_handler(fake)
+    return client, fake
+
+
+class RedirectSafetyTests(unittest.TestCase):
+    def test_cross_host_redirect_refused_and_key_not_leaked(self) -> None:
+        def responder(req):
+            return _FakeHTTPResponse(302, "Location: http://evil.example/steal\n")
+
+        client, fake = _radarr_with_fake("http://radarr:7878", responder)
+
+        with self.assertRaises(ArrClientError) as ctx:
+            client.fetch_tracked_index()
+
+        self.assertIn("refusing to follow", str(ctx.exception))
+        self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
+        # The redirect target is never contacted, so the API key — which rides
+        # only on requests to the configured host — cannot reach it.
+        hosts = [urlparse(r.full_url).hostname for r in fake.requests]
+        self.assertEqual(hosts, ["radarr"])
+        for req in fake.requests:
+            self.assertNotIn("evil.example", req.full_url)
+
+    def test_tls_downgrade_redirect_refused(self) -> None:
+        def responder(req):
+            return _FakeHTTPResponse(302, "Location: http://radarr:7878/steal\n")
+
+        client, fake = _radarr_with_fake("https://radarr:7878", responder)
+
+        with self.assertRaises(ArrClientError) as ctx:
+            client.fetch_tracked_index()
+
+        self.assertIn("refusing to follow", str(ctx.exception))
+        self.assertEqual([urlparse(r.full_url).scheme for r in fake.requests], ["https"])
+
+    def test_same_host_redirect_followed_and_recarries_key(self) -> None:
+        movies = json.dumps(
+            [{"tmdbId": 111, "movieFile": {"path": "/movies/A/a.mkv"}}]
+        ).encode("utf-8")
+
+        def responder(req):
+            if urlparse(req.full_url).path == "/api/v3/movie":
+                return _FakeHTTPResponse(302, "Location: http://radarr:7878/relocated\n")
+            return _FakeHTTPResponse(200, "Content-Type: application/json\n", movies)
+
+        client, fake = _radarr_with_fake("http://radarr:7878", responder)
+
+        index = client.fetch_tracked_index()
+
+        self.assertEqual(index, {"111": {"a.mkv"}})
+        self.assertEqual([urlparse(r.full_url).path for r in fake.requests],
+                         ["/api/v3/movie", "/relocated"])
+        # The followed request re-carries the key (added as an unredirected
+        # header on every open()).
+        self.assertEqual(fake.requests[1].get_header("X-api-key"), "SECRET-KEY-123")
 
 
 # --------------------------------------------------------------------------- #
