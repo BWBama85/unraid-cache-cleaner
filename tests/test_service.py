@@ -56,6 +56,7 @@ class ServiceTests(unittest.TestCase):
                 state_db_path=config_root / "state.sqlite3",
                 report_path=config_root / "last-run.json",
                 log_level="INFO",
+                plex_duplicate_report_path=config_root / "plex-duplicates.json",
             )
             config.ensure_directories()
             service = CleanerService(config, FakeClient([], watch_root), StateStore(config.state_db_path))
@@ -106,6 +107,7 @@ class ServiceTests(unittest.TestCase):
                 state_db_path=config_root / "state.sqlite3",
                 report_path=config_root / "last-run.json",
                 log_level="INFO",
+                plex_duplicate_report_path=config_root / "plex-duplicates.json",
             )
             config.ensure_directories()
             service = CleanerService(config, FakeClient([torrent], watch_root), StateStore(config.state_db_path))
@@ -148,6 +150,7 @@ class ServiceTests(unittest.TestCase):
                 state_db_path=config_root / "state.sqlite3",
                 report_path=config_root / "last-run.json",
                 log_level="INFO",
+                plex_duplicate_report_path=config_root / "plex-duplicates.json",
             )
             config.ensure_directories()
             service = CleanerService(config, FakeClient([], watch_root), StateStore(config.state_db_path))
