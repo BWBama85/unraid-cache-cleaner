@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from . import dedupe
+from .http_redirect import build_handler
 from .models import DuplicateGroup, MediaCopy
 
 TRACKED = "tracked"
@@ -84,7 +85,13 @@ class _ArrClient:
         self._opener = self._build_opener()
 
     def _build_opener(self) -> urllib.request.OpenerDirector:
-        handlers: list[urllib.request.BaseHandler] = []
+        handlers: list[urllib.request.BaseHandler] = [
+            build_handler(
+                self.base_url,
+                service_name=self.service_name,
+                error_factory=ArrClientError,
+            ),
+        ]
 
         if self.base_url.startswith("https://"):
             context = ssl.create_default_context()

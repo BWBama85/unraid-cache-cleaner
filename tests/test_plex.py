@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.models import PlexSection
-from unraid_cache_cleaner.plex import PlexClient, PlexClientError, _HostBoundRedirectHandler
+from unraid_cache_cleaner.plex import PlexClient, PlexClientError
 
 
 class _FakeResponse:
@@ -159,25 +159,6 @@ class RedirectSafetyTests(unittest.TestCase):
         self.assertEqual([urlparse(r.full_url).path for r in fake.requests],
                          ["/library/sections", "/relocated"])
         self.assertEqual(fake.requests[1].get_header("X-plex-token"), "SECRET-TOKEN-123")
-
-    def test_redirect_request_rejects_cross_host_directly(self) -> None:
-        handler = _HostBoundRedirectHandler("plex", require_tls=False)
-        req = urllib.request.Request("http://plex:32400/library/sections")
-        with self.assertRaises(PlexClientError):
-            handler.redirect_request(req, None, 302, "Found", {}, "http://evil.example/steal")
-
-    def test_redirect_request_rejects_tls_downgrade(self) -> None:
-        handler = _HostBoundRedirectHandler("plex", require_tls=True)
-        req = urllib.request.Request("https://plex:32400/library/sections")
-        with self.assertRaises(PlexClientError):
-            handler.redirect_request(req, None, 302, "Found", {}, "http://plex:32400/library/sections")
-
-    def test_redirect_request_allows_same_host(self) -> None:
-        handler = _HostBoundRedirectHandler("plex", require_tls=False)
-        req = urllib.request.Request("http://plex:32400/library/sections")
-        new = handler.redirect_request(req, None, 302, "Found", {}, "http://plex:32400/relocated")
-        self.assertIsInstance(new, urllib.request.Request)
-        self.assertEqual(urlparse(new.full_url).path, "/relocated")
 
 
 class PlexClientTests(unittest.TestCase):

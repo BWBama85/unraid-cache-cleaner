@@ -11,11 +11,16 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Dict, Optional
 
+from .http_redirect import build_handler
 from .models import TorrentRecord
 
 
 class QbittorrentClientError(RuntimeError):
     """Raised when qBittorrent cannot be queried safely."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class QbittorrentClient:
@@ -42,6 +47,11 @@ class QbittorrentClient:
     def _build_opener(self) -> urllib.request.OpenerDirector:
         handlers: list[urllib.request.BaseHandler] = [
             urllib.request.HTTPCookieProcessor(self._cookie_jar),
+            build_handler(
+                self.base_url,
+                service_name="qBittorrent",
+                error_factory=QbittorrentClientError,
+            ),
         ]
 
         if self.base_url.startswith("https://"):
