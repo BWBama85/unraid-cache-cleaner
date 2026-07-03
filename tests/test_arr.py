@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
 import unittest
 import urllib.error
@@ -164,6 +165,19 @@ class ArrClientTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 500)
         self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
 
+    def test_read_timeout_wrapped_as_arrclienterror(self) -> None:
+        # A read-phase socket.timeout is an OSError that urllib does NOT wrap in
+        # URLError; it must still surface as ArrClientError so the report degrades
+        # gracefully instead of crashing.
+        opener = _RecordingOpener(_raiser(socket.timeout("timed out")))
+        client = _radarr(opener)
+
+        with self.assertRaises(ArrClientError) as ctx:
+            client.fetch_tracked_index()
+
+        self.assertIn("Unable to reach Radarr", str(ctx.exception))
+        self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
+
 
 # --------------------------------------------------------------------------- #
 # annotate() — pure association engine                                         #
@@ -267,12 +281,12 @@ class AnnotateMovieTests(unittest.TestCase):
         [out] = annotate([group], {}, set())
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
-    def test_stacked_parts_preserve_first_part_association(self) -> None:
+    def _stacked_group(self):
         # A stacked copy (cd1+cd2 share media_id) plus a second single copy.
         cd1 = MediaCopy(part_id=1, file=Path("/m/cd1.mkv"), size=5 * GiB, resolution="1080", media_id=10)
         cd2 = MediaCopy(part_id=2, file=Path("/m/cd2.mkv"), size=5 * GiB, resolution="1080", media_id=10)
         other = MediaCopy(part_id=3, file=Path("/m/other.mkv"), size=6 * GiB, resolution="1080", media_id=11)
-        group = dedupe.analyze_group(
+        return dedupe.analyze_group(
             DuplicateGroup(
                 rating_key="1",
                 kind="movie",
@@ -282,12 +296,37 @@ class AnnotateMovieTests(unittest.TestCase):
             )
         )
 
-        [out] = annotate([group], {"123": {"cd1.mkv"}}, set())
+    def test_stacked_first_part_tracked_marks_copy_tracked(self) -> None:
+        [out] = annotate([self._stacked_group()], {"123": {"cd1.mkv"}}, set())
 
-        # the merged logical copy (keyed on cd1) is tracked; the other is untracked
         ranked = {c.file.name: c.association for c in dedupe.rank_copies(out)}
         self.assertEqual(ranked["cd1.mkv"], arr.TRACKED)
         self.assertEqual(ranked["other.mkv"], arr.UNTRACKED)
+
+    def test_stacked_non_first_part_tracked_still_marks_copy_tracked(self) -> None:
+        # Radarr tracks cd2 (the SECOND part). The merged copy keeps cd1's fields,
+        # so the whole stack must carry the tracked label or the merged copy would
+        # read as safe while deleting it re-downloads cd2.
+        [out] = annotate([self._stacked_group()], {"123": {"cd2.mkv"}}, set())
+
+        ranked = {c.file.name: c.association for c in dedupe.rank_copies(out)}
+        self.assertEqual(ranked["cd1.mkv"], arr.TRACKED)
+        self.assertEqual(ranked["other.mkv"], arr.UNTRACKED)
+
+    def test_mismatch_group_never_labeled_safe(self) -> None:
+        # Two different films Plex merged into one group ({tmdb-111} vs {tmdb-222}).
+        # Even though Radarr tracks the first film's basename, no copy may be
+        # labeled untracked/safe — the grouping is not trusted.
+        group = _movie_group(
+            "111",
+            [("/m/A {tmdb-111}/a.mkv", 5 * GiB, "1080"), ("/m/B {tmdb-222}/b.mkv", 6 * GiB, "1080")],
+        )
+        self.assertEqual(group.classification, dedupe.MISMATCH)
+
+        [out] = annotate([group], {"111": {"a.mkv"}}, set())
+
+        self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
+        self.assertTrue(all(c.arr_tracked is None for c in out.copies))
 
 
 class AnnotateEpisodeTests(unittest.TestCase):

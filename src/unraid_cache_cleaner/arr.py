@@ -30,7 +30,6 @@ reliable:
 from __future__ import annotations
 
 import json
-import logging
 import ssl
 import urllib.error
 import urllib.parse
@@ -41,8 +40,6 @@ from typing import Dict, List, Optional, Set
 
 from . import dedupe
 from .models import DuplicateGroup, MediaCopy
-
-LOGGER = logging.getLogger(__name__)
 
 TRACKED = "tracked"
 UNTRACKED = "untracked"
@@ -128,6 +125,14 @@ class _ArrClient:
             raise ArrClientError(
                 f"Unable to connect to {self.service_name} at {self.base_url}: {exc.reason}"
             ) from exc
+        except OSError as exc:
+            # A read-phase timeout (socket.timeout/TimeoutError) or dropped
+            # connection is an OSError that urllib does NOT wrap in URLError, so it
+            # would otherwise escape _build_arr_indexes' ArrClientError handler and
+            # crash the read-only report instead of degrading gracefully.
+            raise ArrClientError(
+                f"Unable to reach {self.service_name} at {self.base_url}: {exc}"
+            ) from exc
 
         try:
             return json.loads(body)
@@ -176,6 +181,10 @@ class SonarrClient(_ArrClient):
     service_name = "Sonarr"
 
     def fetch_tracked_index(self) -> Set[str]:
+        # N+1: one /series call plus one /episodefile call per series. Fine for a
+        # manual, one-shot report against a LAN Sonarr; a library with hundreds of
+        # series means hundreds of serial round-trips. Bulk retrieval is a
+        # follow-up optimization, not needed for correctness.
         series_list = self._get_json("/api/v3/series")
         basenames: Set[str] = set()
         for series in series_list or []:
@@ -195,11 +204,44 @@ class SonarrClient(_ArrClient):
 
 
 def _refresh(group: DuplicateGroup, copies: tuple[MediaCopy, ...]) -> DuplicateGroup:
-    """Re-run the (idempotent) dedupe analysis so ``keeper`` carries the new
-    per-copy association too. Size/resolution are untouched, so classification
-    and reclaimable math are unchanged."""
+    """Swap in the annotated ``copies`` and re-point ``keeper`` at the annotated
+    best copy. Annotation only sets association fields, so classification and the
+    reclaimable math are unchanged and are kept as-is (no need for a full
+    re-analysis) — only ``keeper`` must be re-derived so it, too, carries the
+    association."""
 
-    return dedupe.analyze_group(replace(group, copies=copies))
+    ranked = dedupe.rank_copies(replace(group, copies=copies))
+    return replace(group, copies=copies, keeper=ranked[0] if ranked else None)
+
+
+def _stack_key(copy: MediaCopy, index: int):
+    """Group parts into logical copies exactly as ``dedupe._merge_stacks`` does.
+
+    A non-zero ``media_id`` ties a stacked copy's parts together; ``0`` means
+    ungrouped, so each such part stands alone (keyed by position, never shared).
+    """
+
+    return copy.media_id if copy.media_id != 0 else ("solo", index)
+
+
+def _apply(
+    group: DuplicateGroup, associations: List[tuple[str, Optional[str]]]
+) -> DuplicateGroup:
+    copies = tuple(
+        replace(c, association=assoc, arr_tracked=name)
+        for c, (assoc, name) in zip(group.copies, associations)
+    )
+    return _refresh(group, copies)
+
+
+def _all_unknown(group: DuplicateGroup) -> DuplicateGroup:
+    return _apply(group, [(UNKNOWN, None)] * len(group.copies))
+
+
+def _stacks_with(group: DuplicateGroup, matched: List[bool]) -> set:
+    """The stack keys whose logical copy contains at least one matched part."""
+
+    return {_stack_key(c, i) for i, c in enumerate(group.copies) if matched[i]}
 
 
 def _annotate_by_id(
@@ -210,19 +252,25 @@ def _annotate_by_id(
 ) -> DuplicateGroup:
     plex_id = group.external_ids.get(namespace)
     tracked_basenames = index.get(plex_id) if plex_id else None
+    matched = [
+        bool(tracked_basenames) and c.file.name in tracked_basenames for c in group.copies
+    ]
 
-    if tracked_basenames and any(c.file.name in tracked_basenames for c in group.copies):
-        copies = tuple(
-            replace(c, association=TRACKED, arr_tracked=arr_name)
-            if c.file.name in tracked_basenames
-            else replace(c, association=UNTRACKED, arr_tracked=None)
-            for c in group.copies
-        )
-    else:
-        # Id absent in Plex, id not in the *arr, or no copy basename matches
-        # (mount map ambiguous): never claim safe.
-        copies = tuple(replace(c, association=UNKNOWN, arr_tracked=None) for c in group.copies)
-    return _refresh(group, copies)
+    # Id absent in Plex, id not in the *arr, or no part basename matches (mount
+    # map ambiguous): never claim safe.
+    if not any(matched):
+        return _all_unknown(group)
+
+    # A stacked copy is one logical unit: if any of its parts is *arr-tracked,
+    # deleting the copy re-downloads it, so every part of that stack is tracked
+    # (and _merge_stacks then keeps that label on the merged copy). Parts in a
+    # stack the *arr does not track are the redundant, safe-to-delete copies.
+    tracked_stacks = _stacks_with(group, matched)
+    associations = [
+        (TRACKED, arr_name) if _stack_key(c, i) in tracked_stacks else (UNTRACKED, None)
+        for i, c in enumerate(group.copies)
+    ]
+    return _apply(group, associations)
 
 
 def _annotate_by_basename(
@@ -230,13 +278,15 @@ def _annotate_by_basename(
     tracked_basenames: Set[str],
     arr_name: str,
 ) -> DuplicateGroup:
-    copies = tuple(
-        replace(c, association=TRACKED, arr_tracked=arr_name)
-        if c.file.name in tracked_basenames
-        else replace(c, association=UNKNOWN, arr_tracked=None)
-        for c in group.copies
-    )
-    return _refresh(group, copies)
+    matched = [c.file.name in tracked_basenames for c in group.copies]
+    tracked_stacks = _stacks_with(group, matched)
+    # No reliable id anchor for episodes, so a non-tracked part is ``unknown``
+    # (never ``untracked``/safe) — see the module docstring.
+    associations = [
+        (TRACKED, arr_name) if _stack_key(c, i) in tracked_stacks else (UNKNOWN, None)
+        for i, c in enumerate(group.copies)
+    ]
+    return _apply(group, associations)
 
 
 def annotate(
@@ -249,12 +299,17 @@ def annotate(
     ``radarr_index`` maps TMDB id -> tracked movie-file basenames;
     ``sonarr_basenames`` is the flat set of tracked episode-file basenames. An
     empty index/set (e.g. that ``*arr`` unconfigured or unreachable) leaves the
-    relevant kind ``unknown``. Non-movie/episode kinds pass through untouched.
+    relevant kind ``unknown``. ``mismatch`` groups (Plex merged different titles)
+    and non-movie/episode kinds are never labeled tracked/untracked — their
+    copies keep the default ``unknown``, so a copy we don't trust the grouping of
+    is never presented as safe.
     """
 
     out: List[DuplicateGroup] = []
     for group in groups:
-        if group.kind == "movie":
+        if group.classification == dedupe.MISMATCH:
+            out.append(group)
+        elif group.kind == "movie":
             out.append(_annotate_by_id(group, radarr_index, "tmdb", RADARR))
         elif group.kind == "episode":
             out.append(_annotate_by_basename(group, sonarr_basenames, SONARR))

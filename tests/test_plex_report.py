@@ -588,6 +588,35 @@ class ArrAssociationTests(unittest.TestCase):
             # the extra TV copy is unknown, never falsely labeled untracked/safe
             self.assertEqual(copies["b.mkv"]["association"], "unknown")
 
+    def test_mismatch_copies_never_labeled_untracked_in_json(self) -> None:
+        # Radarr tracks the first film's file, but the group is a Plex mismatch
+        # (two tmdb ids). No copy may be serialized as untracked/safe.
+        mismatch = _movie(
+            "800",
+            "Mismatch",
+            [
+                _media(1, "1080", 9000, [_part(81, "/movies/A {tmdb-111}/a.mkv", 5 * GiB)]),
+                _media(2, "1080", 9000, [_part(82, "/movies/B {tmdb-222}/b.mkv", 6 * GiB)]),
+            ],
+            guids=["tmdb://111"],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            client = FakePlexClient(
+                [PlexSection(key="1", type="movie", title="Movies")], {("1", 1): [mismatch]}
+            )
+            radarr = FakeArrClient({"111": {"a.mkv"}})
+            reporter = _arr_reporter(tmp, client, radarr=radarr)
+
+            payload = reporter.build_payload(reporter.generate())
+
+            group = payload["groups"][0]
+            self.assertEqual(group["classification"], "mismatch")
+            self.assertTrue(
+                all(c["association"] == "unknown" for c in group["copies"]),
+                group["copies"],
+            )
+
     def test_no_tracked_reclaim_reports_all_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

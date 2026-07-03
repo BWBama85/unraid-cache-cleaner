@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import arr, dedupe
 from .arr import ArrClientError, RadarrClient, SonarrClient
@@ -162,7 +162,9 @@ class PlexDuplicateReporter:
             arr_enabled=self._arr_enabled,
         )
 
-    def _build_arr_indexes(self, warnings: List[str]):
+    def _build_arr_indexes(
+        self, warnings: List[str]
+    ) -> Tuple[Dict[str, Set[str]], Set[str]]:
         """Fetch the Radarr/Sonarr tracked indexes, degrading gracefully.
 
         An unconfigured client contributes an empty index; a configured but
@@ -413,14 +415,13 @@ class PlexDuplicateReporter:
                 "SONARR_URL/SONARR_API_KEY to flag copies that re-download when deleted."
             ]
 
-        flagged = [
-            (group, tracked)
-            for group in reclaimable
-            for tracked in [
-                [c for c in self._reclaim_candidates(group) if c.association == arr.TRACKED]
+        flagged: List[Tuple[DuplicateGroup, List[MediaCopy]]] = []
+        for group in reclaimable:
+            tracked = [
+                copy for copy in self._reclaim_candidates(group) if copy.association == arr.TRACKED
             ]
-            if tracked
-        ]
+            if tracked:
+                flagged.append((group, tracked))
         if not flagged:
             return ["  (no reclaimable copy is *arr-tracked - all safe to delete)"]
 
