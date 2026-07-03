@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import email
 import io
 import json
 import sys
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.models import PlexSection
-from unraid_cache_cleaner.plex import PlexClient, PlexClientError
+from unraid_cache_cleaner.plex import PlexClient, PlexClientError, _HostBoundRedirectHandler
 
 
 class _FakeResponse:
@@ -59,6 +61,123 @@ def _raiser(exc: Exception):
         raise exc
 
     return responder
+
+
+class _FakeHTTPResponse:
+    """Minimal stand-in for ``http.client.HTTPResponse`` for the real opener."""
+
+    def __init__(self, code: int, header_text: str, body: bytes = b"") -> None:
+        self.code = code
+        self.status = code
+        self.msg = "Testing"
+        self._info = email.message_from_string(header_text)
+        self._buf = io.BytesIO(body)
+
+    def info(self):
+        return self._info
+
+    def geturl(self) -> str:
+        return ""
+
+    def read(self, amt: int | None = None) -> bytes:
+        return self._buf.read() if amt is None else self._buf.read(amt)
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "_FakeHTTPResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+class _FakeHTTPHandler(urllib.request.BaseHandler):
+    """Intercepts the socket layer of a *real* opener; records every request.
+
+    Sorts ahead of the default HTTP(S) handlers (``handler_order``) so it answers
+    before a real socket is opened, while the opener's redirect handler, error
+    processor, and ``addheaders`` (the token) all run exactly as in production.
+    """
+
+    handler_order = 100
+
+    def __init__(self, responder) -> None:
+        self._responder = responder
+        self.requests = []
+
+    def http_open(self, req):
+        self.requests.append(req)
+        return self._responder(req)
+
+    https_open = http_open
+
+
+def _client_with_fake(base_url: str, responder):
+    client = PlexClient(base_url, "SECRET-TOKEN-123")
+    fake = _FakeHTTPHandler(responder)
+    client._opener.add_handler(fake)
+    return client, fake
+
+
+class RedirectSafetyTests(unittest.TestCase):
+    def test_cross_host_redirect_refused_and_token_not_leaked(self) -> None:
+        def responder(req):
+            return _FakeHTTPResponse(302, "Location: http://evil.example/steal\n")
+
+        client, fake = _client_with_fake("http://plex:32400", responder)
+
+        with self.assertRaises(PlexClientError) as ctx:
+            client.fetch_sections()
+
+        self.assertIn("refusing to follow", str(ctx.exception))
+        self.assertNotIn("SECRET-TOKEN-123", str(ctx.exception))
+        # The redirect target is never contacted, so the token — which rides only
+        # on requests to the configured host — cannot reach it.
+        hosts = [urlparse(r.full_url).hostname for r in fake.requests]
+        self.assertEqual(hosts, ["plex"])
+        for req in fake.requests:
+            self.assertNotIn("evil.example", req.full_url)
+
+    def test_same_host_redirect_followed_and_stays_authenticated(self) -> None:
+        sections = json.dumps(
+            {"MediaContainer": {"Directory": [{"key": "1", "type": "movie", "title": "Movies"}]}}
+        ).encode("utf-8")
+
+        def responder(req):
+            if urlparse(req.full_url).path == "/library/sections":
+                return _FakeHTTPResponse(302, "Location: http://plex:32400/relocated\n")
+            return _FakeHTTPResponse(200, "Content-Type: application/json\n", sections)
+
+        client, fake = _client_with_fake("http://plex:32400", responder)
+
+        result = client.fetch_sections()
+
+        self.assertEqual(result, [PlexSection(key="1", type="movie", title="Movies")])
+        # Two hops, both on the configured host; the followed request re-carries
+        # the token (added as an unredirected header on every open()).
+        self.assertEqual([urlparse(r.full_url).path for r in fake.requests],
+                         ["/library/sections", "/relocated"])
+        self.assertEqual(fake.requests[1].get_header("X-plex-token"), "SECRET-TOKEN-123")
+
+    def test_redirect_request_rejects_cross_host_directly(self) -> None:
+        handler = _HostBoundRedirectHandler("plex", require_tls=False)
+        req = urllib.request.Request("http://plex:32400/library/sections")
+        with self.assertRaises(PlexClientError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://evil.example/steal")
+
+    def test_redirect_request_rejects_tls_downgrade(self) -> None:
+        handler = _HostBoundRedirectHandler("plex", require_tls=True)
+        req = urllib.request.Request("https://plex:32400/library/sections")
+        with self.assertRaises(PlexClientError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://plex:32400/library/sections")
+
+    def test_redirect_request_allows_same_host(self) -> None:
+        handler = _HostBoundRedirectHandler("plex", require_tls=False)
+        req = urllib.request.Request("http://plex:32400/library/sections")
+        new = handler.redirect_request(req, None, 302, "Found", {}, "http://plex:32400/relocated")
+        self.assertIsInstance(new, urllib.request.Request)
+        self.assertEqual(urlparse(new.full_url).path, "/relocated")
 
 
 class PlexClientTests(unittest.TestCase):
