@@ -281,6 +281,32 @@ class AnnotateMovieTests(unittest.TestCase):
         [out] = annotate([group], {}, set())
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
+    def test_ambiguous_duplicate_basename_is_unknown(self) -> None:
+        # Two copies of the same movie share a filename in different dirs. Radarr
+        # tracks one exact path but the basename matches both, so neither can be
+        # confidently called tracked -> both unknown (never untracked/safe).
+        group = _movie_group(
+            "123",
+            [("/movies/Real/big.mkv", 20 * GiB, "4k"), ("/movies/OldDupe/big.mkv", 8 * GiB, "1080")],
+        )
+        [out] = annotate([group], {"123": {"big.mkv"}}, set())
+
+        self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
+        self.assertTrue(all(c.arr_tracked is None for c in out.copies))
+
+    def test_unique_match_still_tracks_when_a_sibling_differs(self) -> None:
+        # Only the ambiguous case degrades: a uniquely-named tracked copy is still
+        # tracked and its differently-named sibling still untracked.
+        group = _movie_group(
+            "123",
+            [("/movies/M/big.4k.mkv", 20 * GiB, "4k"), ("/movies/M/big.1080.mkv", 8 * GiB, "1080")],
+        )
+        [out] = annotate([group], {"123": {"big.4k.mkv"}}, set())
+        self.assertEqual(
+            _by_name(out),
+            {"big.4k.mkv": (arr.TRACKED, arr.RADARR), "big.1080.mkv": (arr.UNTRACKED, None)},
+        )
+
     def _stacked_group(self):
         # A stacked copy (cd1+cd2 share media_id) plus a second single copy.
         cd1 = MediaCopy(part_id=1, file=Path("/m/cd1.mkv"), size=5 * GiB, resolution="1080", media_id=10)
@@ -346,6 +372,15 @@ class AnnotateEpisodeTests(unittest.TestCase):
             [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e2.mkv", 3 * GiB, "1080")],
         )
         [out] = annotate([group], {}, {"totally-different.mkv"})
+        self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
+
+    def test_ambiguous_episode_basename_is_unknown(self) -> None:
+        # Two episode copies share a filename; Sonarr tracks that name but can't
+        # be pinned to one -> both unknown, not tracked.
+        group = _episode_group(
+            [("/tv/A/e1.mkv", 3 * GiB, "1080"), ("/tv/B/e1.mkv", 3 * GiB, "1080")],
+        )
+        [out] = annotate([group], {}, {"e1.mkv"})
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
     def test_other_kind_passes_through_untouched(self) -> None:

@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from . import dedupe
 from .models import DuplicateGroup, MediaCopy
@@ -238,10 +238,35 @@ def _all_unknown(group: DuplicateGroup) -> DuplicateGroup:
     return _apply(group, [(UNKNOWN, None)] * len(group.copies))
 
 
-def _stacks_with(group: DuplicateGroup, matched: List[bool]) -> set:
-    """The stack keys whose logical copy contains at least one matched part."""
+def _match_stacks(
+    group: DuplicateGroup, tracked_basenames: Set[str]
+) -> Tuple[set, set]:
+    """Partition the group's logical copies (stacks) by how their part basenames
+    match the ``*arr``'s tracked files.
 
-    return {_stack_key(c, i) for i, c in enumerate(group.copies) if matched[i]}
+    Returns ``(tracked_stacks, ambiguous_stacks)``. The ``*arr`` tracks one exact
+    path per item, but the index only knows basenames (to bridge mount-path
+    differences), so a basename that matches parts in more than one stack cannot
+    be pinned to a single copy — those stacks are *ambiguous*, not confidently
+    tracked. A basename that matches exactly one stack marks it ``tracked``. A
+    stack pinned by any unique basename stays tracked even if it also carries a
+    shared one.
+    """
+
+    basename_stacks: Dict[str, set] = {}
+    for i, copy in enumerate(group.copies):
+        if copy.file.name in tracked_basenames:
+            basename_stacks.setdefault(copy.file.name, set()).add(_stack_key(copy, i))
+
+    tracked: set = set()
+    ambiguous: set = set()
+    for stacks in basename_stacks.values():
+        if len(stacks) == 1:
+            tracked |= stacks
+        else:
+            ambiguous |= stacks
+    ambiguous -= tracked
+    return tracked, ambiguous
 
 
 def _annotate_by_id(
@@ -252,24 +277,29 @@ def _annotate_by_id(
 ) -> DuplicateGroup:
     plex_id = group.external_ids.get(namespace)
     tracked_basenames = index.get(plex_id) if plex_id else None
-    matched = [
-        bool(tracked_basenames) and c.file.name in tracked_basenames for c in group.copies
-    ]
 
-    # Id absent in Plex, id not in the *arr, or no part basename matches (mount
-    # map ambiguous): never claim safe.
-    if not any(matched):
+    # Id absent in Plex, or id not in the *arr: never claim safe.
+    if not tracked_basenames:
         return _all_unknown(group)
 
-    # A stacked copy is one logical unit: if any of its parts is *arr-tracked,
-    # deleting the copy re-downloads it, so every part of that stack is tracked
-    # (and _merge_stacks then keeps that label on the merged copy). Parts in a
-    # stack the *arr does not track are the redundant, safe-to-delete copies.
-    tracked_stacks = _stacks_with(group, matched)
-    associations = [
-        (TRACKED, arr_name) if _stack_key(c, i) in tracked_stacks else (UNTRACKED, None)
-        for i, c in enumerate(group.copies)
-    ]
+    tracked_stacks, ambiguous_stacks = _match_stacks(group, tracked_basenames)
+    if not tracked_stacks and not ambiguous_stacks:
+        # Id matched but no basename matches (mount map ambiguous): all unknown.
+        return _all_unknown(group)
+
+    # A stacked copy is one logical unit: a stack the *arr uniquely tracks is
+    # tracked (deleting it re-downloads); a stack whose only match is a basename
+    # shared with another copy is unknown (can't tell which is the real file);
+    # a stack matching nothing is the redundant, safe-to-delete copy.
+    associations: List[tuple[str, Optional[str]]] = []
+    for i, copy in enumerate(group.copies):
+        key = _stack_key(copy, i)
+        if key in tracked_stacks:
+            associations.append((TRACKED, arr_name))
+        elif key in ambiguous_stacks:
+            associations.append((UNKNOWN, None))
+        else:
+            associations.append((UNTRACKED, None))
     return _apply(group, associations)
 
 
@@ -278,10 +308,9 @@ def _annotate_by_basename(
     tracked_basenames: Set[str],
     arr_name: str,
 ) -> DuplicateGroup:
-    matched = [c.file.name in tracked_basenames for c in group.copies]
-    tracked_stacks = _stacks_with(group, matched)
-    # No reliable id anchor for episodes, so a non-tracked part is ``unknown``
-    # (never ``untracked``/safe) — see the module docstring.
+    tracked_stacks, _ = _match_stacks(group, tracked_basenames)
+    # No reliable id anchor for episodes, so anything not uniquely tracked —
+    # ambiguous or unmatched — is ``unknown`` (never ``untracked``/safe).
     associations = [
         (TRACKED, arr_name) if _stack_key(c, i) in tracked_stacks else (UNKNOWN, None)
         for i, c in enumerate(group.copies)

@@ -416,13 +416,22 @@ class PlexDuplicateReporter:
             ]
 
         flagged: List[Tuple[DuplicateGroup, List[MediaCopy]]] = []
+        unknown_count = 0
         for group in reclaimable:
-            tracked = [
-                copy for copy in self._reclaim_candidates(group) if copy.association == arr.TRACKED
-            ]
+            candidates = self._reclaim_candidates(group)
+            tracked = [copy for copy in candidates if copy.association == arr.TRACKED]
+            unknown_count += sum(1 for copy in candidates if copy.association == arr.UNKNOWN)
             if tracked:
                 flagged.append((group, tracked))
         if not flagged:
+            # "safe" is only honest when nothing is unconfirmed: unknown reclaim
+            # candidates (an *arr outage, or a TV copy whose filename didn't
+            # match) are tagged [arr:?] above and must not be called safe.
+            if unknown_count:
+                return [
+                    f"  No *arr-tracked reclaimable copies, but {unknown_count} are "
+                    "unconfirmed ([arr:?] above) - verify those before deleting."
+                ]
             return ["  (no reclaimable copy is *arr-tracked - all safe to delete)"]
 
         shown = flagged if limit is None else flagged[:limit]

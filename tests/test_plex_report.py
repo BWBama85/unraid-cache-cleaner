@@ -626,6 +626,18 @@ class ArrAssociationTests(unittest.TestCase):
             table = reporter.render_table(reporter.generate())
             self.assertIn("all safe to delete", table)
 
+    def test_unknown_reclaim_candidate_not_called_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            # tmdb 700 isn't in the index -> every copy unknown, none tracked.
+            radarr = FakeArrClient({"999": {"other.mkv"}})
+            reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
+
+            table = reporter.render_table(reporter.generate())
+            self.assertNotIn("all safe to delete", table)
+            self.assertIn("verify those before deleting", table)
+            self.assertIn("[arr:?]", table)
+
 
 if __name__ == "__main__":
     unittest.main()
