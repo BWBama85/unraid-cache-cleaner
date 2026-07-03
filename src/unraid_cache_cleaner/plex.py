@@ -46,7 +46,15 @@ class _HostBoundRedirectHandler(urllib.request.HTTPRedirectHandler):
         self._allowed_host = allowed_host.lower()
         self._require_tls = require_tls
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> Optional[urllib.request.Request]:
         target = urllib.parse.urlparse(newurl)
         target_host = (target.hostname or "").lower()
         if target_host != self._allowed_host or (self._require_tls and target.scheme != "https"):
@@ -86,11 +94,12 @@ class PlexClient:
         handlers: list[urllib.request.BaseHandler] = []
 
         parsed = urllib.parse.urlparse(self.base_url)
+        use_tls = parsed.scheme == "https"
         handlers.append(
-            _HostBoundRedirectHandler(parsed.hostname or "", require_tls=parsed.scheme == "https")
+            _HostBoundRedirectHandler(parsed.hostname or "", require_tls=use_tls)
         )
 
-        if self.base_url.startswith("https://"):
+        if use_tls:
             context = ssl.create_default_context()
             if not self.verify_tls:
                 context.check_hostname = False
