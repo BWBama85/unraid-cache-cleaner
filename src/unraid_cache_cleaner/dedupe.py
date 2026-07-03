@@ -191,12 +191,16 @@ def analyze(groups: List[DuplicateGroup]) -> List[DuplicateGroup]:
     """Analyze every real duplicate group.
 
     Groups that collapse to a single logical copy once stacks are merged are not
-    duplicates and are dropped.
+    duplicates and are dropped — *unless* their file paths carry conflicting
+    external ids. A ``mismatch`` group can stack into one logical copy (Plex
+    merged different-title parts under one ``Media`` element); dropping it would
+    hide the conflict, so it is kept and classified ``mismatch`` (keeper = the
+    sole logical copy, ``reclaimable_bytes = 0``) for operator review instead.
     """
 
     analyzed: List[DuplicateGroup] = []
     for group in groups:
-        if len(_merge_stacks(group.copies)) < 2:
+        if len(_merge_stacks(group.copies)) < 2 and not _is_mismatch(group):
             continue
         analyzed.append(analyze_group(group))
     return analyzed
