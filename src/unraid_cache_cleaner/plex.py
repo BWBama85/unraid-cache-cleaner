@@ -26,6 +26,46 @@ class PlexClientError(RuntimeError):
         self.status_code = status_code
 
 
+class _HostBoundRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects that would carry the ``X-Plex-Token`` off the configured host.
+
+    urllib re-applies the opener's ``addheaders`` — the token among them — as
+    unredirected headers on *every* request it opens, including the one it builds
+    internally to follow a 3xx. So a Plex endpoint (or an interposing reverse
+    proxy) that 301/302s to a different host would otherwise receive the token.
+    We fail closed instead: a redirect is followed only when it stays on the
+    configured hostname and does not downgrade TLS (an ``https`` deployment never
+    follows a redirect to plaintext ``http``, which would leak the token in the
+    clear). Everything else raises :class:`PlexClientError` before the redirected
+    request is issued. Same-host port changes and ``http``->``https`` upgrades —
+    common reverse-proxy behaviour — stay allowed.
+    """
+
+    def __init__(self, allowed_host: str, require_tls: bool) -> None:
+        super().__init__()
+        self._allowed_host = allowed_host.lower()
+        self._require_tls = require_tls
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> Optional[urllib.request.Request]:
+        target = urllib.parse.urlparse(newurl)
+        target_host = (target.hostname or "").lower()
+        if target_host != self._allowed_host or (self._require_tls and target.scheme != "https"):
+            raise PlexClientError(
+                f"Plex redirected to '{target.scheme}://{target.hostname or 'unknown'}'; refusing "
+                "to follow a cross-host or TLS-downgrading redirect so X-Plex-Token stays on-box.",
+                status_code=code,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class PlexClient:
     """Small token-authenticated client for the Plex Web API.
 
@@ -53,7 +93,13 @@ class PlexClient:
     def _build_opener(self) -> urllib.request.OpenerDirector:
         handlers: list[urllib.request.BaseHandler] = []
 
-        if self.base_url.startswith("https://"):
+        parsed = urllib.parse.urlparse(self.base_url)
+        use_tls = parsed.scheme == "https"
+        handlers.append(
+            _HostBoundRedirectHandler(parsed.hostname or "", require_tls=use_tls)
+        )
+
+        if use_tls:
             context = ssl.create_default_context()
             if not self.verify_tls:
                 context.check_hostname = False
