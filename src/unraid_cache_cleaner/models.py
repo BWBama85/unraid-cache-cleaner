@@ -169,5 +169,6 @@ class DuplicateReport:
     total_groups: int = 0
     total_copies: int = 0
     reclaimable_bytes: int = 0
+    summary: DedupeSummary | None = None
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)

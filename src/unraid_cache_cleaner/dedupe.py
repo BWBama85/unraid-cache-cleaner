@@ -28,6 +28,7 @@ MISMATCH = "mismatch"
 #: Higher is better; a label that is neither listed nor numeric ranks ``0`` and
 #: sorts last.
 RES_RANK: Dict[str, int] = {
+    "8k": 4320,
     "4k": 2160,
     "sd": 1,
 }

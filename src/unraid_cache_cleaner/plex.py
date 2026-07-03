@@ -242,8 +242,15 @@ def build_duplicate_group(item: dict, kind: str) -> Optional[DuplicateGroup]:
     """
 
     copies: List[MediaCopy] = []
-    for media in item.get("Media") or []:
-        media_id = _as_int(media.get("id"))
+    for media_index, media in enumerate(item.get("Media") or []):
+        # A ``Media`` element normally carries a non-zero ``id`` that ties its
+        # parts together as one logical copy. If Plex omits it, fall back to a
+        # per-element negative id so this element's parts still merge (and stay
+        # distinct from other elements) instead of collapsing onto the ``0``
+        # sentinel the dedupe engine reads as "ungrouped, stands alone" — which
+        # would misread a stacked multi-part copy as separate duplicates.
+        raw_id = _as_int(media.get("id"))
+        media_id = raw_id if raw_id != 0 else -(media_index + 1)
         resolution = str(media.get("videoResolution", "") or "")
         bitrate = _as_int(media.get("bitrate"))
         codec = str(media.get("videoCodec", "") or "")

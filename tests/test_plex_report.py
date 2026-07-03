@@ -184,6 +184,26 @@ class ParserTests(unittest.TestCase):
         self.assertEqual([c.media_id for c in group.copies], [7, 7])
         self.assertEqual(dedupe.analyze([group]), [])
 
+    def test_idless_media_parts_still_merge(self) -> None:
+        # Plex omits the Media id: the two parts must share a synthesized id so
+        # they merge into one logical copy (a stacked movie), not two duplicates.
+        item = {
+            "ratingKey": "1",
+            "type": "movie",
+            "title": "Stacked",
+            "Media": [
+                {"videoResolution": "1080", "Part": [
+                    {"id": 1, "file": "/m/cd1.mkv", "size": GiB},
+                    {"id": 2, "file": "/m/cd2.mkv", "size": GiB},
+                ]},
+            ],
+        }
+        group = build_duplicate_group(item, "movie")
+        self.assertEqual(len(group.copies), 2)
+        self.assertEqual(group.copies[0].media_id, group.copies[1].media_id)
+        self.assertNotEqual(group.copies[0].media_id, 0)
+        self.assertEqual(dedupe.analyze([group]), [])
+
     def test_part_without_file_is_skipped(self) -> None:
         item = _movie(
             "1",
@@ -257,8 +277,10 @@ class ReporterTests(unittest.TestCase):
             table = reporter.render_table(reporter.generate())
 
             self.assertIn("Reclaimable (safe)", table)
-            self.assertIn("Review — possible mismatches", table)
+            self.assertIn("Review - possible mismatches", table)
             self.assertIn("arr-tracked", table)
+            # the rendered table stays ASCII so a non-UTF-8 stdout can't crash print()
+            table.encode("ascii")
             # mismatch title appears under review, never as reclaimable
             self.assertIn("TMNT", table)
 
@@ -357,6 +379,74 @@ class ReporterTests(unittest.TestCase):
             self.assertEqual(len(report.warnings), 2)
             self.assertTrue(any("99" in w for w in report.warnings))
             self.assertTrue(any("Music" in w for w in report.warnings))
+
+    def test_repeated_section_id_scanned_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            client = self._full_client()
+            reporter = _reporter(tmp, client)
+
+            report = reporter.generate(section_overrides=["1", "1"])
+            # scanned once, not twice — no double-counted reclaimable bytes
+            self.assertEqual(client.duplicate_calls, [("1", 1)])
+            self.assertEqual(report.summary.reclaimable_bytes, 8 * GiB)
+
+    def test_zero_reclaimable_group_is_listed(self) -> None:
+        # Two same-resolution copies Plex reports without a size -> identical,
+        # reclaimable 0. It must still appear in the table body, not just inflate
+        # the header count.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            item = _movie(
+                "500",
+                "Sizeless",
+                [
+                    _media(8, "1080", 9000, [_part(81, "/m/a.mkv", 0)]),
+                    _media(9, "1080", 9000, [_part(91, "/m/b.mkv", 0)]),
+                ],
+            )
+            client = FakePlexClient(
+                [PlexSection(key="1", type="movie", title="Movies")], {("1", 1): [item]}
+            )
+            reporter = _reporter(tmp, client)
+
+            report = reporter.generate()
+            self.assertEqual(report.summary.group_count, 1)
+            table = reporter.render_table(report)
+            self.assertIn("Sizeless", table)
+
+    def test_warnings_surface_when_no_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            client = FakePlexClient([PlexSection(key="1", type="movie", title="Movies")], {})
+            reporter = _reporter(tmp, client)
+
+            report = reporter.generate(section_overrides=["99"])
+            with self.assertLogs("unraid_cache_cleaner.plex_report", level="WARNING"):
+                reporter.log_report(report)
+            self.assertIn("warning:", reporter.render_table(report))
+
+    def test_8k_outranks_1080_as_keeper(self) -> None:
+        # A non-numeric resolution label ("8k") must still rank above 1080p, or
+        # the report would recommend deleting the best copy.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            item = _movie(
+                "600",
+                "Huge",
+                [
+                    _media(10, "8k", 80000, [_part(101, "/m/8k.mkv", 40 * GiB)]),
+                    _media(11, "1080", 9000, [_part(111, "/m/1080.mkv", 6 * GiB)]),
+                ],
+            )
+            client = FakePlexClient(
+                [PlexSection(key="1", type="movie", title="Movies")], {("1", 1): [item]}
+            )
+            reporter = _reporter(tmp, client)
+
+            group = reporter.generate().groups[0]
+            self.assertEqual(group.keeper.resolution, "8k")
+            self.assertEqual(group.reclaimable_bytes, 6 * GiB)
 
 
 if __name__ == "__main__":
