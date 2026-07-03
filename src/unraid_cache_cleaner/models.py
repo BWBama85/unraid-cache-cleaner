@@ -84,7 +84,14 @@ class PlexSection:
 
 @dataclass(frozen=True)
 class MediaCopy:
-    """One physical file backing a Plex media item."""
+    """One physical file backing a Plex media item.
+
+    ``media_id`` groups the parts of a single Plex ``Media`` element (a stacked
+    item split across several files). Copies sharing a non-zero ``media_id`` are
+    one logical copy — the dedupe engine merges them and sums their sizes rather
+    than counting them as duplicates. ``0`` means "ungrouped": each such copy
+    stands alone.
+    """
 
     part_id: int
     file: Path
@@ -93,11 +100,17 @@ class MediaCopy:
     bitrate: int = 0
     codec: str = ""
     container: str = ""
+    media_id: int = 0
 
 
 @dataclass(frozen=True)
 class DuplicateGroup:
-    """A Plex item that resolves to more than one media copy on disk."""
+    """A Plex item that resolves to more than one media copy on disk.
+
+    The trailing analysis fields (``keeper`` … ``reclaimable_keep_smallest``) are
+    populated by ``dedupe.analyze``; a freshly parsed group leaves them at their
+    defaults.
+    """
 
     rating_key: str
     kind: str
@@ -107,6 +120,43 @@ class DuplicateGroup:
     season: int | None = None
     episode: int | None = None
     external_ids: dict[str, str] = field(default_factory=dict)
+    keeper: MediaCopy | None = None
+    classification: str = ""
+    reclaimable_bytes: int = 0
+    reclaimable_keep_smallest: int = 0
+
+
+@dataclass(frozen=True)
+class SectionSummary:
+    """Per-section (by ``DuplicateGroup.kind``) duplicate totals."""
+
+    kind: str
+    group_count: int
+    copy_count: int
+    identical_count: int
+    upgrade_count: int
+    mismatch_count: int
+    reclaimable_bytes: int
+    reclaimable_keep_smallest: int
+
+
+@dataclass(frozen=True)
+class DedupeSummary:
+    """Overall duplicate totals plus a per-section breakdown.
+
+    Reclaimable figures exclude ``mismatch`` groups by construction — the hard
+    safety rule is that a group Plex merged from different titles is never
+    counted as reclaimable.
+    """
+
+    sections: tuple[SectionSummary, ...]
+    group_count: int
+    copy_count: int
+    identical_count: int
+    upgrade_count: int
+    mismatch_count: int
+    reclaimable_bytes: int
+    reclaimable_keep_smallest: int
 
 
 @dataclass

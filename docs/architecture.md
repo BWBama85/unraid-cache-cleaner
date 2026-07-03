@@ -64,6 +64,25 @@ Stores the live orphan candidate set in SQLite so the service can apply a grace 
 
 Coordinates one scan cycle or an endless polling loop, applies deletion policy, removes empty directories, and writes the latest report.
 
+## Plex duplicate reporting (in progress)
+
+A separate, **read-only** capability that reports reclaimable disk space from duplicate media. It never deletes.
+
+### `plex.py`
+
+Minimal token-authenticated Plex Web API client (same `urllib` + `*ClientError` pattern as `qbittorrent.py`). Fetches library sections and the raw duplicate `Metadata` for a section, paging via `X-Plex-Container-Start/Size`.
+
+### `dedupe.py`
+
+Pure, dependency-free analysis over the Plex models — no I/O. It:
+
+- ranks the copies in a group best-first by `(resolution_rank, bitrate, size)`, so a smaller-but-better encode (e.g. 1080p x265 under a 720p copy) is still kept;
+- merges stacked parts (copies sharing a Plex `media_id`) into a single logical copy, summing their sizes, so a split-file title is not mistaken for a duplicate;
+- classifies each group as `identical`, `upgrade`, or `mismatch` — where `mismatch` means the copies' file paths carry different `{imdb-…}`/`{tmdb-…}` ids (Plex merged different titles);
+- computes reclaimable bytes under the hard safety rule that **mismatch groups are never counted as reclaimable**, and summarizes totals per section (`kind`) and overall.
+
+The runnable `plex-duplicates` subcommand and its JSON/human report are a separate slice.
+
 ## Failure Model
 
 The service fails closed:
