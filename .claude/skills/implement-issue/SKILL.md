@@ -188,7 +188,20 @@ Derive the slug from the **first** issue's title (lowercase, ASCII, non-alphanum
 ```bash
 SLUG="<computed from the first issue's title>"
 BRANCH="issue-${ISSUE_DASH}-${SLUG}"
-git switch -c "$BRANCH"
+
+# Branch creation MUST succeed before the active marker is written. If the branch
+# already exists, `git switch -c` fails but the checkout stays on `main`; writing
+# the active marker anyway would point it at a branch you are not on, the gate's
+# branch-mismatch guard would exit 0, and the rest of the playbook would run on
+# `main` — violating the never-commit-`main` rule. So guard it: on failure, write
+# the blocked marker and stop instead.
+if ! git switch -c "$BRANCH" 2>/dev/null; then
+  jq -n --arg branch "$BRANCH" --arg issue "$ISSUE_CSV" \
+    '{reason:"branch already exists", phase:"branch_exists", branch:$branch, issue:$issue}' \
+    > .claude/state/.blocked.tmp && mv .claude/state/.blocked.tmp .claude/state/implement-issue-blocked.json
+  echo "ERROR: branch $BRANCH already exists (or checkout failed) — stopping, still on $(git rev-parse --abbrev-ref HEAD)"
+  exit 1
+fi
 
 jq -n --arg branch "$BRANCH" --arg issue "$ISSUE_CSV" \
   --arg startedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -196,7 +209,7 @@ jq -n --arg branch "$BRANCH" --arg issue "$ISSUE_CSV" \
   > .claude/state/.marker.tmp && mv .claude/state/.marker.tmp .claude/state/implement-issue-active.json
 ```
 
-Every subsequent marker update follows the same `jq → .marker.tmp → mv` atomic pattern (never stage through `/tmp`). If the branch already exists locally or on the remote, write the blocked marker (`reason: "branch already exists"`) and stop — do **not** force-push.
+Every subsequent marker update follows the same `jq → .marker.tmp → mv` atomic pattern (never stage through `/tmp`). Do **not** force-push if the branch also exists on the remote.
 
 ### 6. Implement
 
@@ -224,14 +237,16 @@ Update marker phase: `implemented` once code is written, `gates_green` once the 
 
 ### 7. First commit
 
+> **Write the real issue number(s) literally.** The heredoc is single-quoted (`<<'EOF'`) so `$ISSUE_NUM` will not expand, and shell variables don't persist across Bash calls anyway — substitute the actual number (e.g. `(#5)` / `Refs #5`), not `$ISSUE_NUM`.
+
 ```bash
 git add <specific files>   # NOT `git add -A`
 git commit -m "$(cat <<'EOF'
-<type>(<scope>): <subject> (#$ISSUE_NUM)
+<type>(<scope>): <subject> (#<N>)
 
 <body explaining the why; multi-issue: note which change serves which issue>
 
-Refs #$ISSUE_NUM
+Refs #<N>
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
@@ -268,12 +283,14 @@ jq '.phase = "pushed"' .claude/state/implement-issue-active.json > .claude/state
 
 One `Closes #N` line per issue this PR fully resolves; `Refs #N` for any you only sliced.
 
+> **Write the real numbers literally** — the `--body` heredoc is single-quoted so `$ISSUE_NUM` won't expand, and the `--title` runs in a fresh shell where `$ISSUE_NUM` is unset. Substitute the actual issue number(s) everywhere below (`Closes #5`, `(#5)`).
+
 ```bash
-PR_URL=$(gh pr create --title "<type>(<scope>): <subject> (#$ISSUE_NUM)" --body "$(cat <<'EOF'
+PR_URL=$(gh pr create --title "<type>(<scope>): <subject> (#<N>)" --body "$(cat <<'EOF'
 ## Summary
 - <bullet>
 
-Closes #$ISSUE_NUM
+Closes #<N>
 
 ## Pre-implementation gap analysis (codex)
 <SHOULD-CLARIFY items and how they were resolved as assumptions>

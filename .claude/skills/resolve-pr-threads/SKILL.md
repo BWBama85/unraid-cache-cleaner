@@ -51,7 +51,12 @@ PR_BRANCH=$(echo "$PR_META" | jq -r .headRefName)
 [ -z "$(git status --porcelain)" ] || { echo "ERROR: working tree dirty; commit or stash first"; exit 1; }
 
 git fetch origin "$PR_BRANCH" --quiet || true
-git switch "$PR_BRANCH" 2>/dev/null || git switch -c "$PR_BRANCH" "origin/$PR_BRANCH"
+# Checkout is a HARD precondition — if the head branch can't be checked out
+# (fork PR, missing remote ref), abort. Continuing would land edits/commits on
+# whatever branch was checked out at invocation (possibly `main`).
+git switch "$PR_BRANCH" 2>/dev/null \
+  || git switch -c "$PR_BRANCH" "origin/$PR_BRANCH" 2>/dev/null \
+  || { echo "ERROR: cannot check out PR head branch '$PR_BRANCH' (fork PR or missing ref?) — aborting"; exit 1; }
 ```
 
 ### 2. Fetch unresolved threads
@@ -66,6 +71,7 @@ query($owner:String!,$repo:String!,$num:Int!){
   repository(owner:$owner,name:$repo){
     pullRequest(number:$num){
       reviewThreads(first:50){
+        pageInfo{ hasNextPage }
         nodes{ id isResolved isOutdated
           comments(first:5){ nodes{ id author{login} path line body createdAt } } }
       }
@@ -73,9 +79,13 @@ query($owner:String!,$repo:String!,$num:Int!){
   }
 }' -f owner="$OWNER" -f repo="$REPO" -F num="$PR_NUM" > .claude/state/threads-$PR_NUM.json
 
-TOTAL=$(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false)] | length' .claude/state/threads-$PR_NUM.json)
-if [ "${TOTAL:-0}" -ge 50 ]; then
-  echo "ERROR: $TOTAL unresolved threads — pagination not implemented. Triage manually."; exit 1
+# Abort on a SECOND page, not on an unresolved-count threshold: a PR with >50
+# TOTAL threads (resolved or not) can hide unresolved bot threads beyond page one,
+# and both this fetch and the step-6 verification would silently ignore them —
+# reporting success while branch protection stays blocked.
+HAS_NEXT=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' .claude/state/threads-$PR_NUM.json)
+if [ "$HAS_NEXT" = "true" ]; then
+  echo "ERROR: PR #$PR_NUM has >50 review threads — pagination not implemented. Triage manually."; exit 1
 fi
 ```
 

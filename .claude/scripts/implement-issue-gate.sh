@@ -11,11 +11,12 @@
 # changes" grep (apps|packages -> src|tests). The marker/version/gh machinery is
 # unchanged.
 #
-# How we keep the turn going (getrich issue #208): this is a SOFT "you're not
-# done, keep working" cue. On Claude Code >= 2.1.163 we deliver it via
-# `hookSpecificOutput.additionalContext` on stdout + exit 0 (non-error feedback);
-# older builds fall back to legacy `stderr + exit 2`. Version is read from
-# CLAUDE_CODE_EXECPATH (the exact running binary), not `claude --version`.
+# How we keep the turn going: emit the documented Stop decision control —
+# `{"decision":"block","reason":...}` on stdout + exit 0. That reliably blocks the
+# stop on every version that supports Stop decision control and feeds `reason`
+# back to the model. (An earlier design used hookSpecificOutput.additionalContext,
+# but additionalContext alone does NOT block a Stop — it only injects context, so
+# the run could still end before a PR existed.)
 #
 # State protocol (written by .claude/skills/implement-issue/SKILL.md):
 #   .claude/state/implement-issue-active.json   — marker for an in-flight run
@@ -29,45 +30,6 @@ if [ -z "$repo_root" ]; then
   exit 0
 fi
 cd "$repo_root"
-
-# Return 0 when the *running* Claude Code honors
-# hookSpecificOutput.additionalContext on the Stop event — added in v2.1.163.
-# Read from CLAUDE_CODE_EXECPATH (the binary serving THIS session), anchoring on
-# the 'versions' path segment. When undeterminable, return 1 so the caller uses
-# the safe legacy exit-2 block.
-stop_hook_additional_context_supported() {
-  local execpath="${CLAUDE_CODE_EXECPATH:-}"
-  [ -n "$execpath" ] || return 1
-
-  local -a parts
-  IFS='/' read -r -a parts <<< "$execpath"
-  local ver="" prev="" seg
-  for seg in "${parts[@]}"; do
-    if [ "$prev" = "versions" ]; then
-      ver="$seg"
-      break
-    fi
-    prev="$seg"
-  done
-
-  case "$ver" in
-    [0-9]*.[0-9]*.[0-9]*) : ;;
-    *) return 1 ;;
-  esac
-
-  awk -v v="$ver" -v min="2.1.163" '
-    BEGIN {
-      nv = split(v, V, "."); nm = split(min, M, ".");
-      n = (nv > nm) ? nv : nm;
-      for (i = 1; i <= n; i++) {
-        a = (i <= nv) ? V[i] + 0 : 0;
-        b = (i <= nm) ? M[i] + 0 : 0;
-        if (a > b) exit 0;
-        if (a < b) exit 1;
-      }
-      exit 0;
-    }'
-}
 
 marker=".claude/state/implement-issue-active.json"
 blocked=".claude/state/implement-issue-blocked.json"
@@ -138,15 +100,12 @@ if command -v gh >/dev/null 2>&1; then
   rm -f "$gh_err" 2>/dev/null || true
 fi
 
-# Hand off red gates to precommit-gate.sh. If src/ or tests/ have uncommitted
-# changes, that hook has authority — emitting our resume hint on top of its
-# failure log would stack two contradictory messages.
-if git diff --name-only HEAD 2>/dev/null | grep -Eq '^(src|tests)/' \
-   || git diff --name-only --cached 2>/dev/null | grep -Eq '^(src|tests)/' \
-   || git ls-files --others --exclude-standard 2>/dev/null | grep -Eq '^(src|tests)/'; then
-  printf 'implement-issue-gate: deferring to precommit-gate (uncommitted src/tests changes)\n' >&2
-  exit 0
-fi
+# NOTE: we intentionally do NOT defer to precommit-gate when src/ or tests/ have
+# uncommitted changes. precommit-gate exits 0 when those changes are green, so
+# deferring here would let a no-PR run STOP with green-but-uncommitted code —
+# exactly the continuation invariant this hook exists to enforce. When the gates
+# are red, precommit-gate blocks too; two block messages is fine (both are true:
+# fix the gates AND keep going to a PR).
 
 # Workflow invariant unmet — the run hasn't opened a PR and isn't blocked.
 emit_resume_hint() {
@@ -173,11 +132,10 @@ EOF
 }
 resume_hint="$(emit_resume_hint)"
 
-if stop_hook_additional_context_supported; then
-  jq -cn --arg ctx "$resume_hint" \
-    '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}'
-  exit 0
-fi
-
-printf '\n%s\n' "$resume_hint" >&2
-exit 2
+# Block the stop via the documented Stop decision control: a
+# {"decision":"block","reason":...} JSON on stdout + exit 0 reliably prevents the
+# turn from ending and feeds `reason` back to the model. `additionalContext` alone
+# does NOT block a Stop. jq is guaranteed present here — the script exits 0 far
+# above if jq is missing.
+jq -cn --arg reason "$resume_hint" '{decision:"block", reason:$reason}'
+exit 0
