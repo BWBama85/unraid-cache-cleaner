@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import email
 import io
 import json
 import socket
 import sys
 import unittest
 import urllib.error
-import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from _fake_http import FakeHTTPHandler as _FakeHTTPHandler
+from _fake_http import FakeHTTPResponse as _FakeHTTPResponse
 from unraid_cache_cleaner import arr, dedupe
 from unraid_cache_cleaner.arr import (
     ArrClientError,
@@ -182,58 +182,8 @@ class ArrClientTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Redirect safety — real opener, fake socket layer (mirrors tests/test_plex.py) #
+# Redirect safety — real opener, fake socket layer (see tests/_fake_http.py)    #
 # --------------------------------------------------------------------------- #
-
-class _FakeHTTPResponse:
-    """Minimal stand-in for ``http.client.HTTPResponse`` for the real opener."""
-
-    def __init__(self, code: int, header_text: str, body: bytes = b"") -> None:
-        self.code = code
-        self.status = code
-        self.msg = "Testing"
-        self._info = email.message_from_string(header_text)
-        self._buf = io.BytesIO(body)
-
-    def info(self):
-        return self._info
-
-    def geturl(self) -> str:
-        return ""
-
-    def read(self, amt: int | None = None) -> bytes:
-        return self._buf.read() if amt is None else self._buf.read(amt)
-
-    def close(self) -> None:
-        pass
-
-    def __enter__(self) -> "_FakeHTTPResponse":
-        return self
-
-    def __exit__(self, *exc: object) -> bool:
-        return False
-
-
-class _FakeHTTPHandler(urllib.request.BaseHandler):
-    """Intercepts the socket layer of a *real* opener; records every request.
-
-    Sorts ahead of the default HTTP(S) handlers (``handler_order``) so it answers
-    before a real socket is opened, while the opener's redirect handler and
-    ``addheaders`` (the API key) run exactly as in production.
-    """
-
-    handler_order = 100
-
-    def __init__(self, responder) -> None:
-        self._responder = responder
-        self.requests = []
-
-    def http_open(self, req):
-        self.requests.append(req)
-        return self._responder(req)
-
-    https_open = http_open
-
 
 def _radarr_with_fake(base_url: str, responder):
     client = RadarrClient(base_url, "SECRET-KEY-123")

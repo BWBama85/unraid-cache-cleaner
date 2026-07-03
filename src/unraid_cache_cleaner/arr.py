@@ -93,7 +93,7 @@ class _ArrClient:
             ),
         ]
 
-        if self.base_url.startswith("https://"):
+        if urllib.parse.urlparse(self.base_url).scheme == "https":
             context = ssl.create_default_context()
             if not self.verify_tls:
                 context.check_hostname = False
