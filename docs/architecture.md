@@ -64,13 +64,13 @@ Stores the live orphan candidate set in SQLite so the service can apply a grace 
 
 Coordinates one scan cycle or an endless polling loop, applies deletion policy, removes empty directories, and writes the latest report.
 
-## Plex duplicate reporting (in progress)
+## Plex duplicate reporting
 
-A separate, **read-only** capability that reports reclaimable disk space from duplicate media. It never deletes.
+A separate, **read-only** capability that reports reclaimable disk space from duplicate media. It never deletes. Run it with `unraid-cache-cleaner plex-duplicates`.
 
 ### `plex.py`
 
-Minimal token-authenticated Plex Web API client (same `urllib` + `*ClientError` pattern as `qbittorrent.py`). Fetches library sections and the raw duplicate `Metadata` for a section, paging via `X-Plex-Container-Start/Size`.
+Minimal token-authenticated Plex Web API client (same `urllib` + `*ClientError` pattern as `qbittorrent.py`). Fetches library sections and the raw duplicate `Metadata` for a section, paging via `X-Plex-Container-Start/Size`. Also holds `build_duplicate_group`, the pure parser that turns one raw `Metadata` item (`Media → Part`, plus `Guid` external ids) into a `DuplicateGroup`, collapsing a `Media`'s parts under a shared `media_id`.
 
 ### `dedupe.py`
 
@@ -81,7 +81,9 @@ Pure, dependency-free analysis over the Plex models — no I/O. It:
 - classifies each group as `identical`, `upgrade`, or `mismatch` — where `mismatch` means the copies' file paths carry different `{imdb-…}`/`{tmdb-…}` ids (Plex merged different titles);
 - computes reclaimable bytes under the hard safety rule that **mismatch groups are never counted as reclaimable**, and summarizes totals per section (`kind`) and overall.
 
-The runnable `plex-duplicates` subcommand and its JSON/human report are a separate slice.
+### `plex_report.py`
+
+The read-only orchestrator (`PlexDuplicateReporter`), mirroring `service.py`'s `run_once → write_report → log_report` shape. It resolves the video sections to scan (explicit `--section`/`PLEX_SECTIONS` ids, or auto-detected movie/TV libraries), fetches and parses each section's duplicates, analyzes them with `dedupe`, then writes a stable `sort_keys` JSON report and renders a reclaimable-sorted table. The renderer is pure (`DuplicateReport → str`), and the reporter takes an injectable `clock` so the JSON is byte-identical across runs on the same input. The subcommand is wired in `cli.py` (`plex-duplicates`), which builds a `PlexClient` without touching the qBittorrent client or state DB.
 
 ## Failure Model
 
