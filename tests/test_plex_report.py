@@ -10,7 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from unraid_cache_cleaner import dedupe
+from unraid_cache_cleaner import arr, dedupe
+from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.config import Config
 from unraid_cache_cleaner.models import PlexSection
 from unraid_cache_cleaner.plex import build_duplicate_group
@@ -111,6 +112,22 @@ class FakePlexClient:
     def fetch_duplicates(self, section_id, item_type, *, page_size=200):
         self.duplicate_calls.append((section_id, item_type))
         return list(self._duplicates.get((section_id, item_type), []))
+
+
+class FakeArrClient:
+    """Returns a canned tracked index, or raises to simulate an outage."""
+
+    def __init__(self, index, *, raises=None) -> None:
+        self._index = index
+        self._raises = raises
+        self.calls = 0
+
+    def fetch_tracked_index(self):
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        # dict for Radarr, set for Sonarr — copy so callers can't mutate ours
+        return type(self._index)(self._index)
 
 
 def _config(tmp: Path, **overrides) -> Config:
@@ -447,6 +464,179 @@ class ReporterTests(unittest.TestCase):
             group = reporter.generate().groups[0]
             self.assertEqual(group.keeper.resolution, "8k")
             self.assertEqual(group.reclaimable_bytes, 6 * GiB)
+
+
+# --------------------------------------------------------------------------- #
+# Radarr/Sonarr association (#8)                                                #
+# --------------------------------------------------------------------------- #
+
+# A reclaimable movie carrying a tmdb guid so Radarr can id-anchor it. Both
+# paths share {tmdb-700}, so it is not a mismatch.
+_MOVIE_ARR = _movie(
+    "700",
+    "Arr Movie",
+    [
+        _media(1, "4k", 20000, [_part(11, "/movies/Arr Movie {tmdb-700}/arr.4k.mkv", 20 * GiB)]),
+        _media(2, "1080", 9000, [_part(12, "/movies/Arr Movie {tmdb-700}/arr.1080.mkv", 8 * GiB)]),
+    ],
+    guids=["tmdb://700"],
+)
+
+
+def _arr_reporter(tmp, client, *, radarr=None, sonarr=None, config=None):
+    return PlexDuplicateReporter(
+        config or _config(tmp),
+        client,
+        radarr_client=radarr,
+        sonarr_client=sonarr,
+        clock=lambda: 1234.5,
+    )
+
+
+class ArrAssociationTests(unittest.TestCase):
+    def _movie_client(self):
+        return FakePlexClient(
+            [PlexSection(key="1", type="movie", title="Movies")], {("1", 1): [_MOVIE_ARR]}
+        )
+
+    def test_json_carries_association_and_keeper_tracked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({"700": {"arr.4k.mkv"}})
+            reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
+
+            payload = reporter.build_payload(reporter.generate())
+
+            self.assertTrue(payload["arr_enabled"])
+            self.assertEqual(radarr.calls, 1)
+            group = payload["groups"][0]
+            copies = {c["file"].split("/")[-1]: c for c in group["copies"]}
+            self.assertEqual(copies["arr.4k.mkv"]["association"], "tracked")
+            self.assertEqual(copies["arr.4k.mkv"]["arr_tracked"], "radarr")
+            self.assertEqual(copies["arr.1080.mkv"]["association"], "untracked")
+            self.assertIsNone(copies["arr.1080.mkv"]["arr_tracked"])
+            # the keeper (best copy) is the tracked 4k one
+            self.assertEqual(group["keeper"]["association"], "tracked")
+            # reclaim candidate (1080) is untracked -> nothing at re-download risk
+            self.assertEqual(payload["totals"]["arr_tracked_reclaimable_count"], 0)
+
+    def test_tracked_reclaim_candidate_flagged_in_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            # Radarr tracks the worse (1080) copy — the one a reclaim would delete.
+            radarr = FakeArrClient({"700": {"arr.1080.mkv"}})
+            reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
+
+            report = reporter.generate()
+            payload = reporter.build_payload(report)
+            table = reporter.render_table(report)
+
+            self.assertEqual(payload["totals"]["arr_tracked_reclaimable_count"], 1)
+            self.assertIn("[arr:tracked]", table)
+            self.assertIn("tracked by radarr", table)
+            self.assertIn("re-download", table)
+            table.encode("ascii")  # stays ASCII
+
+    def test_unconfigured_is_byte_identical_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _arr_reporter(tmp, self._movie_client())  # no arr clients
+
+            payload = reporter.build_payload(reporter.generate())
+
+            self.assertNotIn("arr_enabled", payload)
+            self.assertNotIn("arr_tracked_reclaimable_count", payload["totals"])
+            for group in payload["groups"]:
+                for copy in group["copies"]:
+                    self.assertEqual(set(copy), {"file", "size", "resolution", "bitrate"})
+            # table shows the not-configured hint, not a stale placeholder
+            table = reporter.render_table(reporter.generate())
+            self.assertIn("Not configured", table)
+
+    def test_unreachable_arr_warns_and_still_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({}, raises=ArrClientError("boom", status_code=500))
+            reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
+
+            report = reporter.generate()
+            reporter.write_report(report)
+            payload = json.loads(reporter.config.plex_duplicate_report_path.read_text())
+
+            self.assertTrue(payload["arr_enabled"])
+            self.assertTrue(any("Radarr association skipped" in w for w in report.warnings))
+            # an outage never crashes the report; the copies fall back to unknown
+            group = payload["groups"][0]
+            self.assertTrue(all(c["association"] == "unknown" for c in group["copies"]))
+
+    def test_episode_tracked_by_sonarr_basename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            client = FakePlexClient(
+                [PlexSection(key="2", type="show", title="TV")],
+                {("2", 4): [_EPISODE_IDENTICAL]},
+            )
+            # _EPISODE_IDENTICAL copies are /tv/Some Show/S02/a.mkv and b.mkv
+            sonarr = FakeArrClient({"a.mkv"})
+            reporter = _arr_reporter(tmp, client, sonarr=sonarr)
+
+            payload = reporter.build_payload(reporter.generate())
+
+            copies = {c["file"].split("/")[-1]: c for c in payload["groups"][0]["copies"]}
+            self.assertEqual(copies["a.mkv"]["association"], "tracked")
+            self.assertEqual(copies["a.mkv"]["arr_tracked"], "sonarr")
+            # the extra TV copy is unknown, never falsely labeled untracked/safe
+            self.assertEqual(copies["b.mkv"]["association"], "unknown")
+
+    def test_mismatch_copies_never_labeled_untracked_in_json(self) -> None:
+        # Radarr tracks the first film's file, but the group is a Plex mismatch
+        # (two tmdb ids). No copy may be serialized as untracked/safe.
+        mismatch = _movie(
+            "800",
+            "Mismatch",
+            [
+                _media(1, "1080", 9000, [_part(81, "/movies/A {tmdb-111}/a.mkv", 5 * GiB)]),
+                _media(2, "1080", 9000, [_part(82, "/movies/B {tmdb-222}/b.mkv", 6 * GiB)]),
+            ],
+            guids=["tmdb://111"],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            client = FakePlexClient(
+                [PlexSection(key="1", type="movie", title="Movies")], {("1", 1): [mismatch]}
+            )
+            radarr = FakeArrClient({"111": {"a.mkv"}})
+            reporter = _arr_reporter(tmp, client, radarr=radarr)
+
+            payload = reporter.build_payload(reporter.generate())
+
+            group = payload["groups"][0]
+            self.assertEqual(group["classification"], "mismatch")
+            self.assertTrue(
+                all(c["association"] == "unknown" for c in group["copies"]),
+                group["copies"],
+            )
+
+    def test_no_tracked_reclaim_reports_all_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({"700": {"arr.4k.mkv"}})
+            reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
+
+            table = reporter.render_table(reporter.generate())
+            self.assertIn("all safe to delete", table)
+
+    def test_unknown_reclaim_candidate_not_called_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            # tmdb 700 isn't in the index -> every copy unknown, none tracked.
+            radarr = FakeArrClient({"999": {"other.mkv"}})
+            reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
+
+            table = reporter.render_table(reporter.generate())
+            self.assertNotIn("all safe to delete", table)
+            self.assertIn("verify those before deleting", table)
+            self.assertIn("[arr:?]", table)
 
 
 if __name__ == "__main__":

@@ -105,8 +105,16 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `PLEX_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Plex |
 | `PLEX_VERIFY_TLS` | `true` | Verify TLS certificates (set `false` for a self-signed reverse proxy) |
 | `PLEX_DUPLICATE_REPORT_PATH` | `/config/plex-duplicates.json` | JSON duplicate report output path |
+| `RADARR_URL` | empty | Radarr base URL (e.g. `http://192.168.1.10:7878`); enables movie `*arr`-tracking |
+| `RADARR_API_KEY` | empty | Radarr API key (sent as `X-Api-Key`, never in the URL) |
+| `RADARR_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Radarr |
+| `RADARR_VERIFY_TLS` | `true` | Verify TLS certificates for Radarr |
+| `SONARR_URL` | empty | Sonarr base URL (e.g. `http://192.168.1.10:8989`); enables episode `*arr`-tracking |
+| `SONARR_API_KEY` | empty | Sonarr API key (sent as `X-Api-Key`, never in the URL) |
+| `SONARR_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Sonarr |
+| `SONARR_VERIFY_TLS` | `true` | Verify TLS certificates for Sonarr |
 
-> **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup.
+> **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup. The optional `RADARR_*`/`SONARR_*` variables add [`*arr`-tracking annotations](#radarrsonarr-tracking-optional) to that report; each is inert unless both its URL and API key are set.
 
 If `WATCH_PATHS` is empty, the service falls back to qBittorrent's default save path plus any `save_path` values currently used by torrents. In practice, explicitly setting `WATCH_PATHS` is better on Unraid.
 
@@ -142,8 +150,9 @@ sections:
 - **Review — possible mismatches (not counted)** — items Plex merged from
   *different* titles (e.g. the 1990 and 2014 *TMNT*). These are **never** counted
   as reclaimable; check them by hand.
-- **⚠️ arr-tracked (Radarr/Sonarr)** — a placeholder, populated by a future
-  release ([#8](https://github.com/BWBama85/unraid-cache-cleaner/issues/8)).
+- **⚠️ arr-tracked (Radarr/Sonarr)** — redundant copies that Radarr/Sonarr
+  tracks; see below. Shows a "not configured" hint until you set `RADARR_*` /
+  `SONARR_*`.
 
 Flags:
 
@@ -156,6 +165,36 @@ Flags:
 Getting your token: open any item in Plex Web → **⋯ → Get Info → View XML**, and
 copy the `X-Plex-Token` value from the URL. It travels as a request header, never
 in a logged URL.
+
+### Radarr/Sonarr tracking (optional)
+
+Set `RADARR_URL` + `RADARR_API_KEY` and/or `SONARR_URL` + `SONARR_API_KEY` to
+annotate each duplicate copy with whether an `*arr` tracks it. This matters
+because **deleting an `*arr`-tracked file makes the `*arr` grab a replacement** —
+so the report turns "these copies are redundant" into "these are safe to delete
+vs. these will re-download unless you remove them via Radarr/Sonarr":
+
+- **`tracked`** — an `*arr` tracks this exact file. Reclaimable rows that would
+  delete a tracked copy are tagged `[arr:tracked]`, and the file is listed in the
+  **arr-tracked** section. Delete it via Radarr/Sonarr (or unmonitor first) or it
+  re-downloads.
+- **`untracked`** — safe to delete (movies only; see below).
+- **`unknown`** — could not be confirmed. **Never** treated as safe.
+
+The report **still never deletes anything** — this is annotation only. Each
+`*arr` is enabled only when both its URL and API key are set; if one is
+unreachable, the report logs a warning and continues (that library's copies fall
+back to `unknown`). The token/key travels as an `X-Api-Key` header, never in a
+logged URL.
+
+**Matching is asymmetric by design.** Movies join on the TMDB id (Plex's
+`tmdb://` guid is exactly Radarr's key), so a movie's redundant copies can be
+confidently marked `untracked` (safe). Episodes match by **filename only** —
+Plex's episode guids are episode-level, not the series TVDB id Sonarr keys on —
+so a TV copy is either `tracked` (Sonarr tracks that filename) or `unknown`, and
+is never labeled `untracked`/safe. This is deliberately conservative: the layer
+never tells you a TV file is safe unless it can prove Sonarr doesn't track it,
+which it can't from filenames alone.
 
 ## Packaging
 

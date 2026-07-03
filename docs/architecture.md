@@ -85,6 +85,12 @@ Pure, dependency-free analysis over the Plex models — no I/O. It:
 
 The read-only orchestrator (`PlexDuplicateReporter`), mirroring `service.py`'s `run_once → write_report → log_report` shape. It resolves the video sections to scan (explicit `--section`/`PLEX_SECTIONS` ids, or auto-detected movie/TV libraries), fetches and parses each section's duplicates, analyzes them with `dedupe`, then writes a stable `sort_keys` JSON report and renders a reclaimable-sorted table. The renderer is pure (`DuplicateReport → str`), and the reporter takes an injectable `clock` so the JSON is byte-identical across runs on the same input. The subcommand is wired in `cli.py` (`plex-duplicates`), which builds a `PlexClient` without touching the qBittorrent client or state DB.
 
+### `arr.py` (optional)
+
+An optional Radarr/Sonarr association layer that enriches the report with whether each copy is `*arr`-tracked — so a redundant copy Radarr/Sonarr tracks is flagged as "delete via the `*arr` or it re-downloads", while an untracked copy is confirmed safe. Two thin `urllib` clients (`RadarrClient`, `SonarrClient`) reuse the `qbittorrent.py`/`plex.py` pattern — custom `ArrClientError`, TLS-verify toggle, timeouts, `X-Api-Key` header (never in a URL). `annotate` is a pure transform over analyzed `DuplicateGroup`s.
+
+The join differs by kind, because the two id joins are not equally reliable. **Movies** are *id-anchored*: Plex's `tmdb://` guid is the same TMDB id Radarr keys on, so within a group whose id Radarr tracks, the basename-matching copy is `tracked` and the other redundant copies are `untracked` (safe); if the id is absent, not in Radarr, or no basename matches, every copy is `unknown`. **Episodes** match by *basename only*: Plex's episode `Guid`s are episode-level, not the series TVDB id Sonarr keys on, so a copy whose basename Sonarr tracks is `tracked` and any other copy is `unknown` — never falsely `untracked`. The reporter constructs a client only when both its URL and API key are set; an unconfigured layer leaves the report byte-identical to a Plex-only run, and a configured-but-unreachable `*arr` logs a warning and degrades that kind to `unknown` rather than failing the report.
+
 ## Failure Model
 
 The service fails closed:

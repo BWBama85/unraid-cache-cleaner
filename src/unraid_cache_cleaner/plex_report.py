@@ -20,9 +20,10 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from . import dedupe
+from . import arr, dedupe
+from .arr import ArrClientError, RadarrClient, SonarrClient
 from .config import Config
 from .models import DuplicateGroup, DuplicateReport, MediaCopy, PlexSection
 from .plex import PlexClient, build_duplicate_group
@@ -42,13 +43,19 @@ def _fmt_gib(num_bytes: int) -> str:
     return f"{num_bytes / _GIB:.1f} GiB"
 
 
-def _copy_json(copy: MediaCopy) -> dict:
-    return {
+def _copy_json(copy: MediaCopy, *, include_arr: bool = False) -> dict:
+    payload = {
         "file": str(copy.file),
         "size": copy.size,
         "resolution": copy.resolution,
         "bitrate": copy.bitrate,
     }
+    # Only serialized when the arr layer ran, so a Plex-only report stays
+    # byte-identical to the pre-#8 shape.
+    if include_arr:
+        payload["association"] = copy.association
+        payload["arr_tracked"] = copy.arr_tracked
+    return payload
 
 
 class PlexDuplicateReporter:
@@ -65,11 +72,21 @@ class PlexDuplicateReporter:
         config: Config,
         client: PlexClient,
         *,
+        radarr_client: Optional[RadarrClient] = None,
+        sonarr_client: Optional[SonarrClient] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self.client = client
+        self.radarr_client = radarr_client
+        self.sonarr_client = sonarr_client
         self.clock = clock
+
+    @property
+    def _arr_enabled(self) -> bool:
+        """The association layer runs when at least one *arr client is present."""
+
+        return self.radarr_client is not None or self.sonarr_client is not None
 
     def _resolve_sections(
         self, overrides: Optional[Sequence[str]]
@@ -126,6 +143,11 @@ class PlexDuplicateReporter:
 
         analyzed = dedupe.analyze(raw_groups)
         analyzed.sort(key=self._group_sort_key)
+
+        if self._arr_enabled:
+            radarr_index, sonarr_basenames = self._build_arr_indexes(warnings)
+            analyzed = arr.annotate(analyzed, radarr_index, sonarr_basenames)
+
         summary = dedupe.summarize(analyzed)
 
         return DuplicateReport(
@@ -137,7 +159,33 @@ class PlexDuplicateReporter:
             reclaimable_bytes=summary.reclaimable_bytes,
             summary=summary,
             warnings=warnings,
+            arr_enabled=self._arr_enabled,
         )
+
+    def _build_arr_indexes(
+        self, warnings: List[str]
+    ) -> Tuple[Dict[str, Set[str]], Set[str]]:
+        """Fetch the Radarr/Sonarr tracked indexes, degrading gracefully.
+
+        An unconfigured client contributes an empty index; a configured but
+        unreachable one logs a warning and also contributes an empty index — so
+        an ``*arr`` outage never fails the read-only report, it just leaves that
+        kind ``unknown``.
+        """
+
+        radarr_index: dict = {}
+        sonarr_basenames: set = set()
+        if self.radarr_client is not None:
+            try:
+                radarr_index = self.radarr_client.fetch_tracked_index()
+            except ArrClientError as exc:
+                warnings.append(f"Radarr association skipped: {exc}")
+        if self.sonarr_client is not None:
+            try:
+                sonarr_basenames = self.sonarr_client.fetch_tracked_index()
+            except ArrClientError as exc:
+                warnings.append(f"Sonarr association skipped: {exc}")
+        return radarr_index, sonarr_basenames
 
     def _summary(self, report: DuplicateReport):
         """The report's precomputed summary, recomputed only if absent."""
@@ -152,7 +200,7 @@ class PlexDuplicateReporter:
         # serialize byte-identically.
         return (-group.reclaimable_bytes, group.kind, group.rating_key)
 
-    def _group_json(self, group: DuplicateGroup) -> dict:
+    def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
         keeper = group.keeper
         return {
             "rating_key": group.rating_key,
@@ -160,15 +208,19 @@ class PlexDuplicateReporter:
             "kind": group.kind,
             "classification": group.classification,
             "reclaimable_bytes": group.reclaimable_bytes,
-            "keeper": _copy_json(keeper) if keeper is not None else None,
-            "copies": [_copy_json(copy) for copy in dedupe.rank_copies(group)],
+            "keeper": _copy_json(keeper, include_arr=include_arr) if keeper is not None else None,
+            "copies": [
+                _copy_json(copy, include_arr=include_arr)
+                for copy in dedupe.rank_copies(group)
+            ],
         }
 
     def build_payload(self, report: DuplicateReport) -> dict:
         """Return the stable JSON payload for ``report`` (also used by tests)."""
 
         summary = self._summary(report)
-        return {
+        include_arr = report.arr_enabled
+        payload: dict = {
             "generated_at": report.generated_at,
             "plex_url": self.config.plex_url,
             "sections": [
@@ -181,10 +233,38 @@ class PlexDuplicateReporter:
                 "reclaimable_bytes_keep_smallest": summary.reclaimable_keep_smallest,
                 "mismatch_count": summary.mismatch_count,
             },
-            "groups": [self._group_json(group) for group in report.groups],
+            "groups": [
+                self._group_json(group, include_arr=include_arr) for group in report.groups
+            ],
             "warnings": report.warnings,
             "errors": report.errors,
         }
+        # Added only when the arr layer ran, so a Plex-only report is byte-identical
+        # to the pre-#8 shape.
+        if include_arr:
+            payload["arr_enabled"] = True
+            payload["totals"]["arr_tracked_reclaimable_count"] = self._arr_reclaimable_tracked_count(
+                report
+            )
+        return payload
+
+    @staticmethod
+    def _reclaim_candidates(group: DuplicateGroup) -> List[MediaCopy]:
+        """The copies a reclaim would delete: every logical copy but the keeper."""
+
+        return dedupe.rank_copies(group)[1:]
+
+    def _arr_reclaimable_tracked_count(self, report: DuplicateReport) -> int:
+        """Count reclaim-candidate copies an *arr tracks (delete ⇒ re-download)."""
+
+        count = 0
+        for group in report.groups:
+            if group.classification == dedupe.MISMATCH:
+                continue
+            count += sum(
+                1 for copy in self._reclaim_candidates(group) if copy.association == arr.TRACKED
+            )
+        return count
 
     def write_report(self, report: DuplicateReport) -> None:
         """Write the duplicate report as stable, ``sort_keys`` JSON."""
@@ -208,12 +288,16 @@ class PlexDuplicateReporter:
             scanned = ", ".join(section.title for section in report.sections)
             LOGGER.info("Plex duplicates: none found in sections %s", scanned or "(none)")
             return
+        arr_note = ""
+        if report.arr_enabled:
+            arr_note = f" arr_tracked={self._arr_reclaimable_tracked_count(report)}"
         LOGGER.info(
-            "Plex duplicates: sections=%s groups=%s reclaimable=%s mismatches=%s",
+            "Plex duplicates: sections=%s groups=%s reclaimable=%s mismatches=%s%s",
             len(report.sections),
             summary.group_count,
             _fmt_gib(summary.reclaimable_bytes),
             summary.mismatch_count,
+            arr_note,
         )
 
     def render_table(
@@ -254,7 +338,9 @@ class PlexDuplicateReporter:
         lines.append(
             f"Reclaimable (safe) - {_fmt_gib(total)} across {len(reclaimable)} groups"
         )
-        lines.extend(self._render_reclaimable_rows(reclaimable, limit))
+        lines.extend(
+            self._render_reclaimable_rows(reclaimable, limit, arr_enabled=report.arr_enabled)
+        )
         lines.append("")
 
         mismatches = [
@@ -268,11 +354,30 @@ class PlexDuplicateReporter:
         lines.append("")
 
         lines.append("[!] arr-tracked (Radarr/Sonarr)")
-        lines.append("  Populated by #8 - not yet available.")
+        lines.extend(self._render_arr_rows(report, reclaimable, limit))
         return "\n".join(lines)
 
+    def _group_arr_tag(self, group: DuplicateGroup) -> str:
+        """Trailing tag warning that a reclaim of ``group`` is not plain-``rm`` safe.
+
+        ``[arr:tracked]`` when a to-be-deleted copy is *arr-tracked (deleting it
+        re-downloads); ``[arr:?]`` when one is ``unknown``; empty when every
+        reclaim candidate is confirmed ``untracked``.
+        """
+
+        candidates = self._reclaim_candidates(group)
+        if any(copy.association == arr.TRACKED for copy in candidates):
+            return "  [arr:tracked]"
+        if any(copy.association == arr.UNKNOWN for copy in candidates):
+            return "  [arr:?]"
+        return ""
+
     def _render_reclaimable_rows(
-        self, groups: List[DuplicateGroup], limit: Optional[int]
+        self,
+        groups: List[DuplicateGroup],
+        limit: Optional[int],
+        *,
+        arr_enabled: bool = False,
     ) -> List[str]:
         if not groups:
             return ["  (none)"]
@@ -281,12 +386,68 @@ class PlexDuplicateReporter:
         for group in shown:
             keeper_res = (group.keeper.resolution or "?") if group.keeper else "?"
             copies = len(dedupe.rank_copies(group))
+            tag = self._group_arr_tag(group) if arr_enabled else ""
             rows.append(
                 f"  {_fmt_gib(group.reclaimable_bytes):>10}  "
                 f"{group.classification:<9} {group.kind:<7} "
-                f"keep={keeper_res:<5} copies={copies}  {group.title}"
+                f"keep={keeper_res:<5} copies={copies}  {group.title}{tag}"
             )
         rows.extend(self._truncation_note(len(groups), len(shown)))
+        return rows
+
+    def _render_arr_rows(
+        self,
+        report: DuplicateReport,
+        reclaimable: List[DuplicateGroup],
+        limit: Optional[int],
+    ) -> List[str]:
+        """Render the arr-tracked section: reclaim candidates an *arr tracks.
+
+        Lists the redundant copies (non-keeper) that Radarr/Sonarr tracks — these
+        would re-download if you just delete the file, so remove them via the
+        ``*arr`` instead. Untracked reclaim candidates are the safe common case
+        and are not repeated here.
+        """
+
+        if not report.arr_enabled:
+            return [
+                "  Not configured - set RADARR_URL/RADARR_API_KEY or "
+                "SONARR_URL/SONARR_API_KEY to flag copies that re-download when deleted."
+            ]
+
+        flagged: List[Tuple[DuplicateGroup, List[MediaCopy]]] = []
+        unknown_count = 0
+        for group in reclaimable:
+            candidates = self._reclaim_candidates(group)
+            tracked = [copy for copy in candidates if copy.association == arr.TRACKED]
+            unknown_count += sum(1 for copy in candidates if copy.association == arr.UNKNOWN)
+            if tracked:
+                flagged.append((group, tracked))
+        if not flagged:
+            # "safe" is only honest when nothing is unconfirmed: unknown reclaim
+            # candidates (an *arr outage, or a TV copy whose filename didn't
+            # match) are tagged [arr:?] above and must not be called safe.
+            if unknown_count:
+                return [
+                    f"  No *arr-tracked reclaimable copies, but {unknown_count} are "
+                    "unconfirmed ([arr:?] above) - verify those before deleting."
+                ]
+            return ["  (no reclaimable copy is *arr-tracked - all safe to delete)"]
+
+        shown = flagged if limit is None else flagged[:limit]
+        rows: List[str] = []
+        for group, tracked in shown:
+            service = tracked[0].arr_tracked or "*arr"
+            rows.append(f"  {group.kind:<7} {group.title}  (tracked by {service})")
+            for copy in tracked:
+                rows.append(
+                    f"      {_fmt_gib(copy.size):>10}  "
+                    f"{(copy.resolution or '?'):<6} {copy.file}"
+                )
+        rows.extend(self._truncation_note(len(flagged), len(shown)))
+        rows.append(
+            "  Delete these via Radarr/Sonarr (or unmonitor first) or they re-download."
+        )
         return rows
 
     def _render_mismatch_rows(
