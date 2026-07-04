@@ -230,6 +230,39 @@ class StackTests(unittest.TestCase):
         self.assertEqual(ranked[0].size, 6 * GB)
         self.assertEqual(dedupe.reclaimable_bytes(group), 5 * GB)
 
+    def test_stacked_mismatch_is_surfaced_not_dropped(self) -> None:
+        # Mis-stacking: two DIFFERENT titles share one media_id, so they collapse
+        # to a single logical copy — but their paths carry conflicting {imdb-…}
+        # ids. Dropping the group would hide the conflict; instead analyze keeps
+        # it, classified `mismatch` (keeper = the merged copy, reclaimable == 0).
+        group = _group(
+            "movie",
+            "Mis-stacked distinct titles",
+            _copy(1, "/m/A (1990) {imdb-tt0100758}/cd1.mkv", 5 * GB, "1080", media_id=7),
+            _copy(2, "/m/B (2014) {imdb-tt1291150}/cd2.mkv", 9 * GB, "1080", media_id=7),
+        )
+        analyzed = dedupe.analyze([group])
+        self.assertEqual(len(analyzed), 1)
+        result = analyzed[0]
+        self.assertEqual(result.classification, dedupe.MISMATCH)
+        # keeper is the sole merged logical copy: the two parts summed (5+9 GB).
+        self.assertIsNotNone(result.keeper)
+        self.assertEqual(result.keeper.size, 14 * GB)
+        self.assertEqual(result.reclaimable_bytes, 0)
+        self.assertEqual(result.reclaimable_keep_smallest, 0)
+
+    def test_stacked_single_shared_id_still_dropped(self) -> None:
+        # The legitimate contrast: one title split across cd1/cd2 under one
+        # media_id, both tagged the SAME id — a single logical copy, no id
+        # conflict, so it stays dropped as a non-duplicate.
+        group = _group(
+            "movie",
+            "Legit stacked film",
+            _copy(1, "/m/film {imdb-tt4}/cd1.mkv", 3 * GB, "1080", media_id=7),
+            _copy(2, "/m/film {imdb-tt4}/cd2.mkv", 3 * GB, "1080", media_id=7),
+        )
+        self.assertEqual(dedupe.analyze([group]), [])
+
 
 class SummarizeTests(unittest.TestCase):
     def _probe_fixture(self) -> list:
@@ -319,6 +352,22 @@ class SummarizeTests(unittest.TestCase):
         )
         summary = dedupe.summarize([stacked_single])
         self.assertEqual(summary.group_count, 0)
+
+    def test_summarize_surfaces_stacked_mismatch(self) -> None:
+        # A stacked mismatch collapses to one logical copy but must still appear
+        # in the summary — as a mismatch contributing 0 reclaimable bytes.
+        stacked_mismatch = _group(
+            "movie",
+            "Mis-stacked titles",
+            _copy(1, "/m/A {imdb-tt0100758}/cd1.mkv", 5 * GB, "1080", media_id=7),
+            _copy(2, "/m/B {imdb-tt1291150}/cd2.mkv", 9 * GB, "1080", media_id=7),
+        )
+        summary = dedupe.summarize([stacked_mismatch])
+        self.assertEqual(summary.group_count, 1)
+        self.assertEqual(summary.mismatch_count, 1)
+        self.assertEqual(summary.copy_count, 1)
+        self.assertEqual(summary.reclaimable_bytes, 0)
+        self.assertEqual(summary.reclaimable_keep_smallest, 0)
 
 
 class ImmutabilityTests(unittest.TestCase):
