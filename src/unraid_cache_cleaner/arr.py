@@ -38,7 +38,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from . import dedupe
+from . import USER_AGENT, dedupe
 from .http_redirect import build_handler
 from .models import DuplicateGroup, MediaCopy
 
@@ -104,7 +104,7 @@ class _ArrClient:
         opener.addheaders = [
             ("X-Api-Key", self.api_key),
             ("Accept", "application/json"),
-            ("User-Agent", "unraid-cache-cleaner/0.1.0"),
+            ("User-Agent", USER_AGENT),
         ]
         return opener
 
