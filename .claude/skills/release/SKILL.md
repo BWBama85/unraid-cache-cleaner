@@ -2,7 +2,7 @@
 name: release
 description: Cut a versioned release of unraid-cache-cleaner. Bumps the version, updates CHANGELOG.md, commits + tags vX.Y.Z on main, pushes, creates the GitHub Release, and surfaces the GHCR publish run.
 argument-hint: '[patch|minor|major] | --version vX.Y.Z | --dry-run [patch|minor|major]'
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, Edit
 user-invocable: true
 ---
 
@@ -20,6 +20,25 @@ Cut a versioned release of `unraid-cache-cleaner` end-to-end and surface the res
 - `.github/workflows/publish.yml` is triggered by `push: tags: v*` — it builds and pushes `ghcr.io/bwbama85/unraid-cache-cleaner:vX.Y.Z`. It also pushes `:latest` on any `main` push. **It does NOT create a GitHub Release** — this skill does that itself with `gh release create`.
 - **Two publish runs fire per cut.** Pushing the release commit to `main` triggers a `:latest` build, and pushing the tag triggers the versioned build. Step 8 surfaces the **tag** run specifically — never a blind `gh run list --limit 1`, which may show the `main`/`:latest` run instead.
 - The version lives in **two** files that bump together: `pyproject.toml` (`version = "..."`) and `src/unraid_cache_cleaner/__init__.py` (`__version__ = "..."`). Every client's `User-Agent` derives from `__version__` via the `USER_AGENT` constant (`__init__.py`), so there is no third string to bump. Bump both or ship a mismatch (guarded by `tests/test_version.py`).
+
+## Parse the invocation
+
+Resolve `$ARGUMENTS` up front so the goal gate (dry-run skip) and version compute below can consume the results. macOS bash 3.2-safe; the `setopt` guard makes the `$ARGUMENTS` word-split under zsh too (a no-op under bash, which splits natively):
+
+```bash
+setopt sh_word_split 2>/dev/null || true    # zsh: split $ARGUMENTS on spaces like bash
+LEVEL="patch"; EXPLICIT_VERSION=""; DRY_RUN=0; _next_ver=""
+for arg in $ARGUMENTS; do
+  case "$arg" in
+    patch|minor|major) LEVEL="$arg" ;;
+    --dry-run)         DRY_RUN=1 ;;
+    --version)         _next_ver=1 ;;         # value is the next token
+    --version=*)       EXPLICIT_VERSION="${arg#--version=}" ;;
+    v[0-9]*)           [ -n "$_next_ver" ] && { EXPLICIT_VERSION="$arg"; _next_ver=""; } ;;
+  esac
+done
+echo "level=$LEVEL explicit=${EXPLICIT_VERSION:-none} dry_run=$DRY_RUN"
+```
 
 ## Preflight — abort with zero side effects on any failure
 
@@ -43,12 +62,7 @@ CI_CONCLUSION="$(gh run list --workflow=ci.yml --branch main --limit 20 \
 [ "$CI_CONCLUSION" = "success" ] || { echo "ERROR: CI on HEAD is '$CI_CONCLUSION' (need success)"; exit 1; }
 ```
 
-Then compute the target version (below) and confirm the tag does **not** already exist locally or on the remote:
-
-```bash
-git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null && { echo "ERROR: tag $VERSION already exists locally"; exit 1; }
-git ls-remote --exit-code --tags origin "$VERSION" >/dev/null 2>&1 && { echo "ERROR: tag $VERSION already exists on origin"; exit 1; }
-```
+The tag-does-not-already-exist check lives in **Compute the version** below, because it needs `$VERSION` — but it still runs before anything mutating, so the zero-side-effects promise holds.
 
 Ensure the `release-blocker` label exists so the goal gate below can query it (idempotent — a pre-existing label makes this a harmless no-op):
 
@@ -62,7 +76,7 @@ gh label create release-blocker --color B60205 \
 Release goals live in the rolling **`Next release`** milestone + the **`release-blocker`** label (see `CLAUDE.md` → "Release goals"). Enforce it here so an abort has zero side effects:
 
 ```bash
-gh issue list --milestone "Next release" --label release-blocker --state open \
+[ "$DRY_RUN" = 1 ] || gh issue list --milestone "Next release" --label release-blocker --state open \
   --json number,title --jq '.[] | "#\(.number) \(.title)"'
 ```
 
@@ -70,29 +84,35 @@ If that prints anything, **stop and surface the list** — those issues are decl
 
 ## Compute the version
 
-`--version vX.Y.Z` overrides everything. Otherwise:
+Uses `LEVEL` / `EXPLICIT_VERSION` from **Parse the invocation**. `--version vX.Y.Z` overrides the bump level; otherwise bump the newest tag (or `v1.0.0` on the first cut). The tag-existence guard runs here, once `$VERSION` is known but still before any file is touched.
 
 ```bash
-# Newest existing release tag (vMAJOR.MINOR.PATCH only).
-LATEST="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)"
-LEVEL="patch"   # or from $ARGUMENTS: patch|minor|major
-
-if [ -z "$LATEST" ]; then
-  VERSION="v1.0.0"                       # owner-locked first cut
+if [ -n "$EXPLICIT_VERSION" ]; then
+  VERSION="$EXPLICIT_VERSION"
 else
-  core="${LATEST#v}"
-  IFS=. read -r MA MI PA <<EOF
+  # Newest existing release tag (vMAJOR.MINOR.PATCH only).
+  LATEST="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)"
+  if [ -z "$LATEST" ]; then
+    VERSION="v1.0.0"                       # owner-locked first cut
+  else
+    core="${LATEST#v}"
+    IFS=. read -r MA MI PA <<EOF
 $core
 EOF
-  case "$LEVEL" in
-    major) MA=$((MA + 1)); MI=0; PA=0 ;;
-    minor) MI=$((MI + 1)); PA=0 ;;
-    *)     PA=$((PA + 1)) ;;
-  esac
-  VERSION="v${MA}.${MI}.${PA}"
+    case "$LEVEL" in
+      major) MA=$((MA + 1)); MI=0; PA=0 ;;
+      minor) MI=$((MI + 1)); PA=0 ;;
+      *)     PA=$((PA + 1)) ;;
+    esac
+    VERSION="v${MA}.${MI}.${PA}"
+  fi
 fi
 NUMERIC="${VERSION#v}"
 echo "target: $VERSION"
+
+# Tag must not already exist — locally or on origin.
+git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null && { echo "ERROR: tag $VERSION already exists locally"; exit 1; }
+git ls-remote --exit-code --tags origin "$VERSION" >/dev/null 2>&1 && { echo "ERROR: tag $VERSION already exists on origin"; exit 1; }
 ```
 
 ## CHANGELOG.md — authored, stdlib-only (no git-cliff)
@@ -150,11 +170,13 @@ The release commit is the **one sanctioned exception** to `CLAUDE.md`'s never-co
 
 ```bash
 git add pyproject.toml src/unraid_cache_cleaner/__init__.py CHANGELOG.md
-git commit -m "chore(release): $VERSION"
+git commit -m "chore(release): $VERSION" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 git tag -a "$VERSION" -m "$VERSION"
 git push origin main            # triggers publish.yml → :latest
 git push origin "$VERSION"      # triggers publish.yml → versioned image
 ```
+
+The second `-m` supplies the `Co-Authored-By` trailer `CLAUDE.md` requires on every commit.
 
 Both pushes will prompt for confirmation (they are not on the settings allow-list, by design — a release is the point to have a human in the loop). Never `--force`, never `--no-verify`.
 

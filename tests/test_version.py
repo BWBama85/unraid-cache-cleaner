@@ -33,7 +33,7 @@ def _pyproject_version() -> str:
             in_project = stripped == "[project]"
             continue
         if in_project:
-            match = re.match(r'version\s*=\s*"([^"]+)"', stripped)
+            match = re.match(r"""version\s*=\s*["']([^"']+)["']""", stripped)
             if match:
                 return match.group(1)
     raise AssertionError("no version found under [project] in pyproject.toml")

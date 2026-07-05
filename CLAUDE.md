@@ -54,7 +54,7 @@ There is **no** typecheck or lint tooling (stdlib-only, minimal). The Stop-hook 
 
 ## Git & PR workflow
 
-- **Never commit to `main`.** Feature branch (`issue-<num>-<slug>`) + PR always.
+- **Never commit to `main`.** Feature branch (`issue-<num>-<slug>`) + PR always. The **one** sanctioned exception is the `chore(release): vX.Y.Z` commit made by the `/release` skill (see the skills list below).
 - **Semantic commits**, referencing the issue. End commit messages with:
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 - **Never `--no-verify`; never destructive git** (`reset --hard`, `push --force`, `clean -fd`) unless the user explicitly asks.
