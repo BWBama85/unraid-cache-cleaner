@@ -11,6 +11,7 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from . import USER_AGENT
 from .http_redirect import build_handler
 from .models import DuplicateGroup, MediaCopy, PlexSection
 
@@ -67,7 +68,7 @@ class PlexClient:
         opener.addheaders = [
             ("X-Plex-Token", self.token),
             ("Accept", "application/json"),
-            ("User-Agent", "unraid-cache-cleaner/0.1.0"),
+            ("User-Agent", USER_AGENT),
         ]
         return opener
 

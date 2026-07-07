@@ -11,6 +11,7 @@ from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Dict, Optional
 
+from . import USER_AGENT
 from .http_redirect import build_handler
 from .models import TorrentRecord
 
@@ -64,7 +65,7 @@ class QbittorrentClient:
         opener = urllib.request.build_opener(*handlers)
         opener.addheaders = [
             ("Referer", self.base_url),
-            ("User-Agent", "unraid-cache-cleaner/0.1.0"),
+            ("User-Agent", USER_AGENT),
         ]
         return opener
 

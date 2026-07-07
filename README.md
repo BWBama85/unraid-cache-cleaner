@@ -203,8 +203,11 @@ which it can't from filenames alone.
 The repo publishes a container image automatically from GitHub Actions to:
 
 ```bash
-ghcr.io/bwbama85/unraid-cache-cleaner:latest
+ghcr.io/bwbama85/unraid-cache-cleaner:latest          # every push to main
+ghcr.io/bwbama85/unraid-cache-cleaner:vX.Y.Z          # every vX.Y.Z tag
 ```
+
+`:latest` tracks `main`; pushing a `vX.Y.Z` tag additionally publishes an immutable versioned image (see [Releases](#releases)). The Unraid template pins `:latest`, so no per-release template edit is needed.
 
 ### Local
 
@@ -238,6 +241,20 @@ docker run --rm ghcr.io/bwbama85/unraid-cache-cleaner:latest scan
 ### Unraid
 
 See [docs/unraid.md](docs/unraid.md). A starter container template is included at [contrib/unraid-cache-cleaner.xml](contrib/unraid-cache-cleaner.xml), and the default repository path is the published GHCR image.
+
+### Releases
+
+Versioning follows [SemVer](https://semver.org/); the git tag is the single source of truth for a release. Pushing a `vX.Y.Z` tag triggers [`publish.yml`](.github/workflows/publish.yml), which builds and pushes the versioned GHCR image. The first release is `v1.0.0`.
+
+Maintainers cut releases with the **`/release`** Claude Code skill (`.claude/skills/release/`), which runs preflight (on `main`, clean tree, in sync with `origin/main`, CI green on `HEAD`), bumps the version in `pyproject.toml` and `src/unraid_cache_cleaner/__init__.py` (the client `User-Agent` derives from `__version__`, so there is no third string to touch), prepends a `CHANGELOG.md` section, commits + annotated-tags on `main`, pushes, and creates the GitHub Release from that changelog section:
+
+```
+/release [patch|minor|major]     # default: patch
+/release --version v1.2.0        # explicit version
+/release --dry-run minor         # preview the bump + changelog, no commit/tag/push
+```
+
+The commit history and per-release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Project Layout
 

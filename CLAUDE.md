@@ -54,7 +54,7 @@ There is **no** typecheck or lint tooling (stdlib-only, minimal). The Stop-hook 
 
 ## Git & PR workflow
 
-- **Never commit to `main`.** Feature branch (`issue-<num>-<slug>`) + PR always.
+- **Never commit to `main`.** Feature branch (`issue-<num>-<slug>`) + PR always. The **one** sanctioned exception is the `chore(release): vX.Y.Z` commit made by the `/release` skill (see the skills list below).
 - **Semantic commits**, referencing the issue. End commit messages with:
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 - **Never `--no-verify`; never destructive git** (`reset --hard`, `push --force`, `clean -fd`) unless the user explicitly asks.
@@ -71,9 +71,8 @@ Skills (`.claude/skills/`):
 
 - **`/implement-issue <num> [more nums] [hints]`** — end-to-end: preflight → codex gap-analysis → branch → implement + tests → gate → commit → `/code-review` → triage → push → PR → **file follow-up issues for all deferred work** → completion checklist. Never stops until a PR exists or it's genuinely blocked.
 - **`/resolve-pr-threads <PR#>`** — resolve bot-authored review threads after the PR is up.
+- **`/release [patch|minor|major] | --version vX.Y.Z | --dry-run [bump]`** — cut a versioned release: preflight (on `main`, clean, in-sync, CI green on HEAD) → release-goal gate → bump `pyproject.toml` + `__init__.py` → prepend `CHANGELOG.md` → `chore(release)` commit + annotated tag on `main` (the sole sanctioned exception to never-commit-`main`) → push (tag triggers `publish.yml`) → `gh release create` → surface the tag's GHCR publish run → roll the `Next release` milestone. First cut is `v1.0.0`.
 - Issue authoring uses the **user-level `/create-issue`** skill (11-axis gap analysis before filing).
-
-_Not yet ported:_ a `release` skill (getrich's is changelog/cliff-specific; this repo ships via GHCR GitHub Actions — needs a bespoke rewrite).
 
 ## Release goals — milestones
 
