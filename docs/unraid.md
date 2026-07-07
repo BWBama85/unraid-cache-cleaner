@@ -76,6 +76,14 @@ If your mounted download root also contains non-torrent files you want to keep, 
 
 Patterns without a slash match by basename. Patterns with a slash match the full in-container path.
 
+> **RAR extraction is now first-party.** If you previously ran `rar_extractor.sh`
+> on a cron to unpack scene releases, set `EXTRACT_ENABLED=true` and remove that
+> cron — the service now detects and extracts RAR archives every cycle and
+> protects the extracted media from cleanup (see the README's [RAR
+> extraction](../README.md#rar-extraction) section). The `rar_extractor.sh` entry
+> in `EXCLUDED_GLOBS` above is now optional; it excludes a script you no longer
+> need and can be dropped.
+
 ## Recommended First Run
 
 Use these safety settings first:

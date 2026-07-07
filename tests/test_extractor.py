@@ -22,6 +22,7 @@ from unraid_cache_cleaner.extractor import (
     summarize,
 )
 from unraid_cache_cleaner.planner import normalize_path
+from unraid_cache_cleaner.state import StateExtractionLedger, StateStore
 
 
 class FakeTool:
@@ -373,6 +374,149 @@ class ExtractorTests(unittest.TestCase):
 
             self.assertEqual(counts["extracted"], 1)
             self.assertEqual(counts["failed"], 1)
+
+
+class MultiVolumeTests(unittest.TestCase):
+    """First-volume-only selection across the layouts scene releases use (#37)."""
+
+    def _extracted_names(self, layout: list[str]) -> list[str]:
+        with _Fixture() as fx:
+            for name in layout:
+                fx.write_rar(name)
+            tool = FakeTool()
+            extractor = Extractor(fx.config(), tool=tool)
+            extractor.extract_all((fx.watch_root,), dry_run=False)
+            return sorted(c[0].name for c in tool.extract_calls)
+
+    def test_modern_partNN_first_volume_only(self) -> None:
+        self.assertEqual(
+            self._extracted_names(["rel/show.part01.rar", "rel/show.part02.rar", "rel/show.part03.rar"]),
+            ["show.part01.rar"],
+        )
+
+    def test_mixed_case_part_suffix(self) -> None:
+        self.assertEqual(
+            self._extracted_names(["rel/Show.PART01.RAR", "rel/Show.Part02.Rar"]),
+            ["Show.PART01.RAR"],
+        )
+
+    def test_single_digit_part(self) -> None:
+        self.assertEqual(
+            self._extracted_names(["rel/show.part1.rar", "rel/show.part2.rar"]),
+            ["show.part1.rar"],
+        )
+
+    def test_three_digit_part(self) -> None:
+        self.assertEqual(
+            self._extracted_names(["rel/show.part001.rar", "rel/show.part002.rar"]),
+            ["show.part001.rar"],
+        )
+
+    def test_double_digit_parts_sort_numerically_not_lexically(self) -> None:
+        layout = [f"rel/show.part{n:02d}.rar" for n in range(1, 12)]  # part01..part11
+        self.assertEqual(self._extracted_names(layout), ["show.part01.rar"])
+
+    def test_first_volume_missing_is_not_extracted(self) -> None:
+        # Only part02/part03 present (part01 still downloading): extract nothing.
+        self.assertEqual(
+            self._extracted_names(["rel/show.part02.rar", "rel/show.part03.rar"]),
+            [],
+        )
+
+    def test_legacy_rNN_extracts_the_rar(self) -> None:
+        self.assertEqual(
+            self._extracted_names(["rel/movie.rar", "rel/movie.r00", "rel/movie.r01"]),
+            ["movie.rar"],
+        )
+
+    def test_split_across_directories_only_extracts_the_first_dirs_volume(self) -> None:
+        # A set split across dirs: the dir holding part01 extracts; the dir whose
+        # lowest volume is part02 is treated as first-volume-missing and skipped.
+        self.assertEqual(
+            self._extracted_names(["a/show.part01.rar", "b/show.part02.rar"]),
+            ["show.part01.rar"],
+        )
+
+
+class LedgerIdempotencyTests(unittest.TestCase):
+    """Cross-run idempotency and output tracking via the SQLite ledger (#35)."""
+
+    def _extractor(self, fx: "_Fixture", store: StateStore, **overrides: object) -> Extractor:
+        return Extractor(fx.config(**overrides), tool=FakeTool(), ledger=StateExtractionLedger(store))
+
+    def test_second_cycle_skips_without_reinvoking(self) -> None:
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            store = StateStore(fx.config().state_db_path)
+
+            first = Extractor(fx.config(), tool=(tool1 := FakeTool()), ledger=StateExtractionLedger(store))
+            self.assertEqual([r.status for r in first.extract_all((fx.watch_root,), dry_run=False)], ["extracted"])
+            self.assertEqual(len(tool1.extract_calls), 1)
+
+            second = Extractor(fx.config(), tool=(tool2 := FakeTool()), ledger=StateExtractionLedger(store))
+            results = second.extract_all((fx.watch_root,), dry_run=False)
+            self.assertEqual([r.status for r in results], ["skipped_present"])
+            self.assertEqual(tool2.extract_calls, [])  # no re-invoke
+            self.assertEqual(tool2.test_calls, [])  # not even the integrity test
+
+    def test_failure_is_not_recorded_and_retries(self) -> None:
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            store = StateStore(fx.config().state_db_path)
+
+            first = Extractor(
+                fx.config(), tool=FakeTool(fail_names={"movie.rar"}), ledger=StateExtractionLedger(store)
+            )
+            self.assertEqual([r.status for r in first.extract_all((fx.watch_root,), dry_run=False)], ["failed"])
+
+            # The released claim lets the next cycle try again (and succeed).
+            second = Extractor(fx.config(), tool=(tool2 := FakeTool()), ledger=StateExtractionLedger(store))
+            self.assertEqual([r.status for r in second.extract_all((fx.watch_root,), dry_run=False)], ["extracted"])
+            self.assertEqual(len(tool2.extract_calls), 1)
+
+    def test_extraction_records_protected_output_files(self) -> None:
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            store = StateStore(fx.config().state_db_path)
+            extractor = Extractor(fx.config(), tool=FakeTool(), ledger=StateExtractionLedger(store))
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])
+            mkv = normalize_path(fx.watch_root / "rel" / "movie.mkv")
+            self.assertIn(mkv, results[0].outputs)
+            protected = store.get_protected_extracted_paths(0.0, protect_seconds=10**9)
+            self.assertIn(mkv, protected)
+
+    def test_dry_run_writes_no_ledger_state(self) -> None:
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            store = StateStore(fx.config().state_db_path)
+            extractor = Extractor(fx.config(dry_run=True), tool=FakeTool(), ledger=StateExtractionLedger(store))
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=True)
+
+            self.assertEqual([r.status for r in results], ["would_extract"])
+            # No claim and no outputs were persisted by the preview run.
+            self.assertEqual(store.get_protected_extracted_paths(0.0, protect_seconds=10**9), set())
+
+
+class IncompleteRootsTests(unittest.TestCase):
+    def test_archive_under_incomplete_torrent_is_deferred(self) -> None:
+        with _Fixture() as fx:
+            archive = fx.write_rar("rel/movie.rar")
+            tool = FakeTool()
+            extractor = Extractor(fx.config(), tool=tool)
+
+            results = extractor.extract_all(
+                (fx.watch_root,),
+                dry_run=False,
+                incomplete_roots=(archive.parent,),
+            )
+
+            self.assertEqual([r.status for r in results], ["deferred_incomplete"])
+            self.assertEqual(tool.test_calls, [])  # deferred before the integrity test
+            self.assertEqual(tool.extract_calls, [])
 
 
 class HelperTests(unittest.TestCase):

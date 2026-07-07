@@ -10,7 +10,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.models import TorrentRecord
-from unraid_cache_cleaner.planner import build_protection_plan, find_orphan_candidates
+from unraid_cache_cleaner.planner import (
+    build_protection_plan,
+    find_orphan_candidates,
+    normalize_path,
+    with_protected_files,
+)
 from unraid_cache_cleaner.scanner import scan_filesystem
 
 
@@ -98,6 +103,68 @@ class PlannerTests(unittest.TestCase):
 
             self.assertIn(orphan, candidates)
             self.assertNotIn(archive, candidates)
+
+
+class ExtractedOutputProtectionTests(unittest.TestCase):
+    """with_protected_files keeps extracted media safe (Child C, #36)."""
+
+    def test_extracted_output_survives_beside_unprotected_single_file_rar(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            watch_root = Path(tempdir) / "data"
+            job_dir = watch_root / "job-001"
+            job_dir.mkdir(parents=True)
+            archive = job_dir / "release.rar"
+            extracted = job_dir / "release.mkv"
+            archive.write_text("tracked")
+            extracted.write_text("extracted")
+
+            torrent = TorrentRecord(
+                torrent_hash="abc",
+                name="release.rar",
+                state="stalledUP",
+                save_path=job_dir,
+                content_path=archive,
+            )
+            # With single-file parent protection OFF, the extracted .mkv is exposed.
+            plan = build_protection_plan(
+                [torrent], (watch_root,), protect_single_file_parent_dirs=False
+            )
+            scanned = scan_filesystem((watch_root,), (), protected_dirs=plan.protected_dirs)
+            self.assertIn(normalize_path(extracted), find_orphan_candidates(scanned, plan))
+
+            # Injecting the extracted output as a protected file closes the hole.
+            protected = with_protected_files(plan, [extracted])
+            candidates = find_orphan_candidates(scanned, protected)
+            self.assertNotIn(normalize_path(extracted), candidates)
+
+    def test_flat_watch_root_protects_output_but_still_cleans_orphans(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            watch_root = Path(tempdir) / "data"
+            watch_root.mkdir(parents=True)
+            archive = watch_root / "release.rar"
+            extracted = watch_root / "release.mkv"
+            orphan = watch_root / "orphan.txt"
+            for path, text in ((archive, "tracked"), (extracted, "extracted"), (orphan, "orphan")):
+                path.write_text(text)
+
+            torrent = TorrentRecord(
+                torrent_hash="abc",
+                name="release.rar",
+                state="uploading",
+                save_path=watch_root,
+                content_path=archive,
+            )
+            plan = build_protection_plan(
+                [torrent], (watch_root,), protect_single_file_parent_dirs=True
+            )
+            # Protecting the extracted file must NOT protect the whole watch root.
+            protected = with_protected_files(plan, [extracted])
+            scanned = scan_filesystem((watch_root,), (), protected_dirs=protected.protected_dirs)
+            candidates = find_orphan_candidates(scanned, protected)
+
+            self.assertNotIn(normalize_path(extracted), candidates)  # kept
+            self.assertNotIn(normalize_path(archive), candidates)  # tracked by torrent
+            self.assertIn(normalize_path(orphan), candidates)  # cleanup still works
 
 
 if __name__ == "__main__":

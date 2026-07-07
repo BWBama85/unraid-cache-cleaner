@@ -99,10 +99,11 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `STATE_DB_PATH` | `/config/state.sqlite3` | SQLite state database |
 | `REPORT_PATH` | `/config/last-run.json` | JSON summary of the last run |
 | `LOG_LEVEL` | `INFO` | Python log level |
-| `EXTRACT_ENABLED` | `false` | Enable the [`extract`](#rar-extraction) subcommand (opt-in; extraction mutates) |
+| `EXTRACT_ENABLED` | `false` | Enable [RAR extraction](#rar-extraction) in the `scan`/`service` cycle and the `extract` subcommand (opt-in; extraction mutates) |
 | `EXTRACT_TOOL` | `unar` | Archive binary name or full path (`lsar` is derived from it for the integrity test) |
 | `EXTRACT_OWNER` | empty | Numeric `uid:gid` for a best-effort chown of extracted files (Unraid = `99:100`); empty skips chown |
 | `EXTRACT_MIN_AGE_SECONDS` | `300` | Skip archives whose newest volume is younger than this (settle guard against still-downloading files) |
+| `EXTRACT_PROTECT_SECONDS` | `86400` | Keep extracted output undeletable for this long after extraction, so *arr can import it before normal orphan cleanup resumes |
 | `PLEX_URL` | empty | Plex server base URL (e.g. `http://192.168.1.10:32400`) |
 | `PLEX_TOKEN` | empty | Plex `X-Plex-Token` (sent as a header, never in the URL) |
 | `PLEX_SECTIONS` | empty | Comma-separated library section **IDs** to scan; empty ⇒ auto-detect video sections |
@@ -204,37 +205,50 @@ which it can't from filenames alone.
 
 Scene releases often arrive as `.rar` (frequently multi-volume) inside a
 torrent's download folder, and Radarr/Sonarr cannot import the media until the
-archive is extracted. The `extract` subcommand detects RAR archives under
-`WATCH_PATHS`, integrity-tests them, and extracts them **in place** so `*arr` can
-import — folding what used to be a separate `rar_extractor.sh` cron into this
-container.
+archive is extracted. With `EXTRACT_ENABLED=true`, **every `scan`/`service` cycle
+detects RAR archives under the watch roots, integrity-tests them, and extracts
+them in place** — right before the orphan-deletion pass, so the freshly extracted
+media is protected in the same cycle. This folds what used to be a separate
+`rar_extractor.sh` cron into the service.
 
 ```bash
-# Dry run first (default): reports what would be extracted, writes nothing.
-EXTRACT_ENABLED=true DRY_RUN=true unraid-cache-cleaner extract
-# Then extract for real:
+# Turn it on for the cleanup cycle (dry-run reports would-extract, writes nothing):
+EXTRACT_ENABLED=true DRY_RUN=true  unraid-cache-cleaner scan
+EXTRACT_ENABLED=true DRY_RUN=false unraid-cache-cleaner scan
+
+# Or run extraction on its own, without the deletion pass:
 EXTRACT_ENABLED=true DRY_RUN=false unraid-cache-cleaner extract
 ```
 
 - **Opt-in and dry-run-safe.** Extraction mutates the download path, so it is off
   unless `EXTRACT_ENABLED=true`, and it honors `DRY_RUN` exactly like deletion.
+- **Safe by construction.** Extracted output is recorded as a first-party
+  protected input, so the deletion pass never removes media it just extracted —
+  even for a single-file `.rar` torrent, an archive sitting loose at the watch
+  root, or after the source torrent deregisters. The protection lasts
+  `EXTRACT_PROTECT_SECONDS` (default 24h) after extraction, giving `*arr` time to
+  import before normal orphan cleanup can reclaim the leftover.
+- **Idempotent and claim-safe.** A successful extraction is recorded in the
+  SQLite state DB, so later cycles skip it instead of re-extracting; a
+  claim-before-extract guard keeps a one-shot `extract` from colliding with a
+  running `service`. Failed and deferred archives are not recorded, so they retry.
 - **Multi-volume aware.** A `name.partNN.rar` set is extracted once from its first
   volume, not once per part; legacy `name.rar` + `name.rNN` sets extract from the
-  `.rar`.
+  `.rar`. A set missing its first volume (still downloading) is left until it
+  arrives.
 - **Settle guard.** Archives whose newest volume is younger than
-  `EXTRACT_MIN_AGE_SECONDS` are deferred and retried, so a still-downloading
-  release is not extracted early. A failed integrity test defers likewise; a
-  failed extraction is reported and the archive is kept for a later retry.
+  `EXTRACT_MIN_AGE_SECONDS`, or whose source torrent has not finished
+  downloading, are deferred and retried. A failed integrity test defers likewise;
+  a failed extraction is reported and the archive is kept for a later retry.
 - **Ownership.** Set `EXTRACT_OWNER=99:100` (Unraid's `nobody:users`) for a
   best-effort chown of extracted files; a chown failure is a warning, never fatal.
 - **Platform.** Extraction is Linux-in-container only — it relies on the bundled
   free `unar`/`lsar` binaries. Local dev on macOS/Windows runs the rest of the
   suite; the one real-binary test skips unless `unar` is installed.
 
-> **Migrating from `rar_extractor.sh`:** enable `EXTRACT_ENABLED` and remove the
-> external cron. The `rar_extractor.sh` entry can stay harmlessly in
-> `EXCLUDED_GLOBS`. Extraction is not yet wired into the `scan`/`service` cleanup
-> cycle — run `extract` on your own schedule for now.
+> **Migrating from `rar_extractor.sh`:** set `EXTRACT_ENABLED=true` and remove the
+> external cron — the service now extracts on every cycle. The `rar_extractor.sh`
+> entry can stay harmlessly in `EXCLUDED_GLOBS` or be dropped.
 
 ## Packaging
 

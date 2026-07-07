@@ -26,7 +26,7 @@ from typing import Callable, List, Optional, Protocol, Sequence, Tuple
 
 from .config import Config
 from .models import FileRecord
-from .planner import normalize_path
+from .planner import is_within_any, normalize_path
 from .scanner import scan_filesystem
 
 LOGGER = logging.getLogger(__name__)
@@ -42,7 +42,14 @@ _PART_RE = re.compile(r"^(?P<base>.+)\.part(?P<num>\d+)\.rar$", re.IGNORECASE)
 EXTRACTED = "extracted"
 WOULD_EXTRACT = "would_extract"
 DEFERRED_INCOMPLETE = "deferred_incomplete"
+SKIPPED_PRESENT = "skipped_present"
 FAILED = "failed"
+
+# ``ExtractionLedger.claim`` outcomes (the ledger protocol's contract; the SQLite
+# implementation in ``state.py`` imports these).
+CLAIM_NEW = "new"  # caller won the claim; proceed to extract
+CLAIM_DONE = "done"  # already extracted; skip with no re-invoke
+CLAIM_BUSY = "busy"  # a fresh claim is held elsewhere; skip this cycle
 
 
 class ExtractorError(RuntimeError):
@@ -62,6 +69,27 @@ class ArchiveTool(Protocol):
         ...
 
 
+class ExtractionLedger(Protocol):
+    """Claim/idempotency store injected into ``Extractor`` (fakeable in tests).
+
+    Absent (``None``), the extractor re-processes every archive every run — the
+    behavior of the foundation slice and of the pure unit tests. Present, it makes
+    extraction idempotent across runs and claim-safe against a concurrent run.
+    """
+
+    def claim(self, archive: Path, now: float) -> str:
+        """Return ``CLAIM_NEW`` / ``CLAIM_DONE`` / ``CLAIM_BUSY`` for ``archive``."""
+        ...
+
+    def complete(self, archive: Path, outputs: Sequence[Path], now: float) -> None:
+        """Record a successful extraction and its output files."""
+        ...
+
+    def release(self, archive: Path) -> None:
+        """Drop an in-flight claim so a deferred/failed archive retries."""
+        ...
+
+
 @dataclass(frozen=True)
 class ExtractionResult:
     """Outcome of processing a single archive (or volume set)."""
@@ -70,6 +98,10 @@ class ExtractionResult:
     status: str
     message: str = ""
     output_dir: Optional[Path] = None
+    # Files this extraction created (empty unless a ledger recorded them). The
+    # deletion planner protects these so extracted media survives until *arr
+    # imports it (Child C).
+    outputs: Tuple[Path, ...] = ()
 
 
 def _derive_list_tool(tool: str) -> Optional[str]:
@@ -180,11 +212,13 @@ class Extractor:
         config: Config,
         *,
         tool: Optional[ArchiveTool] = None,
+        ledger: Optional[ExtractionLedger] = None,
         clock: Callable[[], float] = time.time,
         chown: Callable[[str, int, int], None] = os.chown,
     ) -> None:
         self.config = config
         self.tool: ArchiveTool = tool if tool is not None else UnarArchiveTool(config.extract_tool)
+        self.ledger = ledger
         self.clock = clock
         self._chown = chown
 
@@ -220,6 +254,13 @@ class Extractor:
 
         for members in groups.values():
             members.sort(key=lambda item: item[0])
+            lowest_num = members[0][0]
+            # RAR volume numbering starts at part01 (part00 appears rarely). A set
+            # whose lowest present volume is > 1 is missing its first volume —
+            # still downloading — so it is skipped until the first arrives.
+            # Extracting a later volume alone would only fail the integrity test.
+            if lowest_num > 1:
+                continue
             first = members[0][1]
             newest_mtime = max(record.mtime for _, record in members)
             selected.append((normalize_path(first.path), newest_mtime))
@@ -253,16 +294,33 @@ class Extractor:
         roots: Tuple[Path, ...],
         *,
         dry_run: bool,
+        incomplete_roots: Sequence[Path] = (),
     ) -> List[ExtractionResult]:
-        """Process every archive under ``roots``, isolating per-archive errors."""
+        """Process every archive under ``roots``, isolating per-archive errors.
+
+        ``incomplete_roots`` are content paths of torrents that have not finished
+        downloading; any archive within one is deferred (the settle guard covers a
+        fresh mtime, this covers a settled ``.rar`` whose torrent is still pulling
+        other files).
+        """
 
         if not self.tool.is_available():
             raise ExtractorError(f"extract tool not found: {self.config.extract_tool}")
 
         now = self.clock()
+        incomplete = tuple(normalize_path(path) for path in incomplete_roots)
         results: List[ExtractionResult] = []
         for archive, newest_mtime in self.find_first_volumes(roots):
             try:
+                if incomplete and is_within_any(archive, incomplete):
+                    results.append(
+                        ExtractionResult(
+                            archive,
+                            DEFERRED_INCOMPLETE,
+                            "source torrent still downloading; deferred",
+                        )
+                    )
+                    continue
                 if (now - newest_mtime) < self.config.extract_min_age_seconds:
                     results.append(
                         ExtractionResult(
@@ -272,22 +330,44 @@ class Extractor:
                         )
                     )
                     continue
-                results.append(self._extract_one(archive, dry_run=dry_run))
+                results.append(self._extract_one(archive, dry_run=dry_run, now=now))
             except Exception as exc:  # noqa: BLE001 - one bad archive must not abort the run
                 LOGGER.warning("Unexpected error processing %s: %s", archive, exc)
                 results.append(ExtractionResult(archive, FAILED, str(exc)))
         return results
 
-    def _extract_one(self, archive: Path, *, dry_run: bool) -> ExtractionResult:
+    def _extract_one(self, archive: Path, *, dry_run: bool, now: float) -> ExtractionResult:
         dest_dir = archive.parent
+
+        # Dry-run is a read-only preview: it neither claims nor records, so it does
+        # not consult the ledger (an already-extracted archive still reports
+        # would_extract, matching the spec). A live run claims *before* the
+        # integrity test so a concurrent run can't also grab the archive; the
+        # claim is released on any defer/failure so the archive retries next cycle.
+        claimed = False
+        if self.ledger is not None and not dry_run:
+            decision = self.ledger.claim(archive, now)
+            if decision == CLAIM_DONE:
+                return ExtractionResult(
+                    archive, SKIPPED_PRESENT, "already extracted", output_dir=dest_dir
+                )
+            if decision == CLAIM_BUSY:
+                return ExtractionResult(
+                    archive, SKIPPED_PRESENT, "claimed by another run", output_dir=dest_dir
+                )
+            claimed = True
 
         try:
             integrity_ok = self.tool.test(archive)
         except Exception as exc:  # noqa: BLE001 - a failed test just defers the archive
+            if claimed:
+                self.ledger.release(archive)
             return ExtractionResult(
                 archive, DEFERRED_INCOMPLETE, f"integrity test error: {exc}"
             )
         if not integrity_ok:
+            if claimed:
+                self.ledger.release(archive)
             return ExtractionResult(
                 archive,
                 DEFERRED_INCOMPLETE,
@@ -299,17 +379,27 @@ class Extractor:
                 archive, WOULD_EXTRACT, "dry-run: integrity ok", output_dir=dest_dir
             )
 
-        # Snapshot the destination *before* extracting so ownership is applied to
-        # only the files this extraction creates (skipped entirely when no owner
-        # is configured, so the default off case pays nothing).
-        preexisting = _snapshot_tree(dest_dir) if self.config.extract_owner else set()
+        # Snapshot the destination *before* extracting so ownership and output
+        # tracking apply to only the files this extraction creates (skipped when
+        # neither a ledger nor an owner needs it, so the default path pays nothing).
+        need_outputs = self.ledger is not None
+        preexisting = (
+            _snapshot_tree(dest_dir) if (self.config.extract_owner or need_outputs) else set()
+        )
         try:
             self.tool.extract(archive, dest_dir)
         except Exception as exc:  # noqa: BLE001 - surface, keep the archive, retry next run
+            if claimed:
+                self.ledger.release(archive)
             return ExtractionResult(archive, FAILED, str(exc))
 
+        new_files = _new_files_since(dest_dir, preexisting) if need_outputs else ()
         self._apply_ownership(dest_dir, preexisting)
-        return ExtractionResult(archive, EXTRACTED, "extracted", output_dir=dest_dir)
+        if self.ledger is not None:
+            self.ledger.complete(archive, new_files, now)
+        return ExtractionResult(
+            archive, EXTRACTED, "extracted", output_dir=dest_dir, outputs=new_files
+        )
 
     def _apply_ownership(self, dest_dir: Path, preexisting: set) -> None:
         """Best-effort chown of the files this extraction created.
@@ -355,10 +445,35 @@ def _snapshot_tree(root: Path) -> set:
     return seen
 
 
+def _new_files_since(root: Path, preexisting: set) -> Tuple[Path, ...]:
+    """Return files created under ``root`` since the ``preexisting`` snapshot.
+
+    Files only (never directories or symlinks) so the planner protects the
+    concrete extracted media, not a directory that might be a watch root — the
+    flat-watch-root case where protecting ``archive.parent`` would disable all
+    cleanup.
+    """
+
+    created: List[Path] = []
+    for current_root, _dirs, files in os.walk(root):
+        for name in files:
+            path = Path(current_root) / name
+            if path in preexisting or path.is_symlink():
+                continue
+            created.append(path)
+    return tuple(created)
+
+
 def summarize(results: Sequence[ExtractionResult]) -> dict:
     """Count results by status for a compact one-line summary."""
 
-    counts = {EXTRACTED: 0, WOULD_EXTRACT: 0, DEFERRED_INCOMPLETE: 0, FAILED: 0}
+    counts = {
+        EXTRACTED: 0,
+        WOULD_EXTRACT: 0,
+        DEFERRED_INCOMPLETE: 0,
+        SKIPPED_PRESENT: 0,
+        FAILED: 0,
+    }
     for result in results:
         counts[result.status] = counts.get(result.status, 0) + 1
     return counts

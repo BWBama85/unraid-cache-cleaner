@@ -110,19 +110,27 @@ This version focuses on safe orphan cleanup for qBittorrent download/cache paths
 
 ### Opt-in RAR extraction
 
-The `extract` subcommand (module `extractor.py`) detects RAR archives under the
-watch roots, integrity-tests them via the free `unar`/`lsar` binaries, and
-extracts them in place so Radarr/Sonarr can import — the first-party replacement
-for the external `rar_extractor.sh` cron. It is **off by default**
-(`EXTRACT_ENABLED=false`), honors `DRY_RUN`, and reuses `scan_filesystem` for
-archive discovery so it inherits the same symlink-skipping and excluded-glob
-behavior as the cleaner. The archive tool is injected via the constructor, so
-tests pass a fake and `unrar`/`p7zip` can be adapted later.
+Module `extractor.py` detects RAR archives under the watch roots, integrity-tests
+them via the free `unar`/`lsar` binaries, and extracts them in place so
+Radarr/Sonarr can import — the first-party replacement for the external
+`rar_extractor.sh` cron. It is **off by default** (`EXTRACT_ENABLED=false`),
+honors `DRY_RUN`, and reuses `scan_filesystem` for archive discovery so it
+inherits the same symlink-skipping and excluded-glob behavior as the cleaner. The
+archive tool is injected via the constructor, so tests pass a fake and
+`unrar`/`p7zip` can be adapted later.
 
-This is the foundation slice: extraction is **not yet folded into the
-`scan`/`service` cycle**, and the deletion planner does not yet treat extracted
-output as a first-party protection source. Until then, an extracted file is
-protected only while its torrent's content directory is (see [directory
-protection](#directory-protection-beats-file-matching-for-active-content)); run
-`extract` on your own schedule.
+Extraction is folded into `CleanerService.run_once`, running **before** the
+orphan-deletion pass. Each successful extraction's output files are persisted in
+an `extraction_outputs` SQLite table and injected into that cycle's
+`ProtectionPlan` as first-party tracked files, so freshly extracted media is
+never deletable in the run that created it — or in any run for
+`EXTRACT_PROTECT_SECONDS` afterward, which covers the single-file `.rar`,
+loose-archive-at-the-watch-root, and torrent-deregistration cases the [directory
+protection](#directory-protection-beats-file-matching-for-active-content) model
+alone does not. Protection is by **exact file path**, not by directory, so an
+archive extracted at the watch root does not protect (and disable cleanup of) the
+whole mount. An `extractions` table records claims and completions: a
+claim-before-extract guard stops a one-shot `extract` from colliding with a
+running `service`, and completed archives are skipped on later cycles. The
+standalone `extract` subcommand runs the same engine against `WATCH_PATHS` alone.
 

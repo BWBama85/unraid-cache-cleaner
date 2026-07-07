@@ -166,6 +166,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.extract_tool, "unar")
                 self.assertEqual(config.extract_owner, "")
                 self.assertEqual(config.extract_min_age_seconds, 300)
+                self.assertEqual(config.extract_protect_seconds, 86400)
 
     def test_extract_env_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -177,6 +178,7 @@ class ConfigTests(unittest.TestCase):
                 "EXTRACT_TOOL": "/usr/bin/unar",
                 "EXTRACT_OWNER": "99:100",
                 "EXTRACT_MIN_AGE_SECONDS": "60",
+                "EXTRACT_PROTECT_SECONDS": "3600",
             }
             with mock.patch.dict(os.environ, env, clear=True):
                 config = Config.from_env()
@@ -185,6 +187,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.extract_tool, "/usr/bin/unar")
                 self.assertEqual(config.extract_owner, "99:100")
                 self.assertEqual(config.extract_min_age_seconds, 60)
+                self.assertEqual(config.extract_protect_seconds, 3600)
 
 
 if __name__ == "__main__":
