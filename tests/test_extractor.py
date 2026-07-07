@@ -218,6 +218,25 @@ class ExtractorTests(unittest.TestCase):
             self.assertEqual(tool.test_calls, [])  # deferred before the integrity test
             self.assertEqual(tool.extract_calls, [])
 
+    def test_settle_guard_considers_legacy_rNN_volumes(self) -> None:
+        # movie.rar is old, but a legacy continuation volume movie.r01 is still
+        # fresh — the set is not settled, so extraction must defer.
+        with _Fixture() as fx:
+            rar = fx.write_rar("rel/movie.rar")
+            r01 = fx.write_rar("rel/movie.r01")
+            now = 1_000_000.0
+            os.utime(rar, (now - 10_000, now - 10_000))
+            os.utime(r01, (now - 10, now - 10))
+            tool = FakeTool()
+            extractor = Extractor(
+                fx.config(extract_min_age_seconds=3600), tool=tool, clock=lambda: now
+            )
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["deferred_incomplete"])
+            self.assertEqual(tool.extract_calls, [])
+
     def test_missing_binary_raises(self) -> None:
         with _Fixture() as fx:
             fx.write_rar("rel/movie.rar")
@@ -394,6 +413,24 @@ class UnarArchiveToolTests(unittest.TestCase):
         self.assertIn("-output-directory", cmd)
         self.assertEqual(cmd[cmd.index("-output-directory") + 1], "/data/rel")
         self.assertEqual(cmd[-1], "/data/rel/movie.rar")
+        # nested archives must not be auto-extracted (mirror `unrar x`)
+        self.assertIn("-no-recursion", cmd)
+
+    def test_test_uses_integrity_test_flag(self) -> None:
+        runner, calls = self._runner(0)
+        # list_tool must resolve on PATH for the pre-test to run; sys.executable does.
+        tool = UnarArchiveTool("unar", list_tool=sys.executable, runner=runner)
+
+        self.assertTrue(tool.test(Path("/data/rel/movie.rar")))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("-test", calls[0])  # not a plain header listing
+        self.assertEqual(calls[0][-1], "/data/rel/movie.rar")
+
+    def test_test_returns_false_on_nonzero(self) -> None:
+        runner, _ = self._runner(1)
+        tool = UnarArchiveTool("unar", list_tool=sys.executable, runner=runner)
+
+        self.assertFalse(tool.test(Path("/data/rel/movie.rar")))
 
     def test_extract_raises_on_nonzero_exit(self) -> None:
         runner, _ = self._runner(2, stderr="Couldn't open archive")

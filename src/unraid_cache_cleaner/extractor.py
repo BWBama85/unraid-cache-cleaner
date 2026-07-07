@@ -117,18 +117,20 @@ class UnarArchiveTool:
         return shutil.which(self.tool) is not None
 
     def test(self, archive: Path) -> bool:
-        """Return True when the archive reads cleanly (a cheap pre-extract gate).
+        """Return True when the archive's payload verifies cleanly (a defer gate).
 
-        A still-downloading or truncated archive makes ``lsar`` exit non-zero, so
-        it is deferred and retried rather than extracted. When no listing tool is
-        available the check is skipped (returns True) and extraction becomes the
-        real integrity gate.
+        Uses ``lsar -test``, which tests the integrity of the archived files —
+        not plain ``lsar``, which only lists headers and would pass a settled but
+        corrupt or missing-later-volume archive. A still-downloading, truncated,
+        or corrupt archive exits non-zero, so it is deferred and retried rather
+        than extracted. When no listing tool is available the check is skipped
+        (returns True) and extraction becomes the real integrity gate.
         """
 
         if not self.list_tool or shutil.which(self.list_tool) is None:
             return True
         proc = self._runner(
-            [self.list_tool, str(archive)],
+            [self.list_tool, "-test", str(archive)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=self.timeout_seconds,
@@ -139,14 +141,18 @@ class UnarArchiveTool:
         """Extract ``archive`` into ``dest_dir`` (in place, overwriting).
 
         Mirrors the source tool's ``unrar x -y "$rarfile" "$dir/"``: extract the
-        archive's contents directly into its own directory. Raises
-        ``ExtractorError`` on any non-zero exit.
+        archive's contents directly into its own directory. ``-no-recursion``
+        keeps it to the selected archive — ``unar`` otherwise auto-extracts
+        archives nested *inside* it, which (with ``-force-overwrite``) would
+        create/overwrite unexpected files. Raises ``ExtractorError`` on any
+        non-zero exit.
         """
 
         cmd = [
             self.tool,
             "-quiet",
             "-no-directory",
+            "-no-recursion",
             "-force-overwrite",
             "-output-directory",
             str(dest_dir),
@@ -188,25 +194,29 @@ class Extractor:
         Reuses ``scan_filesystem`` so archive discovery inherits the exact
         symlink-skipping, excluded-glob, and normalization behavior the cleaner
         already relies on. Multi-volume sets collapse to their first volume; the
-        newest mtime across the whole set drives the settle guard so a set whose
-        final part is still being written is not extracted early.
+        newest mtime across the whole set — including legacy ``.rNN`` continuation
+        volumes, which are not ``.rar`` and so not extracted directly — drives the
+        settle guard so a set whose final part is still being written is not
+        extracted early.
         """
 
-        records = [
-            record
-            for record in scan_filesystem(roots, self.config.excluded_globs)
-            if record.path.suffix.lower() == ".rar"
-        ]
+        all_records = list(scan_filesystem(roots, self.config.excluded_globs))
+        records_by_dir: dict[Path, List[FileRecord]] = {}
+        for record in all_records:
+            records_by_dir.setdefault(record.path.parent, []).append(record)
 
         groups: dict[Tuple[Path, str], List[Tuple[int, FileRecord]]] = {}
         selected: List[Tuple[Path, float]] = []
-        for record in records:
+        for record in all_records:
+            if record.path.suffix.lower() != ".rar":
+                continue
             match = _PART_RE.match(record.path.name)
             if match:
                 key = (record.path.parent, match.group("base").lower())
                 groups.setdefault(key, []).append((int(match.group("num")), record))
             else:
-                selected.append((normalize_path(record.path), record.mtime))
+                newest_mtime = self._newest_volume_mtime(record, records_by_dir)
+                selected.append((normalize_path(record.path), newest_mtime))
 
         for members in groups.values():
             members.sort(key=lambda item: item[0])
@@ -216,6 +226,27 @@ class Extractor:
 
         selected.sort(key=lambda item: str(item[0]))
         return selected
+
+    @staticmethod
+    def _newest_volume_mtime(
+        rar_record: FileRecord,
+        records_by_dir: "dict[Path, List[FileRecord]]",
+    ) -> float:
+        """Newest mtime across a legacy set: the ``.rar`` plus its ``.rNN`` volumes.
+
+        Legacy multi-volume sets store continuation volumes as ``<base>.rNN``
+        beside the ``.rar``. Those are typically written last while downloading,
+        so the settle guard must see them even though only the ``.rar`` is
+        extracted directly.
+        """
+
+        base = rar_record.path.stem  # movie.rar -> movie
+        sibling_re = re.compile(r"^" + re.escape(base) + r"\.r\d+$", re.IGNORECASE)
+        newest = rar_record.mtime
+        for sibling in records_by_dir.get(rar_record.path.parent, ()):
+            if sibling_re.match(sibling.path.name):
+                newest = max(newest, sibling.mtime)
+        return newest
 
     def extract_all(
         self,
