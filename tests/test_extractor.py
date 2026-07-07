@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,8 +22,25 @@ from unraid_cache_cleaner.extractor import (
     _parse_owner,
     summarize,
 )
+from unraid_cache_cleaner.models import CLAIM_NEW
 from unraid_cache_cleaner.planner import normalize_path
 from unraid_cache_cleaner.state import StateExtractionLedger, StateStore
+
+
+class _BoomLedger:
+    """Ledger whose complete() raises, to test claim release on bookkeeping failure."""
+
+    def __init__(self) -> None:
+        self.released: list = []
+
+    def claim(self, archive: Path, now: float) -> str:
+        return CLAIM_NEW
+
+    def complete(self, archive: Path, outputs, now: float) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    def release(self, archive: Path) -> None:
+        self.released.append(archive)
 
 
 class FakeTool:
@@ -499,6 +517,38 @@ class LedgerIdempotencyTests(unittest.TestCase):
             self.assertEqual([r.status for r in results], ["would_extract"])
             # No claim and no outputs were persisted by the preview run.
             self.assertEqual(store.get_protected_extracted_paths(0.0, protect_seconds=10**9), set())
+
+    def test_overwritten_output_is_still_protected(self) -> None:
+        # A partial `movie.mkv` from a failed prior attempt (or an already-unpacked
+        # file) exists before extraction; extraction overwrites it. Path-diff alone
+        # would miss it — the mtime change must still record it as protected output.
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            stale = fx.write_rar("rel/movie.mkv", content="partial")
+            os.utime(stale, (1000.0, 1000.0))  # old mtime; extraction rewrites it
+            store = StateStore(fx.config().state_db_path)
+            extractor = Extractor(fx.config(), tool=FakeTool(), ledger=StateExtractionLedger(store))
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])
+            mkv = normalize_path(fx.watch_root / "rel" / "movie.mkv")
+            self.assertIn(mkv, results[0].outputs)
+            self.assertIn(mkv, store.get_protected_extracted_paths(0.0, protect_seconds=10**9))
+
+    def test_bookkeeping_failure_releases_claim_and_fails(self) -> None:
+        # If recording the extraction raises (e.g. the ledger DB is locked by a
+        # concurrent run), the media is on disk but unrecorded: the claim must be
+        # released so the next cycle re-extracts and re-records, not wedged for the TTL.
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            ledger = _BoomLedger()
+            extractor = Extractor(fx.config(), tool=FakeTool(), ledger=ledger)
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["failed"])
+            self.assertEqual(len(ledger.released), 1)  # claim released → retryable
 
 
 class IncompleteRootsTests(unittest.TestCase):

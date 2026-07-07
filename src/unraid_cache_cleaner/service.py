@@ -93,10 +93,15 @@ class CleanerService:
         # Extraction runs *before* deletion so its outputs can be folded into this
         # cycle's protection — freshly extracted media must never be deletable in
         # the same run that created it (or any run before *arr imports it).
-        actions.extend(self._run_extraction(torrents, watch_roots))
+        extract_actions, fresh_outputs = self._run_extraction(torrents, watch_roots)
+        actions.extend(extract_actions)
         protected_extracted = self.state_store.get_protected_extracted_paths(
             self.clock(), protect_seconds=self.config.extract_protect_seconds
         )
+        # Always protect this cycle's just-extracted outputs, independent of the
+        # persisted-window math: a slow extraction must never age past the window
+        # before the run that created it can protect it.
+        protected_extracted |= fresh_outputs
         if protected_extracted:
             protection_plan = with_protected_files(protection_plan, protected_extracted)
 
@@ -170,16 +175,18 @@ class CleanerService:
         self,
         torrents: list[TorrentRecord],
         watch_roots: tuple[Path, ...],
-    ) -> list[ActionRecord]:
-        """Detect and extract RAR archives, returning per-archive action records.
+    ) -> tuple[list[ActionRecord], set[Path]]:
+        """Detect and extract RAR archives.
 
-        A missing binary logs one ERROR and returns no actions — the cleanup run
-        continues rather than crashing. Extracted output files are persisted by the
-        injected ledger; the caller folds them into this cycle's protection.
+        Returns per-archive action records and the set of files extracted this
+        cycle (so the caller can protect them unconditionally). A missing binary
+        logs one ERROR and returns nothing — the cleanup run continues rather than
+        crashing. Extracted outputs are also persisted by the injected ledger for
+        cross-cycle protection.
         """
 
         if not self.config.extract_enabled or self.extractor is None:
-            return []
+            return [], set()
 
         incomplete_roots = self._incomplete_content_roots(torrents, watch_roots)
         try:
@@ -190,14 +197,14 @@ class CleanerService:
             )
         except ExtractorError as exc:
             LOGGER.error("%s; extraction disabled for this run", exc)
-            return []
+            return [], set()
 
         if not self.config.dry_run:
             self.state_store.prune_extraction_outputs(
                 self.clock(), protect_seconds=self.config.extract_protect_seconds
             )
 
-        return [
+        actions = [
             ActionRecord(
                 path=result.archive,
                 action="extract",
@@ -207,6 +214,8 @@ class CleanerService:
             )
             for result in results
         ]
+        fresh_outputs = {output for result in results for output in result.outputs}
+        return actions, fresh_outputs
 
     def _incomplete_content_roots(
         self,
@@ -326,32 +335,29 @@ class CleanerService:
         self.config.report_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
     def log_report(self, report: RunReport) -> None:
-        """Emit a compact run summary."""
+        """Emit a compact run summary.
 
+        The extraction counts are appended only when extraction is enabled, so a
+        deletion-only run's summary line is unchanged.
+        """
+
+        fields = "torrents=%s scanned=%s candidates=%s eligible=%s actions=%s"
+        values: list[object] = [
+            report.torrent_count,
+            report.scanned_file_count,
+            report.orphan_candidate_count,
+            report.eligible_count,
+            len(report.actions),
+        ]
         if self.config.extract_enabled:
             extract_actions = [a for a in report.actions if a.action == "extract"]
-            LOGGER.info(
-                "Run complete: torrents=%s scanned=%s candidates=%s eligible=%s actions=%s "
-                "extracted=%s extract_failed=%s dry_run=%s",
-                report.torrent_count,
-                report.scanned_file_count,
-                report.orphan_candidate_count,
-                report.eligible_count,
-                len(report.actions),
-                sum(1 for a in extract_actions if a.status == EXTRACTED),
-                sum(1 for a in extract_actions if a.status == FAILED),
-                report.dry_run,
-            )
-        else:
-            LOGGER.info(
-                "Run complete: torrents=%s scanned=%s candidates=%s eligible=%s actions=%s dry_run=%s",
-                report.torrent_count,
-                report.scanned_file_count,
-                report.orphan_candidate_count,
-                report.eligible_count,
-                len(report.actions),
-                report.dry_run,
-            )
+            fields += " extracted=%s extract_failed=%s"
+            values.append(sum(1 for a in extract_actions if a.status == EXTRACTED))
+            values.append(sum(1 for a in extract_actions if a.status == FAILED))
+        fields += " dry_run=%s"
+        values.append(report.dry_run)
+
+        LOGGER.info("Run complete: " + fields, *values)
         for action in report.actions:
             LOGGER.info("%s %s: %s", action.status, action.action, action.path)
 

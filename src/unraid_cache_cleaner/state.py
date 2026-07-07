@@ -6,8 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Sequence
 
-from .extractor import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW
-from .models import ActionRecord, CandidateRecord, FileRecord
+from .models import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW, ActionRecord, CandidateRecord, FileRecord
 
 # A claim held by a crashed extraction would otherwise block that archive from
 # ever being retried. A claim older than this is considered abandoned and may be

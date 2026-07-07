@@ -22,10 +22,10 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from .config import Config
-from .models import FileRecord
+from .models import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW, FileRecord
 from .planner import is_within_any, normalize_path
 from .scanner import scan_filesystem
 
@@ -44,12 +44,6 @@ WOULD_EXTRACT = "would_extract"
 DEFERRED_INCOMPLETE = "deferred_incomplete"
 SKIPPED_PRESENT = "skipped_present"
 FAILED = "failed"
-
-# ``ExtractionLedger.claim`` outcomes (the ledger protocol's contract; the SQLite
-# implementation in ``state.py`` imports these).
-CLAIM_NEW = "new"  # caller won the claim; proceed to extract
-CLAIM_DONE = "done"  # already extracted; skip with no re-invoke
-CLAIM_BUSY = "busy"  # a fresh claim is held elsewhere; skip this cycle
 
 
 class ExtractorError(RuntimeError):
@@ -380,12 +374,11 @@ class Extractor:
             )
 
         # Snapshot the destination *before* extracting so ownership and output
-        # tracking apply to only the files this extraction creates (skipped when
-        # neither a ledger nor an owner needs it, so the default path pays nothing).
-        need_outputs = self.ledger is not None
-        preexisting = (
-            _snapshot_tree(dest_dir) if (self.config.extract_owner or need_outputs) else set()
-        )
+        # tracking apply only to the files this extraction creates or overwrites
+        # (skipped when neither a ledger nor an owner needs it, so those paths pay
+        # nothing).
+        need_finalize = self.ledger is not None or bool(self.config.extract_owner)
+        before_files, before_dirs = _snapshot(dest_dir) if need_finalize else ({}, set())
         try:
             self.tool.extract(archive, dest_dir)
         except Exception as exc:  # noqa: BLE001 - surface, keep the archive, retry next run
@@ -393,75 +386,113 @@ class Extractor:
                 self.ledger.release(archive)
             return ExtractionResult(archive, FAILED, str(exc))
 
-        new_files = _new_files_since(dest_dir, preexisting) if need_outputs else ()
-        self._apply_ownership(dest_dir, preexisting)
-        if self.ledger is not None:
-            self.ledger.complete(archive, new_files, now)
+        # Bookkeeping runs after the media is on disk. If it fails (e.g. a
+        # concurrent run holds the ledger DB lock), release the claim so the next
+        # cycle re-extracts and re-records rather than leaving the media
+        # unprotected and the claim wedged until its TTL. ``created_at`` is stamped
+        # now, at completion, so a slow extraction does not age its output past the
+        # protection window before this cycle can protect it.
+        try:
+            new_files = self._finalize_output(dest_dir, before_files, before_dirs)
+            if self.ledger is not None:
+                self.ledger.complete(archive, new_files, self.clock())
+        except Exception as exc:  # noqa: BLE001 - keep the archive, retry next run
+            if claimed:
+                self.ledger.release(archive)
+            return ExtractionResult(
+                archive, FAILED, f"post-extraction bookkeeping failed: {exc}"
+            )
         return ExtractionResult(
             archive, EXTRACTED, "extracted", output_dir=dest_dir, outputs=new_files
         )
 
-    def _apply_ownership(self, dest_dir: Path, preexisting: set) -> None:
-        """Best-effort chown of the files this extraction created.
+    def _finalize_output(
+        self,
+        dest_dir: Path,
+        before_files: "Dict[Path, float]",
+        before_dirs: set,
+    ) -> Tuple[Path, ...]:
+        """One post-extraction walk: record the produced files and chown them.
 
-        Scoped to newly-created, non-symlink entries: chowning ``archive.parent``
-        wholesale would rewrite ownership of unrelated siblings — the entire mount
-        when a loose archive sits at a watch root — and following a symlink would
-        chown an out-of-tree target, breaking the scanner's never-follow-symlinks
-        invariant. Failure is a warning, never fatal: on many hosts the process
-        lacks ``CAP_CHOWN``, and a permissions miss must not turn a successful
-        extraction into an error.
+        A file counts as *produced* when its path is new **or** its mtime changed
+        since the pre-extraction snapshot — ``unar`` overwrites in place, so an
+        overwritten output (e.g. a partial file a failed prior attempt left behind,
+        or an already-unpacked media file) differs from the copy it replaced and is
+        still protected. Only produced files (and newly created directories) are
+        chowned — never untouched siblings, which for a loose archive at a watch
+        root would be the whole mount — and symlinks are never followed. A chown
+        miss is warned once and never aborts output collection: freshly extracted
+        media must be protected even when the process lacks ``CAP_CHOWN``.
         """
 
+        owner = self._resolve_owner()
+        produced: List[Path] = []
+        chown_ok = owner is not None
+        for current_root, dirs, files in os.walk(dest_dir):
+            for name in files:
+                path = Path(current_root) / name
+                if path.is_symlink():
+                    continue
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                prior = before_files.get(path)
+                if prior is not None and prior == mtime:
+                    continue  # untouched pre-existing file (e.g. the source archive)
+                produced.append(path)
+                if chown_ok:
+                    chown_ok = self._chown_entry(path, owner, dest_dir)
+            for name in dirs:
+                path = Path(current_root) / name
+                if not chown_ok or path.is_symlink() or path in before_dirs:
+                    continue
+                chown_ok = self._chown_entry(path, owner, dest_dir)
+        return tuple(produced)
+
+    def _resolve_owner(self) -> Optional[Tuple[int, int]]:
         if not self.config.extract_owner:
-            return
+            return None
         try:
-            uid, gid = _parse_owner(self.config.extract_owner)
+            return _parse_owner(self.config.extract_owner)
         except ValueError:
             LOGGER.warning(
                 "Invalid EXTRACT_OWNER %r (expected numeric uid:gid); skipping chown",
                 self.config.extract_owner,
             )
-            return
+            return None
+
+    def _chown_entry(self, path: Path, owner: Tuple[int, int], dest_dir: Path) -> bool:
+        """chown ``path``; return whether chown should keep going this run."""
 
         try:
-            for current_root, dirs, files in os.walk(dest_dir):
-                for name in dirs + files:
-                    path = Path(current_root) / name
-                    if path in preexisting or path.is_symlink():
-                        continue
-                    self._chown(str(path), uid, gid)
+            self._chown(str(path), owner[0], owner[1])
+            return True
         except OSError as exc:
             LOGGER.warning("Failed to change ownership under %s: %s", dest_dir, exc)
+            return False
 
 
-def _snapshot_tree(root: Path) -> set:
-    """Return every path under ``root`` (no symlink traversal), for chown scoping."""
+def _snapshot(root: Path) -> "Tuple[Dict[Path, float], set]":
+    """Map pre-extraction files to their mtime, plus the set of pre-existing dirs.
 
-    seen: set = set()
-    for current_root, dirs, files in os.walk(root):
-        for name in dirs + files:
-            seen.add(Path(current_root) / name)
-    return seen
-
-
-def _new_files_since(root: Path, preexisting: set) -> Tuple[Path, ...]:
-    """Return files created under ``root`` since the ``preexisting`` snapshot.
-
-    Files only (never directories or symlinks) so the planner protects the
-    concrete extracted media, not a directory that might be a watch root — the
-    flat-watch-root case where protecting ``archive.parent`` would disable all
-    cleanup.
+    Lets the post-extraction walk tell the files an extraction produced (new path,
+    or a changed mtime from an overwrite) from untouched siblings. No symlink
+    traversal (``os.walk`` never follows links by default).
     """
 
-    created: List[Path] = []
-    for current_root, _dirs, files in os.walk(root):
-        for name in files:
+    files: "Dict[Path, float]" = {}
+    dirs: set = set()
+    for current_root, subdirs, filenames in os.walk(root):
+        for name in subdirs:
+            dirs.add(Path(current_root) / name)
+        for name in filenames:
             path = Path(current_root) / name
-            if path in preexisting or path.is_symlink():
+            try:
+                files[path] = path.stat().st_mtime
+            except OSError:
                 continue
-            created.append(path)
-    return tuple(created)
+    return files, dirs
 
 
 def summarize(results: Sequence[ExtractionResult]) -> dict:

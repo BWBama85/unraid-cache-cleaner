@@ -118,6 +118,38 @@ class ExtractionServiceTests(unittest.TestCase):
             statuses = {(a.action, a.status) for a in report.actions}
             self.assertIn(("extract", "extracted"), statuses)
 
+    def test_fresh_output_protected_even_when_window_is_zero(self) -> None:
+        # With EXTRACT_PROTECT_SECONDS=0 the persisted-window query protects
+        # nothing, yet this cycle's just-extracted media must still survive — the
+        # same-cycle guarantee is independent of the window/clock math.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            watch_root, config_root = root / "data", root / "config"
+            job = watch_root / "job"
+            job.mkdir(parents=True)
+            config_root.mkdir()
+            (job / "release.rar").write_text("rar")
+
+            torrent = TorrentRecord(
+                torrent_hash="abc",
+                name="release.rar",
+                state="uploading",
+                save_path=watch_root,
+                content_path=job / "release.rar",
+                progress=1.0,
+            )
+            config = _config(
+                watch_root, config_root,
+                extract_enabled=True,
+                protect_single_file_parent_dirs=False,
+                extract_protect_seconds=0,
+            )
+            service = self._service(config, [torrent], watch_root, FakeExtractTool())
+
+            service.run_once()
+
+            self.assertTrue((job / "release.mkv").exists())  # kept via fresh-output union
+
     def test_disabled_never_invokes_the_extractor(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
