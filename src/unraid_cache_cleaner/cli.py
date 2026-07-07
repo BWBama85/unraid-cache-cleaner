@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from .arr import ArrClientError, RadarrClient, SonarrClient
 from .config import Config
+from .extractor import Extractor, ExtractorError, summarize
+from .planner import collapse_roots
 from .plex import PlexClient, PlexClientError
 from .plex_report import PlexDuplicateReporter
 from .qbittorrent import QbittorrentClient, QbittorrentClientError
@@ -27,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("scan", help="Run one cleanup cycle and exit.")
     subparsers.add_parser("service", help="Poll qBittorrent forever.")
+    subparsers.add_parser(
+        "extract",
+        help="Extract RAR archives in the download path so *arr can import them "
+        "(opt-in via EXTRACT_ENABLED; honors DRY_RUN).",
+    )
 
     plex = subparsers.add_parser(
         "plex-duplicates",
@@ -101,6 +109,58 @@ def run_cleaner(config: Config, command: str) -> int:
     return 0
 
 
+def _resolve_extract_roots(config: Config) -> Tuple[Path, ...]:
+    """Resolve the download roots the ``extract`` command scans.
+
+    Kept decoupled from qBittorrent/state on purpose: the one-shot extractor
+    relies solely on ``WATCH_PATHS`` (fail-closed when unset) so it stays a
+    standalone tool, mirroring how ``plex-duplicates`` avoids the cleaner stack.
+    """
+
+    if not config.watch_paths:
+        raise ExtractorError(
+            "The extract command needs WATCH_PATHS set to the mounted download path (e.g. /data)."
+        )
+    existing = tuple(
+        root
+        for root in collapse_roots(config.watch_paths)
+        if root.exists() and root.is_dir()
+    )
+    if not existing:
+        raise ExtractorError(
+            "No configured WATCH_PATHS are mounted inside this container."
+        )
+    return existing
+
+
+def run_extract(config: Config) -> int:
+    """Run the one-shot RAR extraction pass."""
+
+    logger = logging.getLogger(__name__)
+    if not config.extract_enabled:
+        logger.warning(
+            "Extraction is disabled. Set EXTRACT_ENABLED=true to enable the extract command."
+        )
+        return 0
+
+    roots = _resolve_extract_roots(config)
+    extractor = Extractor(config)
+    results = extractor.extract_all(roots, dry_run=config.dry_run)
+
+    counts = summarize(results)
+    logger.info(
+        "Extract complete: extracted=%s would_extract=%s deferred=%s failed=%s dry_run=%s",
+        counts["extracted"],
+        counts["would_extract"],
+        counts["deferred_incomplete"],
+        counts["failed"],
+        config.dry_run,
+    )
+    for result in results:
+        logger.info("%s: %s (%s)", result.status, result.archive, result.message)
+    return 0
+
+
 def _build_radarr(config: Config) -> Optional[RadarrClient]:
     """Construct a Radarr client only when both its URL and API key are set."""
 
@@ -164,6 +224,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if command == "plex-duplicates":
             return run_plex_duplicates(config, args)
+        if command == "extract":
+            return run_extract(config)
         return run_cleaner(config, command)
     except (QbittorrentClientError, PlexClientError, ArrClientError) as exc:
         logger.error(str(exc))

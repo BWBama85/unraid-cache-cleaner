@@ -151,6 +151,41 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.sonarr_timeout_seconds, 25)
                 self.assertFalse(config.sonarr_verify_tls)
 
+    def test_extract_defaults_when_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                # Extraction mutates the download path, so it is off by default.
+                self.assertFalse(config.extract_enabled)
+                self.assertEqual(config.extract_tool, "unar")
+                self.assertEqual(config.extract_owner, "")
+                self.assertEqual(config.extract_min_age_seconds, 300)
+
+    def test_extract_env_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+                "EXTRACT_ENABLED": "true",
+                "EXTRACT_TOOL": "/usr/bin/unar",
+                "EXTRACT_OWNER": "99:100",
+                "EXTRACT_MIN_AGE_SECONDS": "60",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                self.assertTrue(config.extract_enabled)
+                self.assertEqual(config.extract_tool, "/usr/bin/unar")
+                self.assertEqual(config.extract_owner, "99:100")
+                self.assertEqual(config.extract_min_age_seconds, 60)
+
 
 if __name__ == "__main__":
     unittest.main()

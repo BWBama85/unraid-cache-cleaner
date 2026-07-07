@@ -99,6 +99,10 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `STATE_DB_PATH` | `/config/state.sqlite3` | SQLite state database |
 | `REPORT_PATH` | `/config/last-run.json` | JSON summary of the last run |
 | `LOG_LEVEL` | `INFO` | Python log level |
+| `EXTRACT_ENABLED` | `false` | Enable the [`extract`](#rar-extraction) subcommand (opt-in; extraction mutates) |
+| `EXTRACT_TOOL` | `unar` | Archive binary name or full path (`lsar` is derived from it for the integrity test) |
+| `EXTRACT_OWNER` | empty | Numeric `uid:gid` for a best-effort chown of extracted files (Unraid = `99:100`); empty skips chown |
+| `EXTRACT_MIN_AGE_SECONDS` | `300` | Skip archives whose newest volume is younger than this (settle guard against still-downloading files) |
 | `PLEX_URL` | empty | Plex server base URL (e.g. `http://192.168.1.10:32400`) |
 | `PLEX_TOKEN` | empty | Plex `X-Plex-Token` (sent as a header, never in the URL) |
 | `PLEX_SECTIONS` | empty | Comma-separated library section **IDs** to scan; empty ⇒ auto-detect video sections |
@@ -195,6 +199,42 @@ so a TV copy is either `tracked` (Sonarr tracks that filename) or `unknown`, and
 is never labeled `untracked`/safe. This is deliberately conservative: the layer
 never tells you a TV file is safe unless it can prove Sonarr doesn't track it,
 which it can't from filenames alone.
+
+## RAR extraction
+
+Scene releases often arrive as `.rar` (frequently multi-volume) inside a
+torrent's download folder, and Radarr/Sonarr cannot import the media until the
+archive is extracted. The `extract` subcommand detects RAR archives under
+`WATCH_PATHS`, integrity-tests them, and extracts them **in place** so `*arr` can
+import — folding what used to be a separate `rar_extractor.sh` cron into this
+container.
+
+```bash
+# Dry run first (default): reports what would be extracted, writes nothing.
+EXTRACT_ENABLED=true DRY_RUN=true unraid-cache-cleaner extract
+# Then extract for real:
+EXTRACT_ENABLED=true DRY_RUN=false unraid-cache-cleaner extract
+```
+
+- **Opt-in and dry-run-safe.** Extraction mutates the download path, so it is off
+  unless `EXTRACT_ENABLED=true`, and it honors `DRY_RUN` exactly like deletion.
+- **Multi-volume aware.** A `name.partNN.rar` set is extracted once from its first
+  volume, not once per part; legacy `name.rar` + `name.rNN` sets extract from the
+  `.rar`.
+- **Settle guard.** Archives whose newest volume is younger than
+  `EXTRACT_MIN_AGE_SECONDS` are deferred and retried, so a still-downloading
+  release is not extracted early. A failed integrity test defers likewise; a
+  failed extraction is reported and the archive is kept for a later retry.
+- **Ownership.** Set `EXTRACT_OWNER=99:100` (Unraid's `nobody:users`) for a
+  best-effort chown of extracted files; a chown failure is a warning, never fatal.
+- **Platform.** Extraction is Linux-in-container only — it relies on the bundled
+  free `unar`/`lsar` binaries. Local dev on macOS/Windows runs the rest of the
+  suite; the one real-binary test skips unless `unar` is installed.
+
+> **Migrating from `rar_extractor.sh`:** enable `EXTRACT_ENABLED` and remove the
+> external cron. The `rar_extractor.sh` entry can stay harmlessly in
+> `EXCLUDED_GLOBS`. Extraction is not yet wired into the `scan`/`service` cleanup
+> cycle — run `extract` on your own schedule for now.
 
 ## Packaging
 

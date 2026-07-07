@@ -104,6 +104,15 @@ class Config:
     sonarr_api_key: str = ""
     sonarr_timeout_seconds: int = 30
     sonarr_verify_tls: bool = True
+    # RAR extraction (opt-in, #31 Child A). Extraction *mutates* the download
+    # path, so it is off by default and honors DRY_RUN like deletion does. The
+    # standalone `extract` subcommand consumes these today; folding extraction
+    # into the scan/service cycle is a follow-up. Appended with defaults so
+    # existing Config(...) calls and from_env keep working.
+    extract_enabled: bool = False
+    extract_tool: str = "unar"
+    extract_owner: str = ""
+    extract_min_age_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -145,6 +154,10 @@ class Config:
             sonarr_api_key=os.getenv("SONARR_API_KEY", ""),
             sonarr_timeout_seconds=_parse_int(os.getenv("SONARR_TIMEOUT_SECONDS"), 30),
             sonarr_verify_tls=_parse_bool(os.getenv("SONARR_VERIFY_TLS"), True),
+            extract_enabled=_parse_bool(os.getenv("EXTRACT_ENABLED"), False),
+            extract_tool=os.getenv("EXTRACT_TOOL", "unar"),
+            extract_owner=os.getenv("EXTRACT_OWNER", ""),
+            extract_min_age_seconds=_parse_int(os.getenv("EXTRACT_MIN_AGE_SECONDS"), 300),
         )
         config.ensure_directories()
         return config
