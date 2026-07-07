@@ -65,7 +65,7 @@
 			"Bash(gh repo view:*)",
 			"Bash(gh label list)",
 			"Bash(gh label list:*)",
-			"Bash(gh label create:*)",
+			"Bash(gh label create release-blocker:*)",
 
 			"Bash(gh run list:*)",
 			"Bash(gh run view:*)",
