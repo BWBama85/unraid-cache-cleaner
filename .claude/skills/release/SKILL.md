@@ -195,7 +195,7 @@ git push --atomic origin main "$VERSION"
 
 The second `-m` supplies the `Co-Authored-By` trailer `CLAUDE.md` requires on every commit.
 
-The push will prompt for confirmation (it is not on the settings allow-list, by design — a release is the point to have a human in the loop). Never `--force`, never `--no-verify`.
+The push will prompt for confirmation (it is not on the settings allow-list, by design — a release is the point to have a human in the loop). Never `--force`, never `--no-verify`. The preflight and publish-run inspection commands (`gh run list/view/watch`, `gh release list/view`, `git ls-remote`, `gh label list` — all read-only — plus the idempotent `gh label create release-blocker` bootstrap) *are* allow-listed in `.claude/settings.json`, so the only steps that prompt are the three consequential writes: the annotated `git tag`, this push, and `gh release create`.
 
 ## Create the GitHub Release
 
