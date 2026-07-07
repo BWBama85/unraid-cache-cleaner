@@ -44,6 +44,7 @@
 			"Bash(git rev-parse:*)",
 			"Bash(git rev-list:*)",
 			"Bash(git ls-files:*)",
+			"Bash(git ls-remote:*)",
 			"Bash(git blame:*)",
 			"Bash(git switch:*)",
 			"Bash(git add:*)",
@@ -63,6 +64,14 @@
 			"Bash(gh auth status)",
 			"Bash(gh repo view:*)",
 			"Bash(gh label list)",
+			"Bash(gh label list:*)",
+			"Bash(gh label create:*)",
+
+			"Bash(gh run list:*)",
+			"Bash(gh run view:*)",
+			"Bash(gh run watch:*)",
+			"Bash(gh release list:*)",
+			"Bash(gh release view:*)",
 
 			"Bash(codex exec:*)",
 
