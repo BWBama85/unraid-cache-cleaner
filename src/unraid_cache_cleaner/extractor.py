@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Sequence, Tuple
 
 from .config import Config
+from .models import FileRecord
 from .planner import normalize_path
 from .scanner import scan_filesystem
 
@@ -197,7 +198,7 @@ class Extractor:
             if record.path.suffix.lower() == ".rar"
         ]
 
-        groups: dict = {}
+        groups: dict[Tuple[Path, str], List[Tuple[int, FileRecord]]] = {}
         selected: List[Tuple[Path, float]] = []
         for record in records:
             match = _PART_RE.match(record.path.name)
@@ -267,19 +268,27 @@ class Extractor:
                 archive, WOULD_EXTRACT, "dry-run: integrity ok", output_dir=dest_dir
             )
 
+        # Snapshot the destination *before* extracting so ownership is applied to
+        # only the files this extraction creates (skipped entirely when no owner
+        # is configured, so the default off case pays nothing).
+        preexisting = _snapshot_tree(dest_dir) if self.config.extract_owner else set()
         try:
             self.tool.extract(archive, dest_dir)
         except Exception as exc:  # noqa: BLE001 - surface, keep the archive, retry next run
             return ExtractionResult(archive, FAILED, str(exc))
 
-        self._apply_ownership(dest_dir)
+        self._apply_ownership(dest_dir, preexisting)
         return ExtractionResult(archive, EXTRACTED, "extracted", output_dir=dest_dir)
 
-    def _apply_ownership(self, dest_dir: Path) -> None:
-        """Best-effort recursive chown of the extraction dir (mirrors the source).
+    def _apply_ownership(self, dest_dir: Path, preexisting: set) -> None:
+        """Best-effort chown of the files this extraction created.
 
-        Failure is a warning, never fatal: on many hosts the process lacks
-        ``CAP_CHOWN``, and a permissions miss must not turn a successful
+        Scoped to newly-created, non-symlink entries: chowning ``archive.parent``
+        wholesale would rewrite ownership of unrelated siblings — the entire mount
+        when a loose archive sits at a watch root — and following a symlink would
+        chown an out-of-tree target, breaking the scanner's never-follow-symlinks
+        invariant. Failure is a warning, never fatal: on many hosts the process
+        lacks ``CAP_CHOWN``, and a permissions miss must not turn a successful
         extraction into an error.
         """
 
@@ -295,12 +304,24 @@ class Extractor:
             return
 
         try:
-            self._chown(str(dest_dir), uid, gid)
             for current_root, dirs, files in os.walk(dest_dir):
                 for name in dirs + files:
-                    self._chown(str(Path(current_root) / name), uid, gid)
+                    path = Path(current_root) / name
+                    if path in preexisting or path.is_symlink():
+                        continue
+                    self._chown(str(path), uid, gid)
         except OSError as exc:
             LOGGER.warning("Failed to change ownership under %s: %s", dest_dir, exc)
+
+
+def _snapshot_tree(root: Path) -> set:
+    """Return every path under ``root`` (no symlink traversal), for chown scoping."""
+
+    seen: set = set()
+    for current_root, dirs, files in os.walk(root):
+        for name in dirs + files:
+            seen.add(Path(current_root) / name)
+    return seen
 
 
 def summarize(results: Sequence[ExtractionResult]) -> dict:

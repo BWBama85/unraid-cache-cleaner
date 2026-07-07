@@ -251,22 +251,67 @@ class ExtractorTests(unittest.TestCase):
             by_name = {r.archive.name: r.status for r in results}
             self.assertEqual(by_name, {"good.rar": "extracted", "bad.rar": "failed"})
 
-    def test_ownership_applied_when_configured(self) -> None:
+    def test_ownership_applied_only_to_new_files(self) -> None:
         with _Fixture() as fx:
-            fx.write_rar("rel/movie.rar")
+            fx.write_rar("rel/movie.rar")  # pre-existing; must NOT be chowned
             chown_calls: list[tuple[str, int, int]] = []
-            tool = FakeTool()
             extractor = Extractor(
                 fx.config(extract_owner="99:100"),
-                tool=tool,
+                tool=FakeTool(),
                 chown=lambda path, uid, gid: chown_calls.append((path, uid, gid)),
             )
 
             results = extractor.extract_all((fx.watch_root,), dry_run=False)
 
             self.assertEqual([r.status for r in results], ["extracted"])
-            self.assertTrue(chown_calls)
             self.assertTrue(all((uid, gid) == (99, 100) for _, uid, gid in chown_calls))
+            chowned = {path for path, _, _ in chown_calls}
+            self.assertIn(str(fx.watch_root / "rel" / "movie.mkv"), chowned)  # extracted
+            self.assertNotIn(str(fx.watch_root / "rel" / "movie.rar"), chowned)  # source
+
+    def test_ownership_scoped_to_extracted_output_at_watch_root(self) -> None:
+        # A loose .rar at the watch root must not turn chown into an
+        # entire-mount ownership rewrite of unrelated siblings.
+        with _Fixture() as fx:
+            fx.write_rar("loose.rar")
+            (fx.watch_root / "unrelated.mkv").write_text("keep")
+            chown_calls: list[str] = []
+            extractor = Extractor(
+                fx.config(extract_owner="99:100"),
+                tool=FakeTool(),
+                chown=lambda path, uid, gid: chown_calls.append(path),
+            )
+
+            extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            chowned = set(chown_calls)
+            self.assertIn(str(fx.watch_root / "loose.mkv"), chowned)  # extracted output
+            self.assertNotIn(str(fx.watch_root / "unrelated.mkv"), chowned)
+            self.assertNotIn(str(fx.watch_root / "loose.rar"), chowned)
+
+    def test_ownership_never_follows_symlinks(self) -> None:
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            external = Path(fx._tmp.name) / "external.txt"  # out of the watch tree
+            external.write_text("external")
+
+            class LinkTool(FakeTool):
+                def extract(self, archive: Path, dest_dir: Path) -> None:
+                    super().extract(archive, dest_dir)
+                    os.symlink(external, dest_dir / "link.txt")
+
+            chown_calls: list[str] = []
+            extractor = Extractor(
+                fx.config(extract_owner="99:100"),
+                tool=LinkTool(),
+                chown=lambda path, uid, gid: chown_calls.append(path),
+            )
+
+            extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            chowned = set(chown_calls)
+            self.assertIn(str(fx.watch_root / "rel" / "movie.mkv"), chowned)
+            self.assertNotIn(str(fx.watch_root / "rel" / "link.txt"), chowned)
 
     def test_chown_failure_is_non_fatal(self) -> None:
         with _Fixture() as fx:
