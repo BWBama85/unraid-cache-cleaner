@@ -163,6 +163,77 @@ class ArrCliTests(unittest.TestCase):
             self.assertTrue(any("Sonarr association skipped" in w for w in payload["warnings"]))
 
 
+@contextlib.contextmanager
+def _extract_env(tmp: Path, **overrides):
+    env = {
+        "WATCH_PATHS": str(tmp / "data"),
+        "STATE_DB_PATH": str(tmp / "state.sqlite3"),
+        "REPORT_PATH": str(tmp / "last-run.json"),
+        "PLEX_DUPLICATE_REPORT_PATH": str(tmp / "plex-duplicates.json"),
+    }
+    env.update(overrides)
+    (tmp / "data").mkdir(exist_ok=True)
+    with mock.patch.dict(os.environ, env, clear=True):
+        yield
+
+
+class ExtractCliTests(unittest.TestCase):
+    def test_disabled_is_noop_and_touches_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, _extract_env(Path(tmpdir)):
+            with mock.patch.object(cli, "Extractor") as extractor, \
+                    mock.patch.object(cli, "QbittorrentClient") as qbt, \
+                    mock.patch.object(cli, "StateStore") as store:
+                code = cli.main(["extract"])
+
+            self.assertEqual(code, 0)
+            extractor.assert_not_called()
+            qbt.assert_not_called()
+            store.assert_not_called()
+
+    def test_enabled_runs_and_isolates_from_cleaner_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                _extract_env(Path(tmpdir), EXTRACT_ENABLED="true", DRY_RUN="false"):
+            fake = mock.Mock()
+            fake.extract_all.return_value = []
+            with mock.patch.object(cli, "Extractor", return_value=fake) as extractor, \
+                    mock.patch.object(cli, "QbittorrentClient") as qbt, \
+                    mock.patch.object(cli, "StateStore") as store:
+                code = cli.main(["extract"])
+
+            self.assertEqual(code, 0)
+            extractor.assert_called_once()
+            _, kwargs = fake.extract_all.call_args
+            self.assertFalse(kwargs["dry_run"])
+            # the extract command must not build the qBittorrent client or state DB
+            qbt.assert_not_called()
+            store.assert_not_called()
+
+    def test_honors_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                _extract_env(Path(tmpdir), EXTRACT_ENABLED="true", DRY_RUN="true"):
+            fake = mock.Mock()
+            fake.extract_all.return_value = []
+            with mock.patch.object(cli, "Extractor", return_value=fake), \
+                    mock.patch.object(cli, "QbittorrentClient"), \
+                    mock.patch.object(cli, "StateStore"):
+                code = cli.main(["extract"])
+
+            self.assertEqual(code, 0)
+            _, kwargs = fake.extract_all.call_args
+            self.assertTrue(kwargs["dry_run"])
+
+    def test_missing_watch_paths_returns_3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                _extract_env(Path(tmpdir), EXTRACT_ENABLED="true", WATCH_PATHS=""):
+            with mock.patch.object(cli, "Extractor") as extractor, \
+                    mock.patch.object(cli, "QbittorrentClient"), \
+                    mock.patch.object(cli, "StateStore"):
+                code = cli.main(["extract"])
+
+            self.assertEqual(code, 3)
+            extractor.assert_not_called()
+
+
 class SafePrintTests(unittest.TestCase):
     class _AsciiStdout(io.StringIO):
         """Stand-in for a non-UTF-8 terminal: rejects non-ASCII on write."""

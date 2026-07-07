@@ -10,6 +10,14 @@ LABEL org.opencontainers.image.licenses="MIT"
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# `unar`/`lsar` (Debian `main`, free-licensed) power the opt-in RAR extraction
+# feature; they read RAR v5 and multi-volume sets. The Python stdlib has no RAR
+# support, so extraction shells out to this binary. Kept off unless
+# EXTRACT_ENABLED=true, but installed so the image is ready.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends unar \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY pyproject.toml README.md /app/

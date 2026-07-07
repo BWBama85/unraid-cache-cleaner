@@ -107,5 +107,22 @@ This version focuses on safe orphan cleanup for qBittorrent download/cache paths
 - subscribe to qBittorrent push events
 - expose a web UI
 - publish metrics
-- inspect archive extraction tools directly
+
+### Opt-in RAR extraction
+
+The `extract` subcommand (module `extractor.py`) detects RAR archives under the
+watch roots, integrity-tests them via the free `unar`/`lsar` binaries, and
+extracts them in place so Radarr/Sonarr can import — the first-party replacement
+for the external `rar_extractor.sh` cron. It is **off by default**
+(`EXTRACT_ENABLED=false`), honors `DRY_RUN`, and reuses `scan_filesystem` for
+archive discovery so it inherits the same symlink-skipping and excluded-glob
+behavior as the cleaner. The archive tool is injected via the constructor, so
+tests pass a fake and `unrar`/`p7zip` can be adapted later.
+
+This is the foundation slice: extraction is **not yet folded into the
+`scan`/`service` cycle**, and the deletion planner does not yet treat extracted
+output as a first-party protection source. Until then, an extracted file is
+protected only while its torrent's content directory is (see [directory
+protection](#directory-protection-beats-file-matching-for-active-content)); run
+`extract` on your own schedule.
 
