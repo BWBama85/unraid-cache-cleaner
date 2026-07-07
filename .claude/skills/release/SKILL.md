@@ -37,6 +37,12 @@ for arg in $ARGUMENTS; do
     v[0-9]*)           [ -n "$_next_ver" ] && { EXPLICIT_VERSION="$arg"; _next_ver=""; } ;;
   esac
 done
+# Reject a malformed explicit version before it can ever become a tag: publish.yml
+# only builds the versioned image for tags matching v*, so `1.2.0` or `v1.2` would
+# create a Release with no versioned GHCR image.
+if [ -n "$EXPLICIT_VERSION" ] && ! printf '%s' "$EXPLICIT_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "ERROR: --version must be vX.Y.Z (got '$EXPLICIT_VERSION')"; exit 1
+fi
 echo "level=$LEVEL explicit=${EXPLICIT_VERSION:-none} dry_run=$DRY_RUN"
 ```
 
@@ -76,11 +82,16 @@ gh label create release-blocker --color B60205 \
 Release goals live in the rolling **`Next release`** milestone + the **`release-blocker`** label (see `CLAUDE.md` → "Release goals"). Enforce it here so an abort has zero side effects:
 
 ```bash
-[ "$DRY_RUN" = 1 ] || gh issue list --milestone "Next release" --label release-blocker --state open \
-  --json number,title --jq '.[] | "#\(.number) \(.title)"'
+if [ "$DRY_RUN" != 1 ]; then
+  BLOCKERS="$(gh issue list --milestone "Next release" --label release-blocker --state open \
+    --json number,title --jq '.[] | "#\(.number) \(.title)"')"
+  if [ -n "$BLOCKERS" ]; then
+    echo "ERROR: open release-blocker issues in Next release — cut is blocked:"; echo "$BLOCKERS"; exit 1
+  fi
+fi
 ```
 
-If that prints anything, **stop and surface the list** — those issues are declared must-land-before-release. Do not cut silently. Proceed only if the owner explicitly says "release anyway" **in-session** (there is no override flag — a release is deliberate and interactive). A `--dry-run` **skips this gate** (it ships nothing).
+The gate **hard-fails** (`exit 1`) when any blocker is open — a `gh issue list` that merely prints could be walked past unnoticed, defeating the zero-side-effect abort. Those issues are declared must-land-before-release; finish them, drop the `release-blocker` label, or move them out of `Next release` before cutting. There is no override flag — a release is deliberate and interactive — so the sole exception is the owner explicitly saying "release anyway" **in-session**, in which case skip this gate and continue. A `--dry-run` **skips this gate** (it ships nothing).
 
 ## Compute the version
 
@@ -169,16 +180,22 @@ python3 -m compileall -q src && python3 -m unittest tests.test_version -v
 The release commit is the **one sanctioned exception** to `CLAUDE.md`'s never-commit-`main` rule. No destructive git, ever (`CLAUDE.md`).
 
 ```bash
+# A --dry-run must stop here — the blocks above only wrote the CHANGELOG + version
+# bumps; nothing is committed, tagged, pushed, or released on a preview.
+[ "$DRY_RUN" = 1 ] && { echo "dry-run: stopping before commit/tag/push — inspect 'git diff', then 'git checkout -- .'"; exit 0; }
+
 git add pyproject.toml src/unraid_cache_cleaner/__init__.py CHANGELOG.md
 git commit -m "chore(release): $VERSION" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 git tag -a "$VERSION" -m "$VERSION"
-git push origin main            # triggers publish.yml → :latest
-git push origin "$VERSION"      # triggers publish.yml → versioned image
+# One atomic transaction so main and the tag advance together: a non-atomic pair
+# could leave main bumped + :latest published while the versioned tag/image never
+# lands. main push → :latest build; tag push → versioned image.
+git push --atomic origin main "$VERSION"
 ```
 
 The second `-m` supplies the `Co-Authored-By` trailer `CLAUDE.md` requires on every commit.
 
-Both pushes will prompt for confirmation (they are not on the settings allow-list, by design — a release is the point to have a human in the loop). Never `--force`, never `--no-verify`.
+The push will prompt for confirmation (it is not on the settings allow-list, by design — a release is the point to have a human in the loop). Never `--force`, never `--no-verify`.
 
 ## Create the GitHub Release
 
@@ -200,8 +217,8 @@ Isolate the **tag-triggered** run so the owner watches the versioned image build
 
 ```bash
 sleep 5   # let the run register
-RUN_ID="$(gh run list --workflow=publish.yml --branch "$VERSION" --limit 1 --json databaseId --jq '.[0].databaseId')"
-if [ -n "$RUN_ID" ]; then
+RUN_ID="$(gh run list --workflow=publish.yml --branch "$VERSION" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+if [ -n "$RUN_ID" ]; then  # // empty yields "" (not the string "null") when the run hasn't registered yet → fallback path
   gh run watch "$RUN_ID" || gh run view "$RUN_ID" --json url --jq .url
 else
   gh run list --workflow=publish.yml --limit 3 --json url,displayTitle,headBranch  # fallback: print recent runs
