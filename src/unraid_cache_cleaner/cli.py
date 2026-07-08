@@ -16,7 +16,7 @@ from .plex import PlexClient, PlexClientError
 from .plex_report import PlexDuplicateReporter
 from .qbittorrent import QbittorrentClient, QbittorrentClientError
 from .service import CleanerService
-from .state import StateStore
+from .state import StateExtractionLedger, StateStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,7 +100,8 @@ def run_cleaner(config: Config, command: str) -> int:
         verify_tls=config.qbittorrent_verify_tls,
     )
     state_store = StateStore(config.state_db_path)
-    service = CleanerService(config, client, state_store)
+    extractor = Extractor(config, ledger=StateExtractionLedger(state_store))
+    service = CleanerService(config, client, state_store, extractor=extractor)
 
     if command == "scan":
         service.run_once()
@@ -144,15 +145,21 @@ def run_extract(config: Config) -> int:
         return 0
 
     roots = _resolve_extract_roots(config)
-    extractor = Extractor(config)
+    # The extract command shares the cleaner's SQLite ledger (but not its
+    # qBittorrent client): claim-before-extract keeps a one-shot `extract` from
+    # double-extracting against a running `service`, and gives the standalone
+    # command cross-run idempotency.
+    state_store = StateStore(config.state_db_path)
+    extractor = Extractor(config, ledger=StateExtractionLedger(state_store))
     results = extractor.extract_all(roots, dry_run=config.dry_run)
 
     counts = summarize(results)
     logger.info(
-        "Extract complete: extracted=%s would_extract=%s deferred=%s failed=%s dry_run=%s",
+        "Extract complete: extracted=%s would_extract=%s deferred=%s skipped=%s failed=%s dry_run=%s",
         counts["extracted"],
         counts["would_extract"],
         counts["deferred_incomplete"],
+        counts["skipped_present"],
         counts["failed"],
         config.dry_run,
     )

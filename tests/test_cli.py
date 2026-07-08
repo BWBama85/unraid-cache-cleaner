@@ -190,7 +190,7 @@ class ExtractCliTests(unittest.TestCase):
             qbt.assert_not_called()
             store.assert_not_called()
 
-    def test_enabled_runs_and_isolates_from_cleaner_stack(self) -> None:
+    def test_enabled_runs_and_shares_ledger_not_qbittorrent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, \
                 _extract_env(Path(tmpdir), EXTRACT_ENABLED="true", DRY_RUN="false"):
             fake = mock.Mock()
@@ -204,9 +204,10 @@ class ExtractCliTests(unittest.TestCase):
             extractor.assert_called_once()
             _, kwargs = fake.extract_all.call_args
             self.assertFalse(kwargs["dry_run"])
-            # the extract command must not build the qBittorrent client or state DB
+            # the extract command must not build the qBittorrent client, but it
+            # shares the SQLite ledger (claim-before-extract, cross-run idempotency)
             qbt.assert_not_called()
-            store.assert_not_called()
+            store.assert_called_once()
 
     def test_honors_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, \

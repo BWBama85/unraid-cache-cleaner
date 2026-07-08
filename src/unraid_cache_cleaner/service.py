@@ -6,11 +6,19 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from .config import Config
+from .extractor import EXTRACTED, FAILED, Extractor, ExtractorError
 from .models import ActionRecord, CandidateRecord, RunReport, TorrentRecord
-from .planner import build_protection_plan, collapse_roots, normalize_path, find_orphan_candidates, is_within_any
+from .planner import (
+    build_protection_plan,
+    collapse_roots,
+    find_orphan_candidates,
+    is_within_any,
+    normalize_path,
+    with_protected_files,
+)
 from .qbittorrent import QbittorrentClient
 from .scanner import scan_filesystem
 from .state import StateStore
@@ -27,12 +35,14 @@ class CleanerService:
         client: QbittorrentClient,
         state_store: StateStore,
         *,
+        extractor: Optional[Extractor] = None,
         clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config = config
         self.client = client
         self.state_store = state_store
+        self.extractor = extractor
         self.clock = clock
         self.sleeper = sleeper
 
@@ -79,6 +89,22 @@ class CleanerService:
             watch_roots,
             protect_single_file_parent_dirs=self.config.protect_single_file_parent_dirs,
         )
+
+        # Extraction runs *before* deletion so its outputs can be folded into this
+        # cycle's protection — freshly extracted media must never be deletable in
+        # the same run that created it (or any run before *arr imports it).
+        extract_actions, fresh_outputs = self._run_extraction(torrents, watch_roots)
+        actions.extend(extract_actions)
+        protected_extracted = self.state_store.get_protected_extracted_paths(
+            self.clock(), protect_seconds=self.config.extract_protect_seconds
+        )
+        # Always protect this cycle's just-extracted outputs, independent of the
+        # persisted-window math: a slow extraction must never age past the window
+        # before the run that created it can protect it.
+        protected_extracted |= fresh_outputs
+        if protected_extracted:
+            protection_plan = with_protected_files(protection_plan, protected_extracted)
+
         scanned_files = scan_filesystem(
             watch_roots,
             self.config.excluded_globs,
@@ -144,6 +170,76 @@ class CleanerService:
         self.write_report(report)
         self.log_report(report)
         return report
+
+    def _run_extraction(
+        self,
+        torrents: list[TorrentRecord],
+        watch_roots: tuple[Path, ...],
+    ) -> tuple[list[ActionRecord], set[Path]]:
+        """Detect and extract RAR archives.
+
+        Returns per-archive action records and the set of files extracted this
+        cycle (so the caller can protect them unconditionally). A missing binary
+        logs one ERROR and returns nothing — the cleanup run continues rather than
+        crashing. Extracted outputs are also persisted by the injected ledger for
+        cross-cycle protection.
+        """
+
+        if not self.config.extract_enabled or self.extractor is None:
+            return [], set()
+
+        incomplete_roots = self._incomplete_content_roots(torrents, watch_roots)
+        try:
+            results = self.extractor.extract_all(
+                watch_roots,
+                dry_run=self.config.dry_run,
+                incomplete_roots=incomplete_roots,
+            )
+        except ExtractorError as exc:
+            LOGGER.error("%s; extraction disabled for this run", exc)
+            return [], set()
+
+        if not self.config.dry_run:
+            self.state_store.prune_extraction_outputs(
+                self.clock(), protect_seconds=self.config.extract_protect_seconds
+            )
+
+        actions = [
+            ActionRecord(
+                path=result.archive,
+                action="extract",
+                status=result.status,
+                size=0,
+                message=result.message,
+            )
+            for result in results
+        ]
+        fresh_outputs = {output for result in results for output in result.outputs}
+        return actions, fresh_outputs
+
+    def _incomplete_content_roots(
+        self,
+        torrents: list[TorrentRecord],
+        watch_roots: tuple[Path, ...],
+    ) -> tuple[Path, ...]:
+        """Content paths of still-downloading torrents (progress < 1.0).
+
+        Archives under one are deferred: the mtime settle guard catches an archive
+        being actively written, this catches a settled ``.rar`` whose torrent is
+        still pulling other files. A torrent whose content path *is* a watch root
+        is skipped — it would defer the whole mount.
+        """
+
+        roots: list[Path] = []
+        for torrent in torrents:
+            if torrent.progress >= 1.0:
+                continue
+            content = normalize_path(torrent.content_path)
+            if content in watch_roots:
+                continue
+            if is_within_any(content, watch_roots):
+                roots.append(content)
+        return tuple(roots)
 
     def _delete_candidate(self, candidate: CandidateRecord) -> ActionRecord:
         path = candidate.path
@@ -239,17 +335,29 @@ class CleanerService:
         self.config.report_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
     def log_report(self, report: RunReport) -> None:
-        """Emit a compact run summary."""
+        """Emit a compact run summary.
 
-        LOGGER.info(
-            "Run complete: torrents=%s scanned=%s candidates=%s eligible=%s actions=%s dry_run=%s",
+        The extraction counts are appended only when extraction is enabled, so a
+        deletion-only run's summary line is unchanged.
+        """
+
+        fields = "torrents=%s scanned=%s candidates=%s eligible=%s actions=%s"
+        values: list[object] = [
             report.torrent_count,
             report.scanned_file_count,
             report.orphan_candidate_count,
             report.eligible_count,
             len(report.actions),
-            report.dry_run,
-        )
+        ]
+        if self.config.extract_enabled:
+            extract_actions = [a for a in report.actions if a.action == "extract"]
+            fields += " extracted=%s extract_failed=%s"
+            values.append(sum(1 for a in extract_actions if a.status == EXTRACTED))
+            values.append(sum(1 for a in extract_actions if a.status == FAILED))
+        fields += " dry_run=%s"
+        values.append(report.dry_run)
+
+        LOGGER.info("Run complete: " + fields, *values)
         for action in report.actions:
             LOGGER.info("%s %s: %s", action.status, action.action, action.path)
 

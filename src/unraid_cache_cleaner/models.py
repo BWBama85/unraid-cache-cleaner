@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Extraction-claim outcomes — the shared vocabulary returned by the SQLite ledger
+# (`state.py`) and interpreted by the extractor. Kept here, the neutral data home,
+# so the persistence layer need not import the feature module.
+CLAIM_NEW = "new"  # caller won the claim; proceed to extract
+CLAIM_DONE = "done"  # already extracted; skip with no re-invoke
+CLAIM_BUSY = "busy"  # a fresh claim is held elsewhere; skip this cycle
+
 
 @dataclass(frozen=True)
 class TorrentRecord:

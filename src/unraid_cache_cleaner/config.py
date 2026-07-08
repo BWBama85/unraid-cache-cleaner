@@ -113,6 +113,13 @@ class Config:
     extract_tool: str = "unar"
     extract_owner: str = ""
     extract_min_age_seconds: int = 300
+    # Extracted output is protected from deletion for this window after it is
+    # written, so freshly extracted media survives until Radarr/Sonarr import it —
+    # even after the source torrent deregisters and its directory protection
+    # vanishes. Once the window lapses, normal orphan rules resume so post-import
+    # leftovers are eventually reclaimed. Default 24h, comfortably longer than the
+    # orphan grace.
+    extract_protect_seconds: int = 86400
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -158,6 +165,7 @@ class Config:
             extract_tool=os.getenv("EXTRACT_TOOL", "unar"),
             extract_owner=os.getenv("EXTRACT_OWNER", ""),
             extract_min_age_seconds=_parse_int(os.getenv("EXTRACT_MIN_AGE_SECONDS"), 300),
+            extract_protect_seconds=_parse_int(os.getenv("EXTRACT_PROTECT_SECONDS"), 86400),
         )
         config.ensure_directories()
         return config

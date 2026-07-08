@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Iterable, Sequence, Union
 
 from .models import FileRecord, ProtectionPlan, TorrentRecord
 
@@ -83,6 +83,24 @@ def build_protection_plan(
     return ProtectionPlan(
         tracked_files=frozenset(normalize_path(path) for path in tracked_files),
         protected_dirs=ordered_dirs,
+    )
+
+
+def with_protected_files(plan: ProtectionPlan, extra_files: Iterable[Path]) -> ProtectionPlan:
+    """Return a plan with ``extra_files`` added as first-party tracked files.
+
+    Extracted output is protected as **exact file paths** rather than by
+    protecting its directory: an archive can sit directly at a watch root, and
+    protecting that whole directory would disable all cleanup. Exact-path
+    protection keeps the extracted media safe while leaving unrelated siblings —
+    and the mount itself — eligible for orphan cleanup.
+    """
+
+    files = set(plan.tracked_files)
+    files.update(normalize_path(path) for path in extra_files)
+    return ProtectionPlan(
+        tracked_files=frozenset(files),
+        protected_dirs=plan.protected_dirs,
     )
 
 
