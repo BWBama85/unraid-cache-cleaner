@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
-from .models import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW, ActionRecord, CandidateRecord, FileRecord
+from .models import (
+    CLAIM_BUSY,
+    CLAIM_DONE,
+    CLAIM_NEW,
+    ActionRecord,
+    CandidateRecord,
+    ClaimResult,
+    FileRecord,
+)
 
 # A claim held by a crashed extraction would otherwise block that archive from
 # ever being retried. A claim older than this is considered abandoned and may be
 # reclaimed. Comfortably longer than any real extraction (unar's own timeout is
 # an hour), short enough that a crash recovers within a few poll cycles.
+#
+# This constant is also the *bound* on the crash-window exposure (#41 fix 3): if a
+# process dies after `unar` has written the media but before `complete_extraction`
+# records it, the row stays `'claimed'` and the next cycle returns CLAIM_BUSY
+# (the media is on disk but unrecorded, hence unprotected) for at most this long.
+# Once the TTL lapses the claim is reclaimed, the archive re-extracted, and its
+# outputs re-recorded — so eventual correctness holds and the gap is bounded.
+# Keep it >= the archive tool's own timeout (default 3600s) so a genuinely slow
+# extraction is never mistaken for a crash and reclaimed out from under itself.
 CLAIM_TTL_SECONDS = 7200
 
 
@@ -64,6 +82,18 @@ class StateStore:
                 )
                 """
             )
+            # #41 hardening columns, added out-of-band so an operator's existing
+            # state DB (created before this change) upgrades in place rather than
+            # needing a rebuild. All three are nullable: `size`/`mtime` fingerprint
+            # the claimed archive so a *different* archive later written to the same
+            # path is re-extracted instead of wrongly skipped; `token` is the
+            # per-claim ownership token guarding release/complete against a stale
+            # reclaim. Rows written before the upgrade carry NULLs and fall back to
+            # the pre-#41 (path-only, unguarded) behavior until re-extracted.
+            self._ensure_columns(
+                "extractions",
+                {"size": "INTEGER", "mtime": "REAL", "token": "TEXT"},
+            )
             # Files produced by extraction. The deletion planner consults these
             # as first-party protected inputs (Child C) so extracted media is not
             # deleted before Radarr/Sonarr import it, even after the source
@@ -77,6 +107,20 @@ class StateStore:
                 )
                 """
             )
+
+    def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
+        """Additively add any missing columns to ``table`` (in-place migration).
+
+        SQLite ``ALTER TABLE ADD COLUMN`` only appends nullable columns, which is
+        exactly what the #41 fingerprint/token fields are. Idempotent: a fresh DB
+        adds them all once; an already-migrated DB is a no-op. ``table``/column
+        names are internal constants, never user input, so the f-string is safe.
+        """
+
+        existing = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns.items():
+            if name not in existing:
+                self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def sync_candidates(self, candidates: dict[Path, FileRecord], now: float) -> None:
         """Replace the live candidate set while preserving first_seen."""
@@ -170,64 +214,106 @@ class StateStore:
         archive: Path,
         now: float,
         *,
+        size: int,
+        mtime: float,
         ttl_seconds: int = CLAIM_TTL_SECONDS,
-    ) -> str:
-        """Atomically claim an archive for extraction.
+    ) -> ClaimResult:
+        """Atomically claim an archive for extraction (identity- and token-aware).
 
-        Returns ``CLAIM_NEW`` when this caller now owns the claim (proceed to
-        extract), ``CLAIM_DONE`` when the archive was already extracted (skip with
-        no re-invoke), or ``CLAIM_BUSY`` when a still-fresh claim is held by
-        another run. The ``INSERT OR IGNORE`` + ``rowcount`` check is atomic under
-        SQLite's write lock, so a concurrent one-shot ``extract`` and a running
-        ``service`` cannot both win the same archive.
+        ``size``/``mtime`` fingerprint the archive currently on disk. Returns a
+        :class:`ClaimResult`:
+
+        - ``CLAIM_NEW`` (with a fresh ownership ``token``) when this caller now
+          owns the claim — either the archive is unseen, an equal-path record
+          describes a *different* archive (reused path → re-extract, #41 fix 1),
+          or a prior claim has gone stale past ``ttl_seconds`` (crash recovery).
+        - ``CLAIM_DONE`` when the *same* archive (matching fingerprint) is already
+          extracted — skip with no re-invoke.
+        - ``CLAIM_BUSY`` when a still-fresh claim is held by another run.
+
+        The ``INSERT OR IGNORE`` + ``rowcount`` check is atomic under SQLite's
+        write lock, so a concurrent one-shot ``extract`` and a running ``service``
+        cannot both win the same archive. Winning a claim always rotates the
+        ``token`` so any earlier owner's in-flight ``release``/``complete`` becomes
+        a no-op (#41 fix 2).
         """
 
         key = str(archive)
         with self._connection:
+            token = secrets.token_hex(16)
             cursor = self._connection.execute(
                 """
-                INSERT OR IGNORE INTO extractions (archive_path, status, claimed_at)
-                VALUES (?, 'claimed', ?)
+                INSERT OR IGNORE INTO extractions
+                    (archive_path, status, claimed_at, size, mtime, token)
+                VALUES (?, 'claimed', ?, ?, ?, ?)
                 """,
-                (key, now),
+                (key, now, size, mtime, token),
             )
             if cursor.rowcount == 1:
-                return CLAIM_NEW
+                return ClaimResult(CLAIM_NEW, token)
 
             row = self._connection.execute(
-                "SELECT status, claimed_at FROM extractions WHERE archive_path = ?",
+                "SELECT status, claimed_at, size, mtime FROM extractions WHERE archive_path = ?",
                 (key,),
             ).fetchone()
             if row["status"] == "extracted":
-                return CLAIM_DONE
+                if _identity_matches(row, size, mtime):
+                    return ClaimResult(CLAIM_DONE)
+                # A genuinely different archive now occupies this path: the old
+                # idempotency record must not suppress extracting the new one.
+                self._reclaim(key, now, size, mtime, token)
+                return ClaimResult(CLAIM_NEW, token)
             if (now - float(row["claimed_at"])) >= ttl_seconds:
-                self._connection.execute(
-                    """
-                    UPDATE extractions SET claimed_at = ?
-                    WHERE archive_path = ? AND status = 'claimed'
-                    """,
-                    (now, key),
-                )
-                return CLAIM_NEW
-            return CLAIM_BUSY
+                self._reclaim(key, now, size, mtime, token)
+                return ClaimResult(CLAIM_NEW, token)
+            return ClaimResult(CLAIM_BUSY)
+
+    def _reclaim(self, key: str, now: float, size: int, mtime: float, token: str) -> None:
+        """Re-arm an existing row as a fresh ``claimed`` owned by ``token``.
+
+        Used for both a reused-path re-extraction and a stale-TTL recovery. Guarded
+        on ``archive_path`` only (not ``status``) because it must overwrite either a
+        stale ``claimed`` row or a superseded ``extracted`` one; either way the new
+        token revokes the prior owner's write access.
+        """
+
+        self._connection.execute(
+            """
+            UPDATE extractions
+            SET status = 'claimed', claimed_at = ?, size = ?, mtime = ?, token = ?,
+                extracted_at = NULL
+            WHERE archive_path = ?
+            """,
+            (now, size, mtime, token, key),
+        )
 
     def complete_extraction(
         self,
         archive: Path,
         outputs: Sequence[Path],
         now: float,
+        *,
+        token: Optional[str],
     ) -> None:
-        """Promote a claim to ``extracted`` and record its output files."""
+        """Promote *our* claim to ``extracted`` and record its output files.
+
+        No-op unless the row is still ``claimed`` under the caller's ``token``: if a
+        concurrent run reclaimed the archive after our claim went stale, that run —
+        not us — owns the outputs, so we must neither promote its claim nor record
+        files under it (#41 fix 2).
+        """
 
         key = str(archive)
         with self._connection:
-            self._connection.execute(
+            cursor = self._connection.execute(
                 """
                 UPDATE extractions SET status = 'extracted', extracted_at = ?
-                WHERE archive_path = ?
+                WHERE archive_path = ? AND status = 'claimed' AND token IS ?
                 """,
-                (now, key),
+                (now, key, token),
             )
+            if cursor.rowcount == 0:
+                return
             if outputs:
                 self._connection.executemany(
                     """
@@ -240,17 +326,18 @@ class StateStore:
                     [(str(path), key, now) for path in outputs],
                 )
 
-    def release_extraction(self, archive: Path) -> None:
-        """Drop an in-flight claim so a deferred/failed archive retries.
+    def release_extraction(self, archive: Path, *, token: Optional[str]) -> None:
+        """Drop *our* in-flight claim so a deferred/failed archive retries.
 
-        Only ``claimed`` rows are removed; a durable ``extracted`` record is never
-        touched.
+        Only a ``claimed`` row held under the caller's ``token`` is removed: a
+        durable ``extracted`` record is never touched, and a claim a concurrent run
+        has since reclaimed (different token) is left alone (#41 fix 2).
         """
 
         with self._connection:
             self._connection.execute(
-                "DELETE FROM extractions WHERE archive_path = ? AND status = 'claimed'",
-                (str(archive),),
+                "DELETE FROM extractions WHERE archive_path = ? AND status = 'claimed' AND token IS ?",
+                (str(archive), token),
             )
 
     def get_protected_extracted_paths(self, now: float, *, protect_seconds: int) -> set[Path]:
@@ -272,6 +359,24 @@ class StateStore:
             )
 
 
+def _identity_matches(row: sqlite3.Row, size: int, mtime: float) -> bool:
+    """Whether a stored extraction row describes the archive now on disk.
+
+    A pre-#41 row (migrated in with NULL ``size``/``mtime``) carries no recorded
+    identity, so it cannot be proven stale — treated as a match to preserve the
+    original path-only idempotency until that archive is next re-extracted with a
+    fingerprint. ``mtime`` is compared exactly: an unchanged file returns the same
+    ``st_mtime`` every stat, and any real overwrite changes ``mtime`` and/or
+    ``size`` — so any difference correctly forces a re-extract.
+    """
+
+    stored_size = row["size"]
+    stored_mtime = row["mtime"]
+    if stored_size is None or stored_mtime is None:
+        return True
+    return int(stored_size) == size and float(stored_mtime) == mtime
+
+
 class StateExtractionLedger:
     """Adapts :class:`StateStore` to the extractor's claim/complete/release ledger.
 
@@ -284,12 +389,16 @@ class StateExtractionLedger:
         self._store = store
         self._ttl = claim_ttl_seconds
 
-    def claim(self, archive: Path, now: float) -> str:
-        return self._store.claim_extraction(archive, now, ttl_seconds=self._ttl)
+    def claim(self, archive: Path, now: float, *, size: int, mtime: float) -> ClaimResult:
+        return self._store.claim_extraction(
+            archive, now, size=size, mtime=mtime, ttl_seconds=self._ttl
+        )
 
-    def complete(self, archive: Path, outputs: Sequence[Path], now: float) -> None:
-        self._store.complete_extraction(archive, outputs, now)
+    def complete(
+        self, archive: Path, outputs: Sequence[Path], now: float, *, token: Optional[str]
+    ) -> None:
+        self._store.complete_extraction(archive, outputs, now, token=token)
 
-    def release(self, archive: Path) -> None:
-        self._store.release_extraction(archive)
+    def release(self, archive: Path, *, token: Optional[str]) -> None:
+        self._store.release_extraction(archive, token=token)
 

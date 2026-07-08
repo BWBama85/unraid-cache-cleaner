@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -21,46 +22,168 @@ class ExtractionLedgerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
+    def _claim(self, archive: Path, now: float, *, size: int = 1, mtime: float = 1.0, **kw):
+        return self.store.claim_extraction(archive, now, size=size, mtime=mtime, **kw)
+
     def test_claim_is_new_then_done_after_complete(self) -> None:
         archive = Path("/data/rel/movie.rar")
 
-        self.assertEqual(self.store.claim_extraction(archive, 1000.0), CLAIM_NEW)
+        claim = self._claim(archive, 1000.0, size=10, mtime=100.0)
+        self.assertEqual(claim.decision, CLAIM_NEW)
+        self.assertIsNotNone(claim.token)
         # A second claim while still 'claimed' is busy (owned by the first caller).
-        self.assertEqual(self.store.claim_extraction(archive, 1000.0), CLAIM_BUSY)
+        self.assertEqual(self._claim(archive, 1000.0, size=10, mtime=100.0).decision, CLAIM_BUSY)
 
-        self.store.complete_extraction(archive, [Path("/data/rel/movie.mkv")], 1001.0)
-        self.assertEqual(self.store.claim_extraction(archive, 1002.0), CLAIM_DONE)
+        self.store.complete_extraction(
+            archive, [Path("/data/rel/movie.mkv")], 1001.0, token=claim.token
+        )
+        # The same archive (matching fingerprint) is now done.
+        self.assertEqual(self._claim(archive, 1002.0, size=10, mtime=100.0).decision, CLAIM_DONE)
 
     def test_release_lets_a_deferred_archive_retry(self) -> None:
         archive = Path("/data/rel/movie.rar")
 
-        self.assertEqual(self.store.claim_extraction(archive, 1000.0), CLAIM_NEW)
-        self.store.release_extraction(archive)
+        claim = self._claim(archive, 1000.0)
+        self.assertEqual(claim.decision, CLAIM_NEW)
+        self.store.release_extraction(archive, token=claim.token)
         # After release the claim is gone, so a later cycle wins a fresh claim.
-        self.assertEqual(self.store.claim_extraction(archive, 1001.0), CLAIM_NEW)
+        self.assertEqual(self._claim(archive, 1001.0).decision, CLAIM_NEW)
 
     def test_release_never_drops_a_completed_record(self) -> None:
         archive = Path("/data/rel/movie.rar")
-        self.store.claim_extraction(archive, 1000.0)
-        self.store.complete_extraction(archive, [], 1001.0)
+        claim = self._claim(archive, 1000.0)
+        self.store.complete_extraction(archive, [], 1001.0, token=claim.token)
 
-        self.store.release_extraction(archive)  # must be a no-op on 'extracted'
+        self.store.release_extraction(archive, token=claim.token)  # no-op on 'extracted'
 
-        self.assertEqual(self.store.claim_extraction(archive, 1002.0), CLAIM_DONE)
+        self.assertEqual(self._claim(archive, 1002.0).decision, CLAIM_DONE)
 
     def test_stale_claim_is_reclaimable(self) -> None:
         archive = Path("/data/rel/movie.rar")
-        self.assertEqual(self.store.claim_extraction(archive, 1000.0, ttl_seconds=100), CLAIM_NEW)
+        self.assertEqual(self._claim(archive, 1000.0, ttl_seconds=100).decision, CLAIM_NEW)
 
         # Within the TTL: still busy. Past the TTL: reclaimable (crash recovery).
-        self.assertEqual(self.store.claim_extraction(archive, 1050.0, ttl_seconds=100), CLAIM_BUSY)
-        self.assertEqual(self.store.claim_extraction(archive, 1200.0, ttl_seconds=100), CLAIM_NEW)
+        self.assertEqual(self._claim(archive, 1050.0, ttl_seconds=100).decision, CLAIM_BUSY)
+        self.assertEqual(self._claim(archive, 1200.0, ttl_seconds=100).decision, CLAIM_NEW)
+
+    def test_reused_path_with_different_identity_reextracts(self) -> None:
+        # #41 fix 1: a genuinely different archive written to a path that once held
+        # an extracted archive must re-extract, not return the stale CLAIM_DONE.
+        archive = Path("/data/rel/movie.rar")
+        first = self._claim(archive, 1000.0, size=10, mtime=100.0)
+        self.store.complete_extraction(archive, [Path("/data/rel/movie.mkv")], 1000.0, token=first.token)
+
+        # Same identity → still idempotently done.
+        self.assertEqual(self._claim(archive, 1100.0, size=10, mtime=100.0).decision, CLAIM_DONE)
+        # Changed size → a new archive → re-extract.
+        changed_size = self._claim(archive, 1200.0, size=20, mtime=100.0)
+        self.assertEqual(changed_size.decision, CLAIM_NEW)
+        self.store.complete_extraction(archive, [Path("/data/rel/movie.mkv")], 1200.0, token=changed_size.token)
+        # Changed mtime alone (same size) → also a new archive.
+        self.assertEqual(self._claim(archive, 1300.0, size=20, mtime=200.0).decision, CLAIM_NEW)
+
+    def test_reclaim_revokes_the_previous_owners_token(self) -> None:
+        # #41 fix 2: after A's claim goes stale and B reclaims, A's late
+        # release/complete must not touch B's live claim.
+        archive = Path("/data/rel/movie.rar")
+        owner_a = self._claim(archive, 1000.0, ttl_seconds=100)
+        self.assertEqual(owner_a.decision, CLAIM_NEW)
+
+        owner_b = self._claim(archive, 1200.0, ttl_seconds=100)  # reclaim past TTL
+        self.assertEqual(owner_b.decision, CLAIM_NEW)
+        self.assertNotEqual(owner_a.token, owner_b.token)
+
+        # A's stale release cannot delete B's claim.
+        self.store.release_extraction(archive, token=owner_a.token)
+        self.assertEqual(self._claim(archive, 1200.0, ttl_seconds=100).decision, CLAIM_BUSY)
+
+        # A's stale complete cannot promote B's claim nor record ghost outputs.
+        self.store.complete_extraction(
+            archive, [Path("/data/rel/ghost.mkv")], 1200.0, token=owner_a.token
+        )
+        self.assertEqual(
+            self.store.get_protected_extracted_paths(1200.0, protect_seconds=10**9), set()
+        )
+        self.assertEqual(self._claim(archive, 1200.0, ttl_seconds=100).decision, CLAIM_BUSY)
+
+        # B still owns the claim and can complete it normally.
+        self.store.complete_extraction(
+            archive, [Path("/data/rel/real.mkv")], 1200.0, token=owner_b.token
+        )
+        self.assertEqual(
+            self.store.get_protected_extracted_paths(1200.0, protect_seconds=10**9),
+            {Path("/data/rel/real.mkv")},
+        )
+
+    def test_crash_window_is_bounded_and_recovers_after_ttl(self) -> None:
+        # #41 fix 3: a crash after the media is written but before complete() leaves
+        # the row 'claimed'. Within the TTL the media is unrecorded/unprotected (the
+        # bounded exposure); past the TTL the claim is reclaimed and re-extraction
+        # can re-record and protect it.
+        archive = Path("/data/rel/movie.rar")
+        crashed = self._claim(archive, 1000.0, ttl_seconds=100)
+        self.assertEqual(crashed.decision, CLAIM_NEW)
+        # (process dies before complete() — no outputs recorded)
+
+        self.assertEqual(self._claim(archive, 1050.0, ttl_seconds=100).decision, CLAIM_BUSY)
+        self.assertEqual(
+            self.store.get_protected_extracted_paths(1050.0, protect_seconds=10**9), set()
+        )
+
+        recovered = self._claim(archive, 1200.0, ttl_seconds=100)
+        self.assertEqual(recovered.decision, CLAIM_NEW)
+        self.store.complete_extraction(
+            archive, [Path("/data/rel/movie.mkv")], 1200.0, token=recovered.token
+        )
+        self.assertEqual(
+            self.store.get_protected_extracted_paths(1200.0, protect_seconds=10**9),
+            {Path("/data/rel/movie.mkv")},
+        )
+
+    def test_migrates_legacy_extractions_schema_in_place(self) -> None:
+        # An operator DB created before #41 has no size/mtime/token columns. Opening
+        # a StateStore on it must add them (ALTER TABLE) without a rebuild, preserve
+        # legacy 'extracted' idempotency (NULL identity → still CLAIM_DONE), and let
+        # fresh archives claim normally.
+        db = Path(self._tmp.name) / "legacy.sqlite3"
+        legacy = sqlite3.connect(db)
+        legacy.execute(
+            """
+            CREATE TABLE extractions (
+                archive_path TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                claimed_at REAL NOT NULL,
+                extracted_at REAL
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO extractions (archive_path, status, claimed_at, extracted_at) VALUES (?, ?, ?, ?)",
+            ("/data/rel/legacy.rar", "extracted", 10.0, 11.0),
+        )
+        legacy.commit()
+        legacy.close()
+
+        store = StateStore(db)
+        columns = {row["name"] for row in store._connection.execute("PRAGMA table_info(extractions)")}
+        self.assertTrue({"size", "mtime", "token"} <= columns)
+
+        # Legacy extracted row (no recorded identity) stays done — no surprise re-extract.
+        self.assertEqual(
+            store.claim_extraction(Path("/data/rel/legacy.rar"), 100.0, size=5, mtime=5.0).decision,
+            CLAIM_DONE,
+        )
+        # A never-seen archive still claims cleanly on the migrated DB.
+        self.assertEqual(
+            store.claim_extraction(Path("/data/rel/new.rar"), 100.0, size=5, mtime=5.0).decision,
+            CLAIM_NEW,
+        )
 
     def test_protected_paths_respect_the_window(self) -> None:
         archive = Path("/data/rel/movie.rar")
         outputs = [Path("/data/rel/movie.mkv"), Path("/data/rel/movie.nfo")]
-        self.store.claim_extraction(archive, 1000.0)
-        self.store.complete_extraction(archive, outputs, 1000.0)
+        claim = self._claim(archive, 1000.0)
+        self.store.complete_extraction(archive, outputs, 1000.0, token=claim.token)
 
         within = self.store.get_protected_extracted_paths(1000.0 + 500, protect_seconds=1000)
         self.assertEqual(within, set(outputs))
@@ -72,10 +195,10 @@ class ExtractionLedgerTests(unittest.TestCase):
     def test_prune_forgets_expired_outputs_only(self) -> None:
         old = Path("/data/old/a.mkv")
         fresh = Path("/data/new/b.mkv")
-        self.store.claim_extraction(Path("/data/old/a.rar"), 0.0)
-        self.store.complete_extraction(Path("/data/old/a.rar"), [old], 0.0)
-        self.store.claim_extraction(Path("/data/new/b.rar"), 5000.0)
-        self.store.complete_extraction(Path("/data/new/b.rar"), [fresh], 5000.0)
+        old_claim = self._claim(Path("/data/old/a.rar"), 0.0)
+        self.store.complete_extraction(Path("/data/old/a.rar"), [old], 0.0, token=old_claim.token)
+        fresh_claim = self._claim(Path("/data/new/b.rar"), 5000.0)
+        self.store.complete_extraction(Path("/data/new/b.rar"), [fresh], 5000.0, token=fresh_claim.token)
 
         self.store.prune_extraction_outputs(6000.0, protect_seconds=2000)
 

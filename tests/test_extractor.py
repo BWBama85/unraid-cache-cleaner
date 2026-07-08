@@ -22,7 +22,7 @@ from unraid_cache_cleaner.extractor import (
     _parse_owner,
     summarize,
 )
-from unraid_cache_cleaner.models import CLAIM_NEW
+from unraid_cache_cleaner.models import CLAIM_NEW, ClaimResult
 from unraid_cache_cleaner.planner import normalize_path
 from unraid_cache_cleaner.state import StateExtractionLedger, StateStore
 
@@ -30,17 +30,38 @@ from unraid_cache_cleaner.state import StateExtractionLedger, StateStore
 class _BoomLedger:
     """Ledger whose complete() raises, to test claim release on bookkeeping failure."""
 
+    TOKEN = "boom-token"
+
     def __init__(self) -> None:
         self.released: list = []
 
-    def claim(self, archive: Path, now: float) -> str:
-        return CLAIM_NEW
+    def claim(self, archive: Path, now: float, *, size: int, mtime: float) -> ClaimResult:
+        return ClaimResult(CLAIM_NEW, self.TOKEN)
 
-    def complete(self, archive: Path, outputs, now: float) -> None:
+    def complete(self, archive: Path, outputs, now: float, *, token) -> None:
         raise sqlite3.OperationalError("database is locked")
 
-    def release(self, archive: Path) -> None:
-        self.released.append(archive)
+    def release(self, archive: Path, *, token) -> None:
+        self.released.append((archive, token))
+
+
+class _RecordingLedger:
+    """Grants every claim and records the token threaded into complete/release."""
+
+    TOKEN = "tok-abc123"
+
+    def __init__(self) -> None:
+        self.completed: list = []
+        self.released: list = []
+
+    def claim(self, archive: Path, now: float, *, size: int, mtime: float) -> ClaimResult:
+        return ClaimResult(CLAIM_NEW, self.TOKEN)
+
+    def complete(self, archive: Path, outputs, now: float, *, token) -> None:
+        self.completed.append((archive, token))
+
+    def release(self, archive: Path, *, token) -> None:
+        self.released.append((archive, token))
 
 
 class FakeTool:
@@ -576,8 +597,44 @@ class LedgerIdempotencyTests(unittest.TestCase):
 
             self.assertEqual([r.status for r in results], ["failed"])
             self.assertEqual(len(ledger.released), 1)  # claim released → retryable
+            # The release is issued under the token the claim handed back (#41).
+            self.assertEqual(ledger.released[0][1], _BoomLedger.TOKEN)
             mkv = normalize_path(fx.watch_root / "rel" / "movie.mkv")
             self.assertIn(mkv, results[0].outputs)  # protected this cycle despite failure
+
+    def test_claim_token_is_threaded_into_complete(self) -> None:
+        # The token a live claim returns must reach complete() on the success path so
+        # the ledger can prove ownership before promoting/recording (#41).
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            ledger = _RecordingLedger()
+            extractor = Extractor(fx.config(), tool=FakeTool(), ledger=ledger)
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])
+            self.assertEqual(len(ledger.completed), 1)
+            self.assertEqual(ledger.completed[0][1], _RecordingLedger.TOKEN)
+            self.assertEqual(ledger.released, [])  # nothing to release on success
+
+    def test_reused_path_with_different_archive_reextracts(self) -> None:
+        # #41 fix 1, end to end: a different archive later written to a
+        # previously-extracted path re-invokes the tool instead of skipped_present.
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar", content="first-archive")
+            store = StateStore(fx.config().state_db_path)
+
+            first = Extractor(fx.config(), tool=(tool1 := FakeTool()), ledger=StateExtractionLedger(store))
+            self.assertEqual([r.status for r in first.extract_all((fx.watch_root,), dry_run=False)], ["extracted"])
+            self.assertEqual(len(tool1.extract_calls), 1)
+
+            # A genuinely different archive lands at the same path (different size).
+            fx.write_rar("rel/movie.rar", content="a-different-and-larger-second-archive")
+            second = Extractor(fx.config(), tool=(tool2 := FakeTool()), ledger=StateExtractionLedger(store))
+            results = second.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])  # not skipped_present
+            self.assertEqual(len(tool2.extract_calls), 1)  # re-invoked
 
 
 class IncompleteRootsTests(unittest.TestCase):
