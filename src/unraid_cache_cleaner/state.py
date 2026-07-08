@@ -88,8 +88,9 @@ class StateStore:
             # the claimed archive so a *different* archive later written to the same
             # path is re-extracted instead of wrongly skipped; `token` is the
             # per-claim ownership token guarding release/complete against a stale
-            # reclaim. Rows written before the upgrade carry NULLs and fall back to
-            # the pre-#41 (path-only, unguarded) behavior until re-extracted.
+            # reclaim. Rows written before the upgrade carry NULLs and permanently
+            # keep the pre-#41 (path-only, unguarded) behavior; identity/token
+            # protection applies to extractions recorded after the upgrade.
             self._ensure_columns(
                 "extractions",
                 {"size": "INTEGER", "mtime": "REAL", "token": "TEXT"},
@@ -275,8 +276,19 @@ class StateStore:
         on ``archive_path`` only (not ``status``) because it must overwrite either a
         stale ``claimed`` row or a superseded ``extracted`` one; either way the new
         token revokes the prior owner's write access.
+
+        The superseded archive's recorded outputs are dropped too: when a genuinely
+        different archive reuses this path, the previous archive's extracted files
+        (which may have unrelated names, so ``complete``'s per-path upsert would not
+        overwrite them) must stop being force-protected — otherwise now-orphaned
+        media stays undeletable until its window lapses. A stale-``claimed`` recovery
+        has no recorded outputs yet, so this is a no-op there.
         """
 
+        self._connection.execute(
+            "DELETE FROM extraction_outputs WHERE archive_path = ?",
+            (key,),
+        )
         self._connection.execute(
             """
             UPDATE extractions
@@ -363,9 +375,11 @@ def _identity_matches(row: sqlite3.Row, size: int, mtime: float) -> bool:
     """Whether a stored extraction row describes the archive now on disk.
 
     A pre-#41 row (migrated in with NULL ``size``/``mtime``) carries no recorded
-    identity, so it cannot be proven stale — treated as a match to preserve the
-    original path-only idempotency until that archive is next re-extracted with a
-    fingerprint. ``mtime`` is compared exactly: an unchanged file returns the same
+    identity, so it cannot be proven stale — treated as a match, which keeps its
+    original path-only idempotency permanently. (Identity-based reuse detection
+    therefore only ever fires for archives extracted *after* the upgrade; a legacy
+    row is never re-extracted on identity grounds.) ``mtime`` is compared exactly:
+    an unchanged file returns the same
     ``st_mtime`` every stat, and any real overwrite changes ``mtime`` and/or
     ``size`` — so any difference correctly forces a re-extract.
     """

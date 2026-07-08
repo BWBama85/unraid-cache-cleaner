@@ -82,6 +82,28 @@ class ExtractionLedgerTests(unittest.TestCase):
         # Changed mtime alone (same size) → also a new archive.
         self.assertEqual(self._claim(archive, 1300.0, size=20, mtime=200.0).decision, CLAIM_NEW)
 
+    def test_reused_path_reclaim_drops_the_old_archives_protected_outputs(self) -> None:
+        # #41 fix 1 cleanup: when a different archive reuses a path, the previous
+        # archive's recorded outputs (which may have unrelated names) must stop being
+        # force-protected — otherwise now-orphaned media stays undeletable.
+        path = Path("/data/rel/movie.rar")
+        old = self._claim(path, 1000.0, size=10, mtime=100.0)
+        self.store.complete_extraction(path, [Path("/data/rel/old.mkv")], 1000.0, token=old.token)
+        self.assertEqual(
+            self.store.get_protected_extracted_paths(1000.0, protect_seconds=10**9),
+            {Path("/data/rel/old.mkv")},
+        )
+
+        new = self._claim(path, 2000.0, size=20, mtime=200.0)  # different archive, same path
+        self.assertEqual(new.decision, CLAIM_NEW)
+        self.store.complete_extraction(path, [Path("/data/rel/new.mkv")], 2000.0, token=new.token)
+
+        # Only the new archive's output is protected; old.mkv is no longer force-held.
+        self.assertEqual(
+            self.store.get_protected_extracted_paths(2000.0, protect_seconds=10**9),
+            {Path("/data/rel/new.mkv")},
+        )
+
     def test_reclaim_revokes_the_previous_owners_token(self) -> None:
         # #41 fix 2: after A's claim goes stale and B reclaims, A's late
         # release/complete must not touch B's live claim.

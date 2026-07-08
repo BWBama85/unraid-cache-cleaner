@@ -351,6 +351,10 @@ class Extractor:
         claim_token: Optional[str] = None
         if self.ledger is not None and not dry_run:
             try:
+                # Fingerprints the archive as of the claim (a hair fresher than the
+                # scan). For a multi-volume set this is the first volume only — its
+                # (size, mtime) is the set's identity; a re-download that changes only
+                # a continuation volume is treated as the same archive.
                 stat_result = archive.stat()
             except OSError as exc:
                 return ExtractionResult(
