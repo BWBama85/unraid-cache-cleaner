@@ -536,10 +536,37 @@ class LedgerIdempotencyTests(unittest.TestCase):
             self.assertIn(mkv, results[0].outputs)
             self.assertIn(mkv, store.get_protected_extracted_paths(0.0, protect_seconds=10**9))
 
-    def test_bookkeeping_failure_releases_claim_and_fails(self) -> None:
+    def test_overwrite_with_preserved_mtime_detected_by_size(self) -> None:
+        # Real archive tools restore member timestamps, so an overwrite can keep the
+        # same mtime. The (mtime, size) fingerprint must still catch a content change.
+        class _MtimePreservingTool(FakeTool):
+            def extract(self, archive: Path, dest_dir: Path) -> None:
+                target = dest_dir / (Path(archive.name).stem + ".mkv")
+                old = target.stat().st_mtime if target.exists() else None
+                target.write_text("fully-extracted-content-much-larger-than-before")
+                if old is not None:
+                    os.utime(target, (old, old))  # restore mtime (member-timestamp preservation)
+
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            fx.write_rar("rel/movie.mkv", content="x")  # 1 byte; same name as output
+            store = StateStore(fx.config().state_db_path)
+            extractor = Extractor(
+                fx.config(), tool=_MtimePreservingTool(), ledger=StateExtractionLedger(store)
+            )
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])
+            mkv = normalize_path(fx.watch_root / "rel" / "movie.mkv")
+            self.assertIn(mkv, results[0].outputs)  # caught by the size delta
+
+    def test_bookkeeping_failure_releases_claim_and_still_surfaces_outputs(self) -> None:
         # If recording the extraction raises (e.g. the ledger DB is locked by a
         # concurrent run), the media is on disk but unrecorded: the claim must be
-        # released so the next cycle re-extracts and re-records, not wedged for the TTL.
+        # released so the next cycle re-extracts and re-records (not wedged for the
+        # TTL), AND the produced paths must still be surfaced so the caller can
+        # protect them this cycle rather than deleting them as orphans.
         with _Fixture() as fx:
             fx.write_rar("rel/movie.rar")
             ledger = _BoomLedger()
@@ -549,6 +576,8 @@ class LedgerIdempotencyTests(unittest.TestCase):
 
             self.assertEqual([r.status for r in results], ["failed"])
             self.assertEqual(len(ledger.released), 1)  # claim released → retryable
+            mkv = normalize_path(fx.watch_root / "rel" / "movie.mkv")
+            self.assertIn(mkv, results[0].outputs)  # protected this cycle despite failure
 
 
 class IncompleteRootsTests(unittest.TestCase):

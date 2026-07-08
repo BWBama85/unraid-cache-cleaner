@@ -386,22 +386,36 @@ class Extractor:
                 self.ledger.release(archive)
             return ExtractionResult(archive, FAILED, str(exc))
 
-        # Bookkeeping runs after the media is on disk. If it fails (e.g. a
-        # concurrent run holds the ledger DB lock), release the claim so the next
-        # cycle re-extracts and re-records rather than leaving the media
-        # unprotected and the claim wedged until its TTL. ``created_at`` is stamped
-        # now, at completion, so a slow extraction does not age its output past the
-        # protection window before this cycle can protect it.
+        # The produced files are identified first (a cheap filesystem walk), then
+        # persisted. If persistence fails (e.g. a concurrent run holds the ledger
+        # DB lock), release the claim so the next cycle re-extracts and re-records —
+        # but still surface the produced paths as ``outputs`` so this cycle protects
+        # the media it just wrote rather than deleting it as an orphan.
         try:
             new_files = self._finalize_output(dest_dir, before_files, before_dirs)
-            if self.ledger is not None:
-                self.ledger.complete(archive, new_files, self.clock())
         except Exception as exc:  # noqa: BLE001 - keep the archive, retry next run
             if claimed:
                 self.ledger.release(archive)
             return ExtractionResult(
                 archive, FAILED, f"post-extraction bookkeeping failed: {exc}"
             )
+
+        if self.ledger is not None:
+            # ``created_at`` is stamped now, at completion, so a slow extraction
+            # does not age its output past the protection window before this cycle
+            # can protect it.
+            try:
+                self.ledger.complete(archive, new_files, self.clock())
+            except Exception as exc:  # noqa: BLE001 - keep the archive, retry next run
+                if claimed:
+                    self.ledger.release(archive)
+                return ExtractionResult(
+                    archive,
+                    FAILED,
+                    f"post-extraction bookkeeping failed: {exc}",
+                    output_dir=dest_dir,
+                    outputs=new_files,
+                )
         return ExtractionResult(
             archive, EXTRACTED, "extracted", output_dir=dest_dir, outputs=new_files
         )
@@ -409,20 +423,24 @@ class Extractor:
     def _finalize_output(
         self,
         dest_dir: Path,
-        before_files: "Dict[Path, float]",
+        before_files: "Dict[Path, Tuple[float, int]]",
         before_dirs: set,
     ) -> Tuple[Path, ...]:
         """One post-extraction walk: record the produced files and chown them.
 
-        A file counts as *produced* when its path is new **or** its mtime changed
-        since the pre-extraction snapshot — ``unar`` overwrites in place, so an
-        overwritten output (e.g. a partial file a failed prior attempt left behind,
-        or an already-unpacked media file) differs from the copy it replaced and is
-        still protected. Only produced files (and newly created directories) are
-        chowned — never untouched siblings, which for a loose archive at a watch
-        root would be the whole mount — and symlinks are never followed. A chown
-        miss is warned once and never aborts output collection: freshly extracted
-        media must be protected even when the process lacks ``CAP_CHOWN``.
+        A file counts as *produced* when its path is new **or** its ``(mtime, size)``
+        fingerprint changed since the pre-extraction snapshot — ``unar`` overwrites
+        in place, so an overwritten output (e.g. a partial file a failed prior
+        attempt left behind, or an already-unpacked media file) differs from the
+        copy it replaced and is still protected. (A file the tool overwrites with
+        byte-identical content *and* a restored identical mtime is indistinguishable
+        from untouched here; recording those precisely needs the archive's own
+        member list — tracked in #41.) Only produced files (and newly created
+        directories) are chowned — never untouched siblings, which for a loose
+        archive at a watch root would be the whole mount — and symlinks are never
+        followed. A chown miss is warned once and never aborts output collection:
+        freshly extracted media must be protected even when the process lacks
+        ``CAP_CHOWN``.
         """
 
         owner = self._resolve_owner()
@@ -434,11 +452,12 @@ class Extractor:
                 if path.is_symlink():
                     continue
                 try:
-                    mtime = path.stat().st_mtime
+                    stat_result = path.stat()
                 except OSError:
                     continue
+                fingerprint = (stat_result.st_mtime, stat_result.st_size)
                 prior = before_files.get(path)
-                if prior is not None and prior == mtime:
+                if prior is not None and prior == fingerprint:
                     continue  # untouched pre-existing file (e.g. the source archive)
                 produced.append(path)
                 if chown_ok:
@@ -473,15 +492,16 @@ class Extractor:
             return False
 
 
-def _snapshot(root: Path) -> "Tuple[Dict[Path, float], set]":
-    """Map pre-extraction files to their mtime, plus the set of pre-existing dirs.
+def _snapshot(root: Path) -> "Tuple[Dict[Path, Tuple[float, int]], set]":
+    """Map pre-extraction files to a ``(mtime, size)`` fingerprint, plus the set of
+    pre-existing dirs.
 
     Lets the post-extraction walk tell the files an extraction produced (new path,
-    or a changed mtime from an overwrite) from untouched siblings. No symlink
+    or a changed mtime/size from an overwrite) from untouched siblings. No symlink
     traversal (``os.walk`` never follows links by default).
     """
 
-    files: "Dict[Path, float]" = {}
+    files: "Dict[Path, Tuple[float, int]]" = {}
     dirs: set = set()
     for current_root, subdirs, filenames in os.walk(root):
         for name in subdirs:
@@ -489,9 +509,10 @@ def _snapshot(root: Path) -> "Tuple[Dict[Path, float], set]":
         for name in filenames:
             path = Path(current_root) / name
             try:
-                files[path] = path.stat().st_mtime
+                stat_result = path.stat()
             except OSError:
                 continue
+            files[path] = (stat_result.st_mtime, stat_result.st_size)
     return files, dirs
 
 
