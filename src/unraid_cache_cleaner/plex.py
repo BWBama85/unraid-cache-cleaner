@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import ssl
 import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import USER_AGENT
-from .http_redirect import build_handler
+from .http_client import JsonHttpClient
 from .models import DuplicateGroup, MediaCopy, PlexSection
 
 LOGGER = logging.getLogger(__name__)
@@ -28,13 +23,18 @@ class PlexClientError(RuntimeError):
         self.status_code = status_code
 
 
-class PlexClient:
+class PlexClient(JsonHttpClient):
     """Small token-authenticated client for the Plex Web API.
 
     Read-only: it only issues GETs against the library endpoints. The token is
     sent as an ``X-Plex-Token`` header (never in the URL query, so it stays out
-    of request logs) and JSON is requested via ``Accept: application/json``.
+    of request logs) and JSON is requested via ``Accept: application/json``. The
+    ``urllib`` plumbing (fail-closed opener, transport taxonomy, JSON decode)
+    comes from :class:`~unraid_cache_cleaner.http_client.JsonHttpClient`.
     """
+
+    service_name = "Plex"
+    error_class = PlexClientError
 
     def __init__(
         self,
@@ -46,65 +46,19 @@ class PlexClient:
     ) -> None:
         if not base_url or not token:
             raise PlexClientError("PLEX_URL and PLEX_TOKEN are required")
-        self.base_url = base_url.rstrip("/")
         self.token = token
-        self.timeout_seconds = timeout_seconds
-        self.verify_tls = verify_tls
-        self._opener = self._build_opener()
+        super().__init__(base_url, timeout_seconds=timeout_seconds, verify_tls=verify_tls)
 
-    def _build_opener(self) -> urllib.request.OpenerDirector:
-        handlers: list[urllib.request.BaseHandler] = [
-            build_handler(self.base_url, service_name="Plex", error_factory=PlexClientError),
-        ]
+    def _auth_headers(self) -> Sequence[Tuple[str, str]]:
+        return (("X-Plex-Token", self.token), ("Accept", "application/json"))
 
-        if urllib.parse.urlparse(self.base_url).scheme == "https":
-            context = ssl.create_default_context()
-            if not self.verify_tls:
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-            handlers.append(urllib.request.HTTPSHandler(context=context))
-
-        opener = urllib.request.build_opener(*handlers)
-        opener.addheaders = [
-            ("X-Plex-Token", self.token),
-            ("Accept", "application/json"),
-            ("User-Agent", USER_AGENT),
-        ]
-        return opener
-
-    def _request(
-        self,
-        api_path: str,
-        *,
-        params: Optional[Dict[str, str]] = None,
-        extra_headers: Optional[Dict[str, str]] = None,
-    ) -> str:
-        encoded_params = urllib.parse.urlencode(params or {})
-        url = f"{self.base_url}{api_path}"
-        if encoded_params:
-            url = f"{url}?{encoded_params}"
-
-        request = urllib.request.Request(
-            url,
-            method="GET",
-            headers=dict(extra_headers or {}),
-        )
-
-        try:
-            with self._opener.open(request, timeout=self.timeout_seconds) as response:
-                return response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                raise PlexClientError(
-                    "Plex rejected the token (401). Re-copy X-Plex-Token.",
-                    status_code=401,
-                ) from exc
-            body = exc.read().decode("utf-8", errors="replace")
-            raise PlexClientError(f"HTTP {exc.code} from Plex: {body}", status_code=exc.code) from exc
-        except urllib.error.URLError as exc:
-            raise PlexClientError(
-                f"Unable to connect to Plex at {self.base_url}: {exc.reason}"
-            ) from exc
+    def _on_http_error(self, exc: urllib.error.HTTPError) -> Exception:
+        if exc.code == 401:
+            return PlexClientError(
+                "Plex rejected the token (401). Re-copy X-Plex-Token.",
+                status_code=401,
+            )
+        return super()._on_http_error(exc)
 
     def _get_json(
         self,
@@ -120,11 +74,7 @@ class PlexClient:
         if container_size is not None:
             extra_headers["X-Plex-Container-Size"] = str(container_size)
 
-        body = self._request(api_path, params=params, extra_headers=extra_headers)
-        try:
-            return json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise PlexClientError(f"Plex returned invalid JSON from {api_path}: {exc}") from exc
+        return super()._get_json(api_path, params, extra_headers=extra_headers)
 
     def fetch_sections(self) -> List[PlexSection]:
         """Return the Plex library sections."""

@@ -61,21 +61,72 @@ if verify in ("0", "false", "no", "off"):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
+
+class RedirectRefused(Exception):
+    """A redirect off the configured host was refused before it was followed."""
+
+
+class HostBoundRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail-closed redirect guard mirroring
+    unraid_cache_cleaner.http_redirect.HostBoundRedirectHandler.
+
+    Inlined rather than imported: this diagnostic is a standalone snippet piped to
+    'python3 -' inside the container (it deliberately reimplements the qBittorrent
+    calls instead of importing the package), so it must not depend on the package
+    being importable on that interpreter's path. urllib re-applies the opener's
+    addheaders — here the 'Referer' base URL — and the session cookie as
+    unredirected headers when it follows a 3xx, so a qBittorrent endpoint or an
+    interposing reverse proxy that 301/302s to a different host (or downgrades
+    https -> http) would otherwise leak the internal base URL and cookie to the
+    redirect target. A same-host redirect — including a port change or an
+    http -> https upgrade — is still followed.
+    """
+
+    def __init__(self, allowed_host, require_tls):
+        super().__init__()
+        self._allowed_host = (allowed_host or "").lower()
+        self._require_tls = require_tls
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlparse(newurl)
+        target_host = (target.hostname or "").lower()
+        if target_host != self._allowed_host or (self._require_tls and target.scheme != "https"):
+            raise RedirectRefused(
+                "refusing to follow a cross-host or TLS-downgrading redirect to "
+                f"'{target.scheme}://{target.hostname or 'unknown'}' so credentials stay on-box"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+parsed = urllib.parse.urlparse(url)
 opener = urllib.request.build_opener(
     urllib.request.HTTPCookieProcessor(CookieJar()),
+    HostBoundRedirectHandler(parsed.hostname, parsed.scheme == "https"),
     urllib.request.HTTPSHandler(context=ctx),
 )
 opener.addheaders = [("Referer", url), ("User-Agent", "uccc-diagnose/1.0")]
 
-login = opener.open(
+
+def qb_open(*args, **kwargs):
+    """opener.open() that turns a refused cross-host redirect into a clean exit."""
+    try:
+        return opener.open(*args, **kwargs)
+    except RedirectRefused as exc:
+        raise SystemExit(f"ERROR: qBittorrent {exc}")
+
+
+login = qb_open(
     url + "/api/v2/auth/login",
     data=urllib.parse.urlencode({"username": user, "password": pw}).encode(),
     timeout=20,
 ).read().decode().strip()
-if login != "Ok.":
+# "Ok." is the normal success body; an empty body is qBittorrent's auth-bypass
+# 204 (whitelisted subnet / localhost) — the packaged client treats both as
+# success, so the diagnostic must too or it goes dark on exactly those setups.
+if login not in ("Ok.", ""):
     raise SystemExit(f"ERROR: qBittorrent login failed (response: {login!r})")
 
-torrents = json.load(opener.open(url + "/api/v2/torrents/info?filter=all", timeout=30))
+torrents = json.load(qb_open(url + "/api/v2/torrents/info?filter=all", timeout=30))
 
 # --- load what the cleaner wants to delete ---------------------------------
 report = json.load(open(report_path))

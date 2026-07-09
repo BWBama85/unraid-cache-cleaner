@@ -29,17 +29,13 @@ reliable:
 
 from __future__ import annotations
 
-import json
-import ssl
 import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from . import USER_AGENT, dedupe
-from .http_redirect import build_handler
+from . import dedupe
+from .http_client import JsonHttpClient
 from .models import DuplicateGroup, MediaCopy
 
 TRACKED = "tracked"
@@ -58,15 +54,19 @@ class ArrClientError(RuntimeError):
         self.status_code = status_code
 
 
-class _ArrClient:
+class _ArrClient(JsonHttpClient):
     """Shared ``urllib`` plumbing for the Radarr/Sonarr v3 APIs.
 
     Read-only: only issues GETs. The API key travels as an ``X-Api-Key`` header
     (never in the URL query, so it stays out of request logs) and JSON is
-    requested via ``Accept: application/json``.
+    requested via ``Accept: application/json``. The fail-closed opener, transport
+    taxonomy (including the read-phase ``OSError`` wrapping so the report degrades
+    rather than crashing), and JSON decode come from
+    :class:`~unraid_cache_cleaner.http_client.JsonHttpClient`.
     """
 
     service_name = "arr"
+    error_class = ArrClientError
 
     def __init__(
         self,
@@ -78,75 +78,19 @@ class _ArrClient:
     ) -> None:
         if not base_url or not api_key:
             raise ArrClientError(f"{self.service_name} URL and API key are required")
-        self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.timeout_seconds = timeout_seconds
-        self.verify_tls = verify_tls
-        self._opener = self._build_opener()
+        super().__init__(base_url, timeout_seconds=timeout_seconds, verify_tls=verify_tls)
 
-    def _build_opener(self) -> urllib.request.OpenerDirector:
-        handlers: list[urllib.request.BaseHandler] = [
-            build_handler(
-                self.base_url,
-                service_name=self.service_name,
-                error_factory=ArrClientError,
-            ),
-        ]
+    def _auth_headers(self) -> Sequence[Tuple[str, str]]:
+        return (("X-Api-Key", self.api_key), ("Accept", "application/json"))
 
-        if urllib.parse.urlparse(self.base_url).scheme == "https":
-            context = ssl.create_default_context()
-            if not self.verify_tls:
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-            handlers.append(urllib.request.HTTPSHandler(context=context))
-
-        opener = urllib.request.build_opener(*handlers)
-        opener.addheaders = [
-            ("X-Api-Key", self.api_key),
-            ("Accept", "application/json"),
-            ("User-Agent", USER_AGENT),
-        ]
-        return opener
-
-    def _get_json(self, api_path: str, params: Optional[Dict[str, str]] = None) -> object:
-        encoded_params = urllib.parse.urlencode(params or {})
-        url = f"{self.base_url}{api_path}"
-        if encoded_params:
-            url = f"{url}?{encoded_params}"
-
-        request = urllib.request.Request(url, method="GET")
-        try:
-            with self._opener.open(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                raise ArrClientError(
-                    f"{self.service_name} rejected the API key (401). Re-copy the API key.",
-                    status_code=401,
-                ) from exc
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise ArrClientError(
-                f"HTTP {exc.code} from {self.service_name}: {detail}", status_code=exc.code
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise ArrClientError(
-                f"Unable to connect to {self.service_name} at {self.base_url}: {exc.reason}"
-            ) from exc
-        except OSError as exc:
-            # A read-phase timeout (socket.timeout/TimeoutError) or dropped
-            # connection is an OSError that urllib does NOT wrap in URLError, so it
-            # would otherwise escape _build_arr_indexes' ArrClientError handler and
-            # crash the read-only report instead of degrading gracefully.
-            raise ArrClientError(
-                f"Unable to reach {self.service_name} at {self.base_url}: {exc}"
-            ) from exc
-
-        try:
-            return json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise ArrClientError(
-                f"{self.service_name} returned invalid JSON from {api_path}: {exc}"
-            ) from exc
+    def _on_http_error(self, exc: urllib.error.HTTPError) -> Exception:
+        if exc.code == 401:
+            return ArrClientError(
+                f"{self.service_name} rejected the API key (401). Re-copy the API key.",
+                status_code=401,
+            )
+        return super()._on_http_error(exc)
 
 
 class RadarrClient(_ArrClient):

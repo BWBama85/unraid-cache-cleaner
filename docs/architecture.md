@@ -36,13 +36,19 @@ That gives qBittorrent, unpackers, and external movers time to settle before the
 
 ## Main Components
 
+### `http_client.py`
+
+The shared `urllib` JSON-over-HTTP base (`JsonHttpClient`) that `qbittorrent.py`, `plex.py`, and `arr.py` subclass. It owns opener construction (the fail-closed `HostBoundRedirectHandler` from `http_redirect.py` + the TLS-verify toggle + a User-Agent), the request/read/JSON-decode path, and the `HTTPError`/`URLError`/`OSError` → `*ClientError` taxonomy. A subclass sets `service_name` + `error_class`, supplies its credential via `_auth_headers()` (never in a URL), and overrides an `_on_*_error` hook only where it needs a status-specific message. This is where a cross-cutting fix (redirect-guard policy, connect-timeout tuning, a token-in-logs guarantee) lands once for all three clients.
+
 ### `qbittorrent.py`
 
-Minimal authenticated client for:
+Minimal authenticated client (subclass of `JsonHttpClient`) for:
 
 - `POST /api/v2/auth/login`
 - `GET /api/v2/app/defaultSavePath`
 - `GET /api/v2/torrents/info`
+
+Adds a session `CookieJar` (via `_extra_handlers`) and keeps its own `_request` for the form-encoded login POST and one-shot 403 re-authentication.
 
 ### `planner.py`
 
@@ -70,7 +76,7 @@ A separate, **read-only** capability that reports reclaimable disk space from du
 
 ### `plex.py`
 
-Minimal token-authenticated Plex Web API client (same `urllib` + `*ClientError` pattern as `qbittorrent.py`). Fetches library sections and the raw duplicate `Metadata` for a section, paging via `X-Plex-Container-Start/Size`. Also holds `build_duplicate_group`, the pure parser that turns one raw `Metadata` item (`Media → Part`, plus `Guid` external ids) into a `DuplicateGroup`, collapsing a `Media`'s parts under a shared `media_id`.
+Minimal token-authenticated Plex Web API client — a `JsonHttpClient` subclass with an `X-Plex-Token` auth header. Fetches library sections and the raw duplicate `Metadata` for a section, paging via `X-Plex-Container-Start/Size`. Also holds `build_duplicate_group`, the pure parser that turns one raw `Metadata` item (`Media → Part`, plus `Guid` external ids) into a `DuplicateGroup`, collapsing a `Media`'s parts under a shared `media_id`.
 
 ### `dedupe.py`
 
@@ -87,7 +93,7 @@ The read-only orchestrator (`PlexDuplicateReporter`), mirroring `service.py`'s `
 
 ### `arr.py` (optional)
 
-An optional Radarr/Sonarr association layer that enriches the report with whether each copy is `*arr`-tracked — so a redundant copy Radarr/Sonarr tracks is flagged as "delete via the `*arr` or it re-downloads", while an untracked copy is confirmed safe. Two thin `urllib` clients (`RadarrClient`, `SonarrClient`) reuse the `qbittorrent.py`/`plex.py` pattern — custom `ArrClientError`, TLS-verify toggle, timeouts, `X-Api-Key` header (never in a URL). `annotate` is a pure transform over analyzed `DuplicateGroup`s.
+An optional Radarr/Sonarr association layer that enriches the report with whether each copy is `*arr`-tracked — so a redundant copy Radarr/Sonarr tracks is flagged as "delete via the `*arr` or it re-downloads", while an untracked copy is confirmed safe. Two thin clients (`RadarrClient`, `SonarrClient`) subclass the shared `JsonHttpClient` base — custom `ArrClientError`, TLS-verify toggle, timeouts, `X-Api-Key` header (never in a URL). `annotate` is a pure transform over analyzed `DuplicateGroup`s.
 
 The join differs by kind, because the two id joins are not equally reliable. **Movies** are *id-anchored*: Plex's `tmdb://` guid is the same TMDB id Radarr keys on, so within a group whose id Radarr tracks, the basename-matching copy is `tracked` and the other redundant copies are `untracked` (safe); if the id is absent, not in Radarr, or no basename matches, every copy is `unknown`. **Episodes** match by *basename only*: Plex's episode `Guid`s are episode-level, not the series TVDB id Sonarr keys on, so a copy whose basename Sonarr tracks is `tracked` and any other copy is `unknown` — never falsely `untracked`. The reporter constructs a client only when both its URL and API key are set; an unconfigured layer leaves the report byte-identical to a Plex-only run, and a configured-but-unreachable `*arr` logs a warning and degrades that kind to `unknown` rather than failing the report.
 
