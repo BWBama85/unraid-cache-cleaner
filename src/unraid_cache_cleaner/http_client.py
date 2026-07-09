@@ -34,6 +34,20 @@ from . import USER_AGENT
 from .http_redirect import build_handler
 
 
+class JsonHttpError(RuntimeError):
+    """Fallback ``*ClientError`` for a subclass that omits :attr:`error_class`.
+
+    Every real client sets its own ``*ClientError``; this only exists so the
+    base's ``error_class(message, *, status_code=None)`` contract holds even for
+    a subclass that forgot to, surfacing a plain error instead of an opaque
+    ``TypeError`` on the first non-2xx response.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class JsonHttpClient:
     """Shared ``urllib`` plumbing for the read-oriented service clients.
 
@@ -48,8 +62,10 @@ class JsonHttpClient:
     #: interpolate a secret into it.
     service_name: str = ""
     #: The subclass's ``*ClientError`` type. Must accept
-    #: ``error_class(message, *, status_code=None)`` — every client's does.
-    error_class: Type[RuntimeError] = RuntimeError
+    #: ``error_class(message, *, status_code=None)`` — every client's does. The
+    #: default satisfies that contract so a forgetful subclass fails loudly, not
+    #: with an opaque ``TypeError``.
+    error_class: Type[RuntimeError] = JsonHttpError
 
     def __init__(
         self,

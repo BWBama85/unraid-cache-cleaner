@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import urllib.error
 import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
@@ -55,20 +54,6 @@ class QbittorrentClient(JsonHttpClient):
     def _auth_headers(self) -> Sequence[Tuple[str, str]]:
         return (("Referer", self.base_url),)
 
-    def _on_http_error(self, exc: urllib.error.HTTPError) -> Exception:
-        # ``status_code`` lets the 403 re-auth path in ``_request`` recognize the
-        # rejection without re-inspecting the raw ``HTTPError``.
-        body = exc.read().decode("utf-8", errors="replace")
-        return QbittorrentClientError(
-            f"HTTP {exc.code} from qBittorrent: {body}", status_code=exc.code
-        )
-
-    def _on_url_error(self, exc: urllib.error.URLError) -> Exception:
-        return QbittorrentClientError(f"Unable to connect to qBittorrent: {exc.reason}")
-
-    def _on_os_error(self, exc: OSError) -> Exception:
-        return QbittorrentClientError(f"Unable to reach qBittorrent: {exc}")
-
     def _request(
         self,
         method: str,
@@ -94,6 +79,9 @@ class QbittorrentClient(JsonHttpClient):
         try:
             return self._read_text(request)
         except QbittorrentClientError as exc:
+            # ``status_code`` is set by the base ``_on_http_error``; only an HTTP
+            # response carries one, so a connect/read failure (status_code None)
+            # correctly falls through to re-raise.
             if exc.status_code == 403 and allow_reauth and api_path != "/api/v2/auth/login":
                 self.login(force=True)
                 return self._request(

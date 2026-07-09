@@ -120,7 +120,10 @@ login = qb_open(
     data=urllib.parse.urlencode({"username": user, "password": pw}).encode(),
     timeout=20,
 ).read().decode().strip()
-if login != "Ok.":
+# "Ok." is the normal success body; an empty body is qBittorrent's auth-bypass
+# 204 (whitelisted subnet / localhost) — the packaged client treats both as
+# success, so the diagnostic must too or it goes dark on exactly those setups.
+if login not in ("Ok.", ""):
     raise SystemExit(f"ERROR: qBittorrent login failed (response: {login!r})")
 
 torrents = json.load(qb_open(url + "/api/v2/torrents/info?filter=all", timeout=30))
