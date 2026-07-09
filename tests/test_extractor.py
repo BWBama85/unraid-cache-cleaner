@@ -956,8 +956,12 @@ class RealBinaryTests(unittest.TestCase):
             self.assertTrue(payload.exists())
             self.assertEqual(payload.read_text(), "hello from a committed rar fixture\n")
 
+    @unittest.skipUnless(shutil.which("lsar"), "lsar not installed")
     def test_real_lsar_lists_members(self) -> None:
         # Validate the lsar -json parsing against the actual binary, not a fake.
+        # Gated on `lsar` specifically: member enumeration derives lsar from unar,
+        # and a host with unar but no lsar would fail (list_members → None) rather
+        # than skip. (The two normally ship in one package.)
         with _Fixture() as fx:
             archive = self._fixture_archive(fx.watch_root)
             members = UnarArchiveTool("unar").list_members(archive)
