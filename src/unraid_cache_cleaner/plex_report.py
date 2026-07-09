@@ -43,12 +43,24 @@ def _fmt_gib(num_bytes: int) -> str:
     return f"{num_bytes / _GIB:.1f} GiB"
 
 
-def _copy_json(copy: MediaCopy, *, include_arr: bool = False) -> dict:
+def _copy_json(
+    copy: MediaCopy,
+    parts: Sequence[MediaCopy],
+    *,
+    include_arr: bool = False,
+) -> dict:
     payload = {
         "file": str(copy.file),
         "size": copy.size,
         "resolution": copy.resolution,
         "bitrate": copy.bitrate,
+        # Each physical file backing this copy with its own true size, so a
+        # stacked multi-part copy (cd1/cd2 under one Plex media_id) exposes both
+        # paths and their individual sizes instead of hiding the siblings behind
+        # the first part's path and the summed size (#17). Always present and a
+        # single element for an unstacked copy, so a consumer can read
+        # ``copy["parts"]`` unconditionally.
+        "parts": [{"file": str(part.file), "size": part.size} for part in parts],
     }
     # Only serialized when the arr layer ran, so a Plex-only report stays
     # byte-identical to the pre-#8 shape.
@@ -201,18 +213,39 @@ class PlexDuplicateReporter:
         return (-group.reclaimable_bytes, group.kind, group.rating_key)
 
     def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
-        keeper = group.keeper
+        pairs = dedupe.rank_copies_with_parts(group)
+
+        if group.classification == dedupe.MISMATCH:
+            # A mismatch group's copies are the *physical* files (stacks NOT
+            # merged) so an operator reviewing the conflict sees each conflicting
+            # path and its true size, not one stack-merged copy at the summed
+            # size (#25). Each physical copy is its own single part.
+            copies = [
+                _copy_json(copy, [copy], include_arr=include_arr)
+                for copy in dedupe.rank_physical_copies(group)
+            ]
+        else:
+            copies = [
+                _copy_json(logical, parts, include_arr=include_arr)
+                for logical, parts in pairs
+            ]
+
+        # The keeper is, by construction, the best-ranked logical copy — i.e. the
+        # first pair — so pair it with that pair's physical parts for the
+        # per-file breakdown (#17). ``rank_copies_with_parts`` sorts identically
+        # to the ``rank_copies`` call that set ``group.keeper``.
+        keeper_json = None
+        if group.keeper is not None and pairs:
+            keeper_json = _copy_json(group.keeper, pairs[0][1], include_arr=include_arr)
+
         return {
             "rating_key": group.rating_key,
             "title": group.title,
             "kind": group.kind,
             "classification": group.classification,
             "reclaimable_bytes": group.reclaimable_bytes,
-            "keeper": _copy_json(keeper, include_arr=include_arr) if keeper is not None else None,
-            "copies": [
-                _copy_json(copy, include_arr=include_arr)
-                for copy in dedupe.rank_copies(group)
-            ],
+            "keeper": keeper_json,
+            "copies": copies,
         }
 
     def build_payload(self, report: DuplicateReport) -> dict:
@@ -253,6 +286,15 @@ class PlexDuplicateReporter:
         """The copies a reclaim would delete: every logical copy but the keeper."""
 
         return dedupe.rank_copies(group)[1:]
+
+    @staticmethod
+    def _reclaim_candidates_with_parts(
+        group: DuplicateGroup,
+    ) -> List[Tuple[MediaCopy, List[MediaCopy]]]:
+        """Reclaim candidates paired with their physical parts, so a stacked
+        tracked copy can be listed as each of its part files (#17)."""
+
+        return dedupe.rank_copies_with_parts(group)[1:]
 
     def _arr_reclaimable_tracked_count(self, report: DuplicateReport) -> int:
         """Count reclaim-candidate copies an *arr tracks (delete ⇒ re-download)."""
@@ -415,12 +457,18 @@ class PlexDuplicateReporter:
                 "SONARR_URL/SONARR_API_KEY to flag copies that re-download when deleted."
             ]
 
-        flagged: List[Tuple[DuplicateGroup, List[MediaCopy]]] = []
+        flagged: List[Tuple[DuplicateGroup, List[Tuple[MediaCopy, List[MediaCopy]]]]] = []
         unknown_count = 0
         for group in reclaimable:
-            candidates = self._reclaim_candidates(group)
-            tracked = [copy for copy in candidates if copy.association == arr.TRACKED]
-            unknown_count += sum(1 for copy in candidates if copy.association == arr.UNKNOWN)
+            candidates = self._reclaim_candidates_with_parts(group)
+            tracked = [
+                (logical, parts)
+                for logical, parts in candidates
+                if logical.association == arr.TRACKED
+            ]
+            unknown_count += sum(
+                1 for logical, _ in candidates if logical.association == arr.UNKNOWN
+            )
             if tracked:
                 flagged.append((group, tracked))
         if not flagged:
@@ -437,13 +485,17 @@ class PlexDuplicateReporter:
         shown = flagged if limit is None else flagged[:limit]
         rows: List[str] = []
         for group, tracked in shown:
-            service = tracked[0].arr_tracked or "*arr"
+            service = tracked[0][0].arr_tracked or "*arr"
             rows.append(f"  {group.kind:<7} {group.title}  (tracked by {service})")
-            for copy in tracked:
-                rows.append(
-                    f"      {_fmt_gib(copy.size):>10}  "
-                    f"{(copy.resolution or '?'):<6} {copy.file}"
-                )
+            # List each physical part of a tracked copy at its own size, so a
+            # stacked release shows every file that must be removed via the *arr,
+            # not just the first part at the summed size (#17).
+            for logical, parts in tracked:
+                for part in parts:
+                    rows.append(
+                        f"      {_fmt_gib(part.size):>10}  "
+                        f"{(logical.resolution or '?'):<6} {part.file}"
+                    )
         rows.extend(self._truncation_note(len(flagged), len(shown)))
         rows.append(
             "  Delete these via Radarr/Sonarr (or unmonitor first) or they re-download."
@@ -459,7 +511,10 @@ class PlexDuplicateReporter:
         rows: List[str] = []
         for group in shown:
             rows.append(f"  {group.kind:<7} {group.title}")
-            for copy in dedupe.rank_copies(group):
+            # Physical copies (stacks NOT merged): show each conflicting file at
+            # its own size so a mis-stacked pair (cd1/cd2 under one media_id)
+            # surfaces both paths, not a single summed row (#25).
+            for copy in dedupe.rank_physical_copies(group):
                 rows.append(
                     f"      {_fmt_gib(copy.size):>10}  "
                     f"{(copy.resolution or '?'):<6} {copy.file}"
