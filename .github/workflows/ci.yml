@@ -29,6 +29,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install unar (real-binary extraction test)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends unar
+
       - name: Install package
         run: pip install -e .
 

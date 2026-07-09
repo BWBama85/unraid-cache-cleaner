@@ -14,6 +14,7 @@ constructor so tests pass a fake and ``unrar``/``p7zip`` can be adapted later.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -60,6 +61,18 @@ class ArchiveTool(Protocol):
         ...
 
     def extract(self, archive: Path, dest_dir: Path) -> None:
+        ...
+
+    def list_members(self, archive: Path) -> Optional[Sequence[Path]]:
+        """Return the archive's file members, or ``None`` if unenumerable.
+
+        Members are archive-relative paths (the caller maps them under the
+        destination dir); directory entries are omitted. ``None`` — no listing
+        tool, tool error, or unparseable output — tells the extractor to fall
+        back to the ``(mtime, size)`` filesystem diff. Implementations are
+        optional: :class:`Extractor` degrades to the diff for any tool lacking
+        this method.
+        """
         ...
 
 
@@ -128,6 +141,22 @@ def _parse_owner(owner: str) -> Tuple[int, int]:
     if len(parts) != 2:
         raise ValueError(f"expected uid:gid, got {owner!r}")
     return int(parts[0]), int(parts[1])
+
+
+def _safe_member_path(dest_dir: Path, member: Path) -> Optional[Path]:
+    """Map an archive member to its normalized path under ``dest_dir``.
+
+    Returns ``None`` for an absolute member or one containing a ``..`` component —
+    a malicious or malformed archive must never resolve a produced-output path
+    outside the destination dir. Normalization is lexical (``normalize_path``
+    never dereferences symlinks), matching ``_finalize_output``'s guarantees; the
+    result is only ever intersected with paths ``os.walk`` actually visited under
+    ``dest_dir``, so it can neither invent a path nor escape the tree.
+    """
+
+    if member.is_absolute() or ".." in member.parts:
+        return None
+    return normalize_path(dest_dir / member)
 
 
 class UnarArchiveTool:
@@ -203,6 +232,45 @@ class UnarArchiveTool:
             raise ExtractorError(
                 f"{self.tool} exited {proc.returncode} for {archive.name}: {tail}"
             )
+
+    def list_members(self, archive: Path) -> Optional[Sequence[Path]]:
+        """Enumerate the archive's file members via ``lsar -json``.
+
+        Returns the file members as archive-relative paths (directory entries are
+        dropped), or ``None`` when they cannot be enumerated — no ``lsar`` on
+        PATH, a non-zero exit, an empty/garbled payload, or a subprocess error.
+        ``None`` is a fail-closed signal: the extractor falls back to the
+        ``(mtime, size)`` diff rather than mis-reporting an empty produced set.
+        """
+
+        if not self.list_tool or shutil.which(self.list_tool) is None:
+            return None
+        try:
+            proc = self._runner(
+                [self.list_tool, "-json", str(archive)],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        try:
+            payload = json.loads(proc.stdout)
+        except (ValueError, TypeError):
+            return None
+        contents = payload.get("lsarContents") if isinstance(payload, dict) else None
+        if not isinstance(contents, list):
+            return None
+        members: List[Path] = []
+        for entry in contents:
+            if not isinstance(entry, dict) or entry.get("XADIsDirectory"):
+                continue
+            name = entry.get("XADFileName")
+            if isinstance(name, str) and name:
+                members.append(Path(name))
+        return members
 
 
 class Extractor:
@@ -421,7 +489,7 @@ class Extractor:
         # but still surface the produced paths as ``outputs`` so this cycle protects
         # the media it just wrote rather than deleting it as an orphan.
         try:
-            new_files = self._finalize_output(dest_dir, before_files, before_dirs)
+            new_files = self._finalize_output(archive, dest_dir, before_files, before_dirs)
         except Exception as exc:  # noqa: BLE001 - keep the archive, retry next run
             if claim_token is not None:
                 self.ledger.release(archive, token=claim_token)
@@ -451,27 +519,34 @@ class Extractor:
 
     def _finalize_output(
         self,
+        archive: Path,
         dest_dir: Path,
         before_files: "Dict[Path, Tuple[float, int]]",
         before_dirs: set,
     ) -> Tuple[Path, ...]:
         """One post-extraction walk: record the produced files and chown them.
 
-        A file counts as *produced* when its path is new **or** its ``(mtime, size)``
-        fingerprint changed since the pre-extraction snapshot — ``unar`` overwrites
-        in place, so an overwritten output (e.g. a partial file a failed prior
-        attempt left behind, or an already-unpacked media file) differs from the
-        copy it replaced and is still protected. (A file the tool overwrites with
+        A file counts as *produced* when its path is new, when its ``(mtime, size)``
+        fingerprint changed since the pre-extraction snapshot, **or** when the
+        archive's own member list names it. ``unar`` overwrites in place, so an
+        overwritten output (e.g. a partial file a failed prior attempt left behind,
+        or an already-unpacked media file) usually differs from the copy it
+        replaced and the fingerprint diff records it. The member list closes that
+        heuristic's one blind spot (#43): a file the tool overwrites with
         byte-identical content *and* a restored identical mtime is indistinguishable
-        from untouched here; recording those precisely needs the archive's own
-        member list — tracked in #43.) Only produced files (and newly created
-        directories) are chowned — never untouched siblings, which for a loose
-        archive at a watch root would be the whole mount — and symlinks are never
-        followed. A chown miss is warned once and never aborts output collection:
-        freshly extracted media must be protected even when the process lacks
-        ``CAP_CHOWN``.
+        from untouched by the diff alone, yet the archive still declares it, so it is
+        still protected. When the tool cannot enumerate members the produced set is
+        exactly the fingerprint diff (the prior behavior). Member names are matched
+        only against paths ``os.walk`` actually visited under ``dest_dir``, so the
+        member list can never invent a path, follow a symlink, or escape the tree.
+        Only produced files (and newly created directories) are chowned — never
+        untouched siblings, which for a loose archive at a watch root would be the
+        whole mount — and symlinks are never followed. A chown miss is warned once
+        and never aborts output collection: freshly extracted media must be
+        protected even when the process lacks ``CAP_CHOWN``.
         """
 
+        expected_members = self._expected_member_paths(archive, dest_dir)
         owner = self._resolve_owner()
         produced: List[Path] = []
         chown_ok = owner is not None
@@ -486,7 +561,8 @@ class Extractor:
                     continue
                 fingerprint = (stat_result.st_mtime, stat_result.st_size)
                 prior = before_files.get(path)
-                if prior is not None and prior == fingerprint:
+                unchanged = prior is not None and prior == fingerprint
+                if unchanged and path not in expected_members:
                     continue  # untouched pre-existing file (e.g. the source archive)
                 produced.append(path)
                 if chown_ok:
@@ -497,6 +573,29 @@ class Extractor:
                     continue
                 chown_ok = self._chown_entry(path, owner, dest_dir)
         return tuple(produced)
+
+    def _expected_member_paths(self, archive: Path, dest_dir: Path) -> "frozenset[Path]":
+        """The archive's members mapped to normalized paths under ``dest_dir``.
+
+        An empty set is the fail-closed fallback: it is returned whenever the tool
+        lacks ``list_members``, cannot enumerate the archive (returns ``None``), or
+        raises — in which case ``_finalize_output`` degrades to the pure
+        ``(mtime, size)`` diff. Members that would resolve outside ``dest_dir``
+        (absolute or ``..``) are dropped by :func:`_safe_member_path`.
+        """
+
+        lister = getattr(self.tool, "list_members", None)
+        if lister is None:
+            return frozenset()
+        try:
+            members = lister(archive)
+        except Exception as exc:  # noqa: BLE001 - fall back to the fingerprint diff
+            LOGGER.debug("member enumeration failed for %s: %s", archive, exc)
+            return frozenset()
+        if not members:
+            return frozenset()
+        mapped = (_safe_member_path(dest_dir, Path(member)) for member in members)
+        return frozenset(path for path in mapped if path is not None)
 
     def _resolve_owner(self) -> Optional[Tuple[int, int]]:
         if not self.config.extract_owner:

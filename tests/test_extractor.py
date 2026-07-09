@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -20,10 +21,11 @@ from unraid_cache_cleaner.extractor import (
     UnarArchiveTool,
     _derive_list_tool,
     _parse_owner,
+    _safe_member_path,
     summarize,
 )
 from unraid_cache_cleaner.models import CLAIM_NEW, ClaimResult
-from unraid_cache_cleaner.planner import normalize_path
+from unraid_cache_cleaner.planner import is_within, normalize_path
 from unraid_cache_cleaner.state import StateExtractionLedger, StateStore
 
 
@@ -64,6 +66,11 @@ class _RecordingLedger:
         self.released.append((archive, token))
 
 
+# Sentinel: FakeTool.list_members derives the member list from the archive name
+# (mirroring what extract() writes) unless a test pins an explicit result.
+_DERIVE_MEMBERS = object()
+
+
 class FakeTool:
     """Stand-in for the injected archive tool; records calls, no subprocess."""
 
@@ -75,14 +82,17 @@ class FakeTool:
         test_raises: Exception | None = None,
         extract_raises: Exception | None = None,
         fail_names: set[str] | None = None,
+        list_members_result: object = _DERIVE_MEMBERS,
     ) -> None:
         self.available = available
         self.test_result = test_result
         self.test_raises = test_raises
         self.extract_raises = extract_raises
         self.fail_names = fail_names or set()
+        self.list_members_result = list_members_result
         self.test_calls: list[Path] = []
         self.extract_calls: list[tuple[Path, Path]] = []
+        self.list_members_calls: list[Path] = []
 
     def is_available(self) -> bool:
         return self.available
@@ -101,6 +111,13 @@ class FakeTool:
             raise ExtractorError(f"boom: {archive.name}")
         # Simulate a real extraction so ownership/os.walk paths have something.
         (dest_dir / (Path(archive.name).stem + ".mkv")).write_text("extracted")
+
+    def list_members(self, archive: Path) -> list[Path] | None:
+        self.list_members_calls.append(archive)
+        if self.list_members_result is not _DERIVE_MEMBERS:
+            return self.list_members_result  # type: ignore[return-value]
+        # Mirror the single .mkv that extract() writes.
+        return [Path(Path(archive.name).stem + ".mkv")]
 
 
 def _make_config(
@@ -665,6 +682,100 @@ class LedgerIdempotencyTests(unittest.TestCase):
             self.assertEqual(len(tool2.extract_calls), 1)  # re-invoked
 
 
+class _IdenticalOverwriteTool(FakeTool):
+    """Overwrites the output with byte-identical content *and* a restored mtime.
+
+    This is the one overwrite the ``(mtime, size)`` diff cannot see (#43): a real
+    archive tool preserves member timestamps, so re-extracting a file that already
+    holds the archive's exact bytes leaves the fingerprint untouched. Only the
+    archive's member list reveals that the file is a produced output.
+    """
+
+    CONTENT = "byte-identical-extracted-content"
+
+    def extract(self, archive: Path, dest_dir: Path) -> None:
+        self.extract_calls.append((archive, dest_dir))
+        target = dest_dir / (Path(archive.name).stem + ".mkv")
+        old_mtime = target.stat().st_mtime if target.exists() else None
+        target.write_text(self.CONTENT)
+        if old_mtime is not None:
+            os.utime(target, (old_mtime, old_mtime))  # restore member timestamp
+
+
+class MemberListOutputTests(unittest.TestCase):
+    """Precise produced-output detection via the archive's member list (#43)."""
+
+    def _seed_identical_output(self, fx: "_Fixture") -> Path:
+        """Pre-seed movie.mkv with the exact bytes+mtime a re-extract will restore."""
+
+        fx.write_rar("rel/movie.rar")
+        mkv = fx.write_rar("rel/movie.mkv", content=_IdenticalOverwriteTool.CONTENT)
+        os.utime(mkv, (1000.0, 1000.0))
+        return normalize_path(fx.watch_root / "rel" / "movie.mkv")
+
+    def test_byte_identical_overwrite_recorded_via_member_list(self) -> None:
+        with _Fixture() as fx:
+            mkv = self._seed_identical_output(fx)
+            before = os.stat(mkv)
+            store = StateStore(fx.config().state_db_path)
+            extractor = Extractor(
+                fx.config(), tool=_IdenticalOverwriteTool(), ledger=StateExtractionLedger(store)
+            )
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            after = os.stat(mkv)
+            # The fingerprint is genuinely unchanged: the diff alone is blind here.
+            self.assertEqual((before.st_mtime, before.st_size), (after.st_mtime, after.st_size))
+            self.assertEqual([r.status for r in results], ["extracted"])
+            self.assertIn(mkv, results[0].outputs)  # caught only by the member list
+            self.assertIn(mkv, store.get_protected_extracted_paths(0.0, protect_seconds=10**9))
+
+    def test_fallback_to_fingerprint_when_members_unavailable(self) -> None:
+        # With member enumeration unavailable, the byte-identical overwrite reverts
+        # to being invisible (documents the fallback), while a genuinely new file is
+        # still detected — the fingerprint diff is intact.
+        with _Fixture() as fx:
+            mkv = self._seed_identical_output(fx)
+            fx.write_rar("rel/extra.rar")  # produces extra.mkv (a brand-new file)
+            store = StateStore(fx.config().state_db_path)
+            tool = _IdenticalOverwriteTool(list_members_result=None)
+            extractor = Extractor(fx.config(), tool=tool, ledger=StateExtractionLedger(store))
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertTrue(tool.list_members_calls)  # enumeration was attempted
+            outputs = {p for r in results for p in r.outputs}
+            self.assertNotIn(mkv, outputs)  # blind spot: unchanged fingerprint, no member list
+            self.assertIn(normalize_path(fx.watch_root / "rel" / "extra.mkv"), outputs)  # new file still caught
+
+    def test_member_outside_dest_dir_is_never_recorded(self) -> None:
+        # A malicious/malformed archive naming a traversal member must not resolve a
+        # produced-output path outside dest_dir.
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            store = StateStore(fx.config().state_db_path)
+            tool = FakeTool(list_members_result=[Path("../escape.mkv"), Path("/abs/escape.mkv")])
+            extractor = Extractor(fx.config(), tool=tool, ledger=StateExtractionLedger(store))
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])
+            for path in {p for r in results for p in r.outputs}:
+                self.assertTrue(is_within(path, fx.watch_root), f"{path} escaped dest dir")
+            self.assertFalse((fx.watch_root.parent / "escape.mkv").exists())
+
+    def test_safe_member_path_rejects_traversal_and_absolute(self) -> None:
+        dest = Path("/data/rel")
+        self.assertEqual(_safe_member_path(dest, Path("movie.mkv")), normalize_path(dest / "movie.mkv"))
+        self.assertEqual(
+            _safe_member_path(dest, Path("sub/movie.mkv")), normalize_path(dest / "sub" / "movie.mkv")
+        )
+        self.assertIsNone(_safe_member_path(dest, Path("../escape.mkv")))
+        self.assertIsNone(_safe_member_path(dest, Path("sub/../../escape.mkv")))
+        self.assertIsNone(_safe_member_path(dest, Path("/abs/escape.mkv")))
+
+
 class IncompleteRootsTests(unittest.TestCase):
     def test_archive_under_incomplete_torrent_is_deferred(self) -> None:
         with _Fixture() as fx:
@@ -756,37 +867,101 @@ class UnarArchiveToolTests(unittest.TestCase):
         self.assertTrue(tool.test(Path("/data/rel/movie.rar")))
         self.assertEqual(calls, [])
 
+    def test_list_members_parses_json_and_drops_directories(self) -> None:
+        payload = json.dumps(
+            {
+                "lsarContents": [
+                    {"XADFileName": "movie.mkv", "XADFileSize": 10},
+                    {"XADFileName": "subs", "XADIsDirectory": 1},
+                    {"XADFileName": "sub/movie.srt"},
+                ]
+            }
+        )
+        runner, calls = self._runner(0, stdout=payload)
+        tool = UnarArchiveTool("unar", list_tool=sys.executable, runner=runner)
 
+        members = tool.list_members(Path("/data/rel/movie.rar"))
+
+        self.assertEqual(members, [Path("movie.mkv"), Path("sub/movie.srt")])
+        self.assertIn("-json", calls[0])
+        self.assertEqual(calls[0][-1], "/data/rel/movie.rar")
+
+    def test_list_members_none_without_list_tool(self) -> None:
+        runner, calls = self._runner(0, stdout="{}")
+        tool = UnarArchiveTool("p7zip", runner=runner)  # no derived lsar
+
+        self.assertIsNone(tool.list_members(Path("/data/rel/movie.rar")))
+        self.assertEqual(calls, [])  # never shelled out
+
+    def test_list_members_none_on_bad_json(self) -> None:
+        runner, _ = self._runner(0, stdout="not-json{{")
+        tool = UnarArchiveTool("unar", list_tool=sys.executable, runner=runner)
+
+        self.assertIsNone(tool.list_members(Path("/data/rel/movie.rar")))
+
+    def test_list_members_none_on_nonzero_exit(self) -> None:
+        runner, _ = self._runner(1, stdout="{}")
+        tool = UnarArchiveTool("unar", list_tool=sys.executable, runner=runner)
+
+        self.assertIsNone(tool.list_members(Path("/data/rel/movie.rar")))
+
+
+_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+def _load_fixture_generator():
+    """Import the committed stdlib RAR4 generator by path (tests/ is not a package)."""
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "make_rar_fixture", _FIXTURES_DIR / "make_rar_fixture.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(shutil.which("unar"), "unar not installed")
 class RealBinaryTests(unittest.TestCase):
-    @unittest.skipUnless(shutil.which("unar"), "unar not installed")
-    def test_real_unar_extraction_roundtrip(self) -> None:
-        rar = shutil.which("rar")
-        if rar is None:
-            self.skipTest("no `rar` creator available to build a fixture at runtime")
+    """Drive the real ``unar``/``lsar`` binaries against the committed fixture (#39)."""
 
+    def _fixture_archive(self, dest_dir: Path) -> Path:
+        """Copy the committed ``hello.rar`` into ``dest_dir`` (regenerate if absent)."""
+
+        committed = _FIXTURES_DIR / "hello.rar"
+        archive = dest_dir / "hello.rar"
+        if committed.exists():
+            shutil.copyfile(committed, archive)
+        else:  # never shells out to a `rar` creator — reuse the committed generator
+            gen = _load_fixture_generator()
+            archive.write_bytes(gen.build_rar4(gen.FIXTURE_MEMBER, gen.FIXTURE_CONTENT))
+        return archive
+
+    def test_real_unar_extraction_roundtrip(self) -> None:
         with _Fixture() as fx:
             rel = fx.watch_root / "release"
             rel.mkdir()
-            payload = rel / "hello.txt"
-            payload.write_text("hello from a real rar")
-            archive = rel / "sample.rar"
-            subprocess.run(
-                [rar, "a", "-ep", str(archive), "hello.txt"],
-                cwd=str(rel),
-                check=True,
-                capture_output=True,
-            )
-            payload.unlink()  # force extraction to re-create it
+            self._fixture_archive(rel)
 
             extractor = Extractor(
                 fx.config(extract_min_age_seconds=0),
-                clock=lambda: archive.stat().st_mtime + 10_000,
+                clock=lambda: (rel / "hello.rar").stat().st_mtime + 10_000,
             )
             results = extractor.extract_all((fx.watch_root,), dry_run=False)
 
             self.assertEqual([r.status for r in results], ["extracted"])
+            payload = rel / "hello.txt"
             self.assertTrue(payload.exists())
-            self.assertEqual(payload.read_text(), "hello from a real rar")
+            self.assertEqual(payload.read_text(), "hello from a committed rar fixture\n")
+
+    def test_real_lsar_lists_members(self) -> None:
+        # Validate the lsar -json parsing against the actual binary, not a fake.
+        with _Fixture() as fx:
+            archive = self._fixture_archive(fx.watch_root)
+            members = UnarArchiveTool("unar").list_members(archive)
+            self.assertEqual(members, [Path("hello.txt")])
 
 
 if __name__ == "__main__":
