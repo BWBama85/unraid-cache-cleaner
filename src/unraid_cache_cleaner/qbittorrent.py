@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import json
-import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence, Tuple
 
-from . import USER_AGENT
-from .http_redirect import build_handler
+from .http_client import JsonHttpClient
 from .models import TorrentRecord
 
 
@@ -24,8 +22,17 @@ class QbittorrentClientError(RuntimeError):
         self.status_code = status_code
 
 
-class QbittorrentClient:
-    """Small authenticated client for the qBittorrent WebUI API."""
+class QbittorrentClient(JsonHttpClient):
+    """Small authenticated client for the qBittorrent WebUI API.
+
+    Shares the fail-closed opener + transport taxonomy of
+    :class:`~unraid_cache_cleaner.http_client.JsonHttpClient`, but keeps its own
+    request flow: a session ``CookieJar``, a ``Referer`` header, form-encoded
+    login POST, plaintext responses, and a one-shot 403 re-authentication.
+    """
+
+    service_name = "qBittorrent"
+    error_class = QbittorrentClientError
 
     def __init__(
         self,
@@ -36,38 +43,31 @@ class QbittorrentClient:
         timeout_seconds: int = 15,
         verify_tls: bool = True,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
-        self.timeout_seconds = timeout_seconds
-        self.verify_tls = verify_tls
         self._cookie_jar = CookieJar()
-        self._opener = self._build_opener()
         self._authenticated = False
+        super().__init__(base_url, timeout_seconds=timeout_seconds, verify_tls=verify_tls)
 
-    def _build_opener(self) -> urllib.request.OpenerDirector:
-        handlers: list[urllib.request.BaseHandler] = [
-            urllib.request.HTTPCookieProcessor(self._cookie_jar),
-            build_handler(
-                self.base_url,
-                service_name="qBittorrent",
-                error_factory=QbittorrentClientError,
-            ),
-        ]
+    def _extra_handlers(self) -> Sequence[urllib.request.BaseHandler]:
+        return (urllib.request.HTTPCookieProcessor(self._cookie_jar),)
 
-        if urllib.parse.urlparse(self.base_url).scheme == "https":
-            context = ssl.create_default_context()
-            if not self.verify_tls:
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-            handlers.append(urllib.request.HTTPSHandler(context=context))
+    def _auth_headers(self) -> Sequence[Tuple[str, str]]:
+        return (("Referer", self.base_url),)
 
-        opener = urllib.request.build_opener(*handlers)
-        opener.addheaders = [
-            ("Referer", self.base_url),
-            ("User-Agent", USER_AGENT),
-        ]
-        return opener
+    def _on_http_error(self, exc: urllib.error.HTTPError) -> Exception:
+        # ``status_code`` lets the 403 re-auth path in ``_request`` recognize the
+        # rejection without re-inspecting the raw ``HTTPError``.
+        body = exc.read().decode("utf-8", errors="replace")
+        return QbittorrentClientError(
+            f"HTTP {exc.code} from qBittorrent: {body}", status_code=exc.code
+        )
+
+    def _on_url_error(self, exc: urllib.error.URLError) -> Exception:
+        return QbittorrentClientError(f"Unable to connect to qBittorrent: {exc.reason}")
+
+    def _on_os_error(self, exc: OSError) -> Exception:
+        return QbittorrentClientError(f"Unable to reach qBittorrent: {exc}")
 
     def _request(
         self,
@@ -78,11 +78,6 @@ class QbittorrentClient:
         form_data: Optional[Dict[str, str]] = None,
         allow_reauth: bool = True,
     ) -> str:
-        encoded_params = urllib.parse.urlencode(params or {})
-        url = f"{self.base_url}{api_path}"
-        if encoded_params:
-            url = f"{url}?{encoded_params}"
-
         request_data = None
         headers = {}
         if form_data is not None:
@@ -90,17 +85,16 @@ class QbittorrentClient:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
 
         request = urllib.request.Request(
-            url,
+            self._build_url(api_path, params),
             data=request_data,
             method=method,
             headers=headers,
         )
 
         try:
-            with self._opener.open(request, timeout=self.timeout_seconds) as response:
-                return response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 403 and allow_reauth and api_path != "/api/v2/auth/login":
+            return self._read_text(request)
+        except QbittorrentClientError as exc:
+            if exc.status_code == 403 and allow_reauth and api_path != "/api/v2/auth/login":
                 self.login(force=True)
                 return self._request(
                     method,
@@ -109,10 +103,7 @@ class QbittorrentClient:
                     form_data=form_data,
                     allow_reauth=False,
                 )
-            body = exc.read().decode("utf-8", errors="replace")
-            raise QbittorrentClientError(f"HTTP {exc.code} from qBittorrent: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise QbittorrentClientError(f"Unable to connect to qBittorrent: {exc.reason}") from exc
+            raise
 
     def login(self, *, force: bool = False) -> None:
         """Authenticate against the WebUI API."""

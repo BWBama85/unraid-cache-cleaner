@@ -15,6 +15,8 @@ Single package: `src/unraid_cache_cleaner/`.
 | `cli.py` | `argparse` subcommands (`scan`, `service`) + `main()` dispatch and exit codes |
 | `config.py` | `Config` frozen dataclass, `from_env()`, env parsing helpers |
 | `models.py` | Frozen data records (`TorrentRecord`, `FileRecord`, …) + mutable `RunReport` |
+| `http_client.py` | Shared `urllib` JSON-HTTP base (`JsonHttpClient`): fail-closed opener, request/JSON path, error taxonomy |
+| `http_redirect.py` | Fail-closed `HostBoundRedirectHandler` the base installs on every opener |
 | `qbittorrent.py` | Minimal `urllib` WebUI client + `QbittorrentClientError` |
 | `scanner.py` | `os.walk` filesystem scan, symlink/glob skipping |
 | `planner.py` | Protection plan, path normalization, orphan detection |
@@ -27,7 +29,7 @@ Tests live in `tests/` and run with `unittest`.
 
 - **Stdlib only. No third-party runtime dependencies.** `pyproject.toml` has no `[project.dependencies]`; keep it that way. HTTP is `urllib`, not `requests`.
 - **`Config` is a frozen dataclass with NO field defaults** (`config.py`), constructed field-by-field in tests. **Append new fields with defaults** so existing `Config(...)` calls and `from_env` keep working; wire each into `from_env()` and, if it's a persisted path, `ensure_directories()`.
-- **New external services follow the `qbittorrent.py` pattern:** a small `urllib`-based client class + a custom `SomethingClientError(RuntimeError)`; TLS-verify toggle; timeouts; no login secrets in logs.
+- **New external services subclass `http_client.JsonHttpClient`:** the shared `urllib` base owns opener construction (fail-closed redirect guard + TLS-verify toggle), the request/read/JSON-decode path, and the `HTTPError`/`URLError`/`OSError` → `*ClientError` taxonomy. A new client sets `service_name` + `error_class` (a custom `SomethingClientError(RuntimeError)`), supplies its credential via `_auth_headers()` (never in a URL), and overrides an `_on_*_error` hook only for a status-specific message. qBittorrent additionally uses `_extra_handlers()` (cookie jar) and keeps its own `_request` for the form-POST login + 403 reauth. No login secrets in logs.
 - **`pathlib.Path` everywhere** (not string paths). Reuse `planner.normalize_path`.
 - **Per-module loggers:** `LOGGER = logging.getLogger(__name__)`. One compact structured summary line per run.
 - **Safety-first / fail-closed:** default to the safe mode (`DRY_RUN=true`; the Plex report is **read-only**). Missing credentials or mounts should stop with a clear message, not guess.

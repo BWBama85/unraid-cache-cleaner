@@ -7,8 +7,9 @@ opens — including the one it builds internally to follow a 3xx — so a
 misconfigured endpoint or an interposing reverse proxy that 301/302s to a
 different host would otherwise receive the secret. :class:`HostBoundRedirectHandler`
 is the one guard all three share (see #12 for the original Plex-only fix and #22
-for the extraction); when the shared JSON-HTTP base of #20 lands it becomes the
-base's redirect handler.
+for the extraction); the shared JSON-HTTP base
+(:class:`~unraid_cache_cleaner.http_client.JsonHttpClient`, #20) installs it on
+every client opener via :func:`build_handler`.
 """
 
 from __future__ import annotations
