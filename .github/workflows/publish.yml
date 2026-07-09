@@ -53,7 +53,9 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      # Sign only the versioned release image (tag builds), not :latest/:sha.
+      # Sign only on tag builds; the signature is on the pushed index digest, so
+      # every tag resolving to it (vX.Y.Z, sha-*) verifies. :latest is built from
+      # main, never reaches this step, and stays unsigned.
       - name: Install cosign
         if: startsWith(github.ref, 'refs/tags/v')
         uses: sigstore/cosign-installer@v3
