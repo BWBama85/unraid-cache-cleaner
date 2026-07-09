@@ -14,6 +14,22 @@ CLAIM_BUSY = "busy"  # a fresh claim is held elsewhere; skip this cycle
 
 
 @dataclass(frozen=True)
+class ClaimResult:
+    """Outcome of claiming an archive for extraction (#41).
+
+    ``decision`` is one of the ``CLAIM_*`` constants. ``token`` is a random
+    per-claim ownership token, set only when ``decision == CLAIM_NEW``: the caller
+    must present it back to ``complete``/``release`` so a claim reclaimed by a
+    concurrent run after the TTL cannot be silently promoted or dropped by the
+    original (crashed-then-resurrected) owner. It is ``None`` for ``CLAIM_DONE`` /
+    ``CLAIM_BUSY``, where the caller neither extracts nor records.
+    """
+
+    decision: str
+    token: str | None = None
+
+
+@dataclass(frozen=True)
 class TorrentRecord:
     """Minimal torrent data needed for cleanup decisions."""
 

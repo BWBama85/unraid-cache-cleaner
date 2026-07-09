@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from .config import Config
-from .models import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW, FileRecord
+from .models import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW, ClaimResult, FileRecord
 from .planner import is_within_any, normalize_path
 from .scanner import scan_filesystem
 
@@ -69,18 +69,25 @@ class ExtractionLedger(Protocol):
     Absent (``None``), the extractor re-processes every archive every run — the
     behavior of the foundation slice and of the pure unit tests. Present, it makes
     extraction idempotent across runs and claim-safe against a concurrent run.
+
+    ``claim`` takes the archive's on-disk ``size``/``mtime`` so the ledger can tell
+    a genuinely new archive from a re-seen one at the same path, and returns a
+    :class:`ClaimResult` carrying an ownership ``token`` the caller threads back
+    into ``complete``/``release`` (#41).
     """
 
-    def claim(self, archive: Path, now: float) -> str:
-        """Return ``CLAIM_NEW`` / ``CLAIM_DONE`` / ``CLAIM_BUSY`` for ``archive``."""
+    def claim(self, archive: Path, now: float, *, size: int, mtime: float) -> ClaimResult:
+        """Return the claim decision + ownership token for ``archive``."""
         ...
 
-    def complete(self, archive: Path, outputs: Sequence[Path], now: float) -> None:
-        """Record a successful extraction and its output files."""
+    def complete(
+        self, archive: Path, outputs: Sequence[Path], now: float, *, token: Optional[str]
+    ) -> None:
+        """Record a successful extraction and its output files under ``token``."""
         ...
 
-    def release(self, archive: Path) -> None:
-        """Drop an in-flight claim so a deferred/failed archive retries."""
+    def release(self, archive: Path, *, token: Optional[str]) -> None:
+        """Drop our in-flight claim (matched by ``token``) so the archive retries."""
         ...
 
 
@@ -324,13 +331,19 @@ class Extractor:
                         )
                     )
                     continue
-                results.append(self._extract_one(archive, dry_run=dry_run, now=now))
+                results.append(
+                    self._extract_one(
+                        archive, dry_run=dry_run, now=now, newest_mtime=newest_mtime
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 - one bad archive must not abort the run
                 LOGGER.warning("Unexpected error processing %s: %s", archive, exc)
                 results.append(ExtractionResult(archive, FAILED, str(exc)))
         return results
 
-    def _extract_one(self, archive: Path, *, dry_run: bool, now: float) -> ExtractionResult:
+    def _extract_one(
+        self, archive: Path, *, dry_run: bool, now: float, newest_mtime: float
+    ) -> ExtractionResult:
         dest_dir = archive.parent
 
         # Dry-run is a read-only preview: it neither claims nor records, so it does
@@ -338,30 +351,46 @@ class Extractor:
         # would_extract, matching the spec). A live run claims *before* the
         # integrity test so a concurrent run can't also grab the archive; the
         # claim is released on any defer/failure so the archive retries next cycle.
-        claimed = False
+        # The claim carries the archive's (size, mtime) so a different archive later
+        # written to this path re-extracts, and returns a token that authorizes our
+        # later complete/release against a concurrent stale-claim reclaim (#41).
+        claim_token: Optional[str] = None
         if self.ledger is not None and not dry_run:
-            decision = self.ledger.claim(archive, now)
-            if decision == CLAIM_DONE:
+            try:
+                stat_result = archive.stat()
+            except OSError as exc:
+                return ExtractionResult(
+                    archive, DEFERRED_INCOMPLETE, f"archive stat failed: {exc}"
+                )
+            # Identity = (first-volume size, the set's newest mtime). Using the set's
+            # newest mtime — the same value the settle guard tracks — rather than the
+            # first volume's own means a re-download that changes only a continuation
+            # volume (``.part02.rar`` / legacy ``.rNN``) shifts the fingerprint and is
+            # re-extracted, instead of being wrongly skipped as CLAIM_DONE.
+            claim = self.ledger.claim(
+                archive, now, size=stat_result.st_size, mtime=newest_mtime
+            )
+            if claim.decision == CLAIM_DONE:
                 return ExtractionResult(
                     archive, SKIPPED_PRESENT, "already extracted", output_dir=dest_dir
                 )
-            if decision == CLAIM_BUSY:
+            if claim.decision == CLAIM_BUSY:
                 return ExtractionResult(
                     archive, SKIPPED_PRESENT, "claimed by another run", output_dir=dest_dir
                 )
-            claimed = True
+            claim_token = claim.token
 
         try:
             integrity_ok = self.tool.test(archive)
         except Exception as exc:  # noqa: BLE001 - a failed test just defers the archive
-            if claimed:
-                self.ledger.release(archive)
+            if claim_token is not None:
+                self.ledger.release(archive, token=claim_token)
             return ExtractionResult(
                 archive, DEFERRED_INCOMPLETE, f"integrity test error: {exc}"
             )
         if not integrity_ok:
-            if claimed:
-                self.ledger.release(archive)
+            if claim_token is not None:
+                self.ledger.release(archive, token=claim_token)
             return ExtractionResult(
                 archive,
                 DEFERRED_INCOMPLETE,
@@ -382,8 +411,8 @@ class Extractor:
         try:
             self.tool.extract(archive, dest_dir)
         except Exception as exc:  # noqa: BLE001 - surface, keep the archive, retry next run
-            if claimed:
-                self.ledger.release(archive)
+            if claim_token is not None:
+                self.ledger.release(archive, token=claim_token)
             return ExtractionResult(archive, FAILED, str(exc))
 
         # The produced files are identified first (a cheap filesystem walk), then
@@ -394,8 +423,8 @@ class Extractor:
         try:
             new_files = self._finalize_output(dest_dir, before_files, before_dirs)
         except Exception as exc:  # noqa: BLE001 - keep the archive, retry next run
-            if claimed:
-                self.ledger.release(archive)
+            if claim_token is not None:
+                self.ledger.release(archive, token=claim_token)
             return ExtractionResult(
                 archive, FAILED, f"post-extraction bookkeeping failed: {exc}"
             )
@@ -405,10 +434,10 @@ class Extractor:
             # does not age its output past the protection window before this cycle
             # can protect it.
             try:
-                self.ledger.complete(archive, new_files, self.clock())
+                self.ledger.complete(archive, new_files, self.clock(), token=claim_token)
             except Exception as exc:  # noqa: BLE001 - keep the archive, retry next run
-                if claimed:
-                    self.ledger.release(archive)
+                if claim_token is not None:
+                    self.ledger.release(archive, token=claim_token)
                 return ExtractionResult(
                     archive,
                     FAILED,
@@ -435,7 +464,7 @@ class Extractor:
         copy it replaced and is still protected. (A file the tool overwrites with
         byte-identical content *and* a restored identical mtime is indistinguishable
         from untouched here; recording those precisely needs the archive's own
-        member list — tracked in #41.) Only produced files (and newly created
+        member list — tracked in #43.) Only produced files (and newly created
         directories) are chowned — never untouched siblings, which for a loose
         archive at a watch root would be the whole mount — and symlinks are never
         followed. A chown miss is warned once and never aborts output collection:
