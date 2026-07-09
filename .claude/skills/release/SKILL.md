@@ -1,7 +1,7 @@
 ---
 name: release
 description: Cut a versioned release of unraid-cache-cleaner. Bumps the version, updates CHANGELOG.md, commits + tags vX.Y.Z on main, pushes, creates the GitHub Release, and surfaces the GHCR publish run.
-argument-hint: '[patch|minor|major] | --version vX.Y.Z | --dry-run [patch|minor|major]'
+argument-hint: '[patch|minor|major] [--auto-changelog] | --version vX.Y.Z | --dry-run [patch|minor|major]'
 allowed-tools: Bash, Read, Write, Edit
 user-invocable: true
 ---
@@ -12,7 +12,7 @@ Cut a versioned release of `unraid-cache-cleaner` end-to-end and surface the res
 
 > **Bespoke, not ported.** getrich's `release` skill drives `git-cliff` + `cliff.toml` + `scripts/release.mjs` + a deploy workflow — none of which exist here. This is a from-scratch rewrite: **stdlib-only, `gh`/`git` directly**, no changelog engine, no deploy step. Only the portable ideas were kept (preflight, release-goal gate, authored notes discipline, milestone roll, fix-forward safety).
 
-**$ARGUMENTS** — bump level (`patch` | `minor` | `major`), or `--version vX.Y.Z` for an explicit version, or `--dry-run [bump]` to preview without committing/pushing. Default: `patch`. The **first** release ignores the bump arg and is always **`v1.0.0`** (owner-locked decision).
+**$ARGUMENTS** — bump level (`patch` | `minor` | `major`), or `--version vX.Y.Z` for an explicit version, or `--dry-run [bump]` to preview without committing/pushing. Default: `patch`. Add `--auto-changelog` to draft the `CHANGELOG.md` section mechanically from `git log` instead of authoring the highlights by hand (opt-in; see [CHANGELOG.md](#changelogmd--authored-by-default-or---auto-changelog)). The **first** release ignores the bump arg and is always **`v1.0.0`** (owner-locked decision).
 
 ## What a release is here
 
@@ -27,11 +27,12 @@ Resolve `$ARGUMENTS` up front so the goal gate (dry-run skip) and version comput
 
 ```bash
 setopt sh_word_split 2>/dev/null || true    # zsh: split $ARGUMENTS on spaces like bash
-LEVEL="patch"; EXPLICIT_VERSION=""; DRY_RUN=0; _next_ver=""
+LEVEL="patch"; EXPLICIT_VERSION=""; DRY_RUN=0; AUTO_CHANGELOG=0; _next_ver=""
 for arg in $ARGUMENTS; do
   case "$arg" in
     patch|minor|major) LEVEL="$arg" ;;
     --dry-run)         DRY_RUN=1 ;;
+    --auto-changelog)  AUTO_CHANGELOG=1 ;;
     --version)         _next_ver=1 ;;         # value is the next token
     --version=*)       EXPLICIT_VERSION="${arg#--version=}" ;;
     v[0-9]*)           [ -n "$_next_ver" ] && { EXPLICIT_VERSION="$arg"; _next_ver=""; } ;;
@@ -43,7 +44,7 @@ done
 if [ -n "$EXPLICIT_VERSION" ] && ! printf '%s' "$EXPLICIT_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
   echo "ERROR: --version must be vX.Y.Z (got '$EXPLICIT_VERSION')"; exit 1
 fi
-echo "level=$LEVEL explicit=${EXPLICIT_VERSION:-none} dry_run=$DRY_RUN"
+echo "level=$LEVEL explicit=${EXPLICIT_VERSION:-none} dry_run=$DRY_RUN auto_changelog=$AUTO_CHANGELOG"
 ```
 
 ## Preflight — abort with zero side effects on any failure
@@ -126,7 +127,7 @@ git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null && { echo "ERROR: tag 
 git ls-remote --exit-code --tags origin "$VERSION" >/dev/null 2>&1 && { echo "ERROR: tag $VERSION already exists on origin"; exit 1; }
 ```
 
-## CHANGELOG.md — authored, stdlib-only (no git-cliff)
+## CHANGELOG.md — authored by default, or `--auto-changelog`
 
 Prepend a new section to `CHANGELOG.md` (create the file on the first cut). Format:
 
@@ -154,9 +155,23 @@ gh pr list --state merged --base main --limit 60 --json number,title \
 TODAY="$(date -u +%Y-%m-%d)"
 ```
 
-**Author `### Highlights`** (the value this skill adds over a bare commit dump): open with one sentence naming the theme of the cut, group by subsystem (qBittorrent cleanup, Plex duplicates, `*arr` layer, infra/docs), lead with operator impact, cite PR/issue numbers inline. Scale length to the release — v1.0.0 earns a few themed paragraphs; a patch earns two sentences. Put the `git log $RANGE` output under `### Changes`.
+The authored path is the **default** — the human narrative is the value this skill adds over a bare commit dump.
 
-Insert the section with the Write/Edit tools **directly below the `<!-- release sections are inserted below this line, newest first -->` marker** in `CHANGELOG.md` (i.e. under the `# Changelog` preamble, above any prior version section) so newest stays first and the header preamble is preserved.
+**Author `### Highlights`:** open with one sentence naming the theme of the cut, group by subsystem (qBittorrent cleanup, Plex duplicates, `*arr` layer, infra/docs), lead with operator impact, cite PR/issue numbers inline. Scale length to the release — v1.0.0 earns a few themed paragraphs; a patch earns two sentences. Put the `git log $RANGE` output under `### Changes`.
+
+### Opt-in: `--auto-changelog`
+
+When `AUTO_CHANGELOG=1` (the operator passed `--auto-changelog`, handy for a routine patch cut), draft the whole section mechanically instead — a stdlib-only helper (no `git-cliff`, no new deps) groups `git log $RANGE` by conventional-commit type and drafts a first-pass `### Highlights` from the `feat`/breaking commits. Output is deterministic (fixed category order, `git log` order within a group, every commit preserved once — unrecognized types and non-conventional subjects land under `Other`):
+
+```bash
+python3 scripts/generate_changelog.py --version "$VERSION" --range "$RANGE" --date "$TODAY" \
+  > /tmp/changelog-section-$NUMERIC.md
+cat /tmp/changelog-section-$NUMERIC.md   # review before inserting
+```
+
+Treat the output as a **draft**: the `### Highlights` block carries a `<!-- First-pass draft … -->` reminder — tighten it into a real narrative (and delete the reminder) before committing. The helper emits the exact `## [X.Y.Z]` / `### Highlights` / `### Changes` headings the [release-note extraction](#create-the-github-release) below depends on; leave those intact.
+
+Insert the section (authored or drafted) with the Write/Edit tools **directly below the `<!-- release sections are inserted below this line, newest first -->` marker** in `CHANGELOG.md` (i.e. under the `# Changelog` preamble, above any prior version section) so newest stays first and the header preamble is preserved.
 
 On a `--dry-run`, write the section but do not commit — inspect `git diff`, then discard or re-run for real.
 
@@ -195,7 +210,13 @@ git push --atomic origin main "$VERSION"
 
 The second `-m` supplies the `Co-Authored-By` trailer `CLAUDE.md` requires on every commit.
 
-The push will prompt for confirmation (it is not on the settings allow-list, by design — a release is the point to have a human in the loop). Never `--force`, never `--no-verify`. The preflight and publish-run inspection commands (`gh run list/view/watch`, `gh release list/view`, `git ls-remote`, `gh label list` — all read-only — plus the idempotent `gh label create release-blocker` bootstrap) *are* allow-listed in `.claude/settings.json`, so the only steps that prompt are the three consequential writes: the annotated `git tag`, this push, and `gh release create`.
+Never `--force`, never `--no-verify`. The three consequential writes — the annotated `git tag`, this push, and `gh release create` — are meant to be the human-in-the-loop checkpoint; a release is the point to keep a person watching. The read-only preflight/inspection commands (`gh run list/view/watch`, `gh release list/view`, `git ls-remote`, `gh label list`, plus the idempotent `gh label create release-blocker` bootstrap) are allow-listed in `.claude/settings.json`; the three writes are deliberately kept off it.
+
+> **⚠️ Absence-from-the-allow-list is *not* a reliable checkpoint.** Claude Code evaluates permissions **deny → ask → allow**, and an `allow` from *any* scope skips the prompt — the effective allow-list is the union of tracked `.claude/settings.json`, the per-user gitignored `.claude/settings.local.json`, **and a skill's own `allowed-tools` frontmatter**. Two silent traps (nothing in the repo signals the checkpoint was lost):
+> - **This skill's `allowed-tools: Bash`** grants *bare* `Bash`, which on its own pre-approves every command it runs — including `git push` / `git tag` / `gh release create`.
+> - **A broad local `settings.local.json` grant** (e.g. `Bash(gh release *)` or `Bash(git push:*)`) re-permits the writes on that one machine.
+>
+> The robust fix is a tracked **`permissions.ask`** rule for each write (`Bash(git push:*)`, `Bash(git tag -a:*)`, `Bash(gh release create:*)`): `ask`/`deny` rules apply in **every** mode and override any `allow` regardless of scope (even under `bypassPermissions`), so the prompt fires no matter which scope granted the write. That hardening is tracked as a follow-up. Until it lands, keep any local `gh release` / `git push` grant **narrowly scoped** — never a blanket `gh release *` or `git push:*` — and don't assume the bare-`Bash` `allowed-tools` grant leaves the checkpoint intact.
 
 ## Create the GitHub Release
 
