@@ -214,9 +214,6 @@ class PlexDuplicateReporter:
 
     def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
         pairs = dedupe.rank_copies_with_parts(group)
-        parts_by_copy = {
-            (logical.media_id, logical.part_id): parts for logical, parts in pairs
-        }
 
         if group.classification == dedupe.MISMATCH:
             # A mismatch group's copies are the *physical* files (stacks NOT
@@ -233,11 +230,13 @@ class PlexDuplicateReporter:
                 for logical, parts in pairs
             ]
 
-        keeper = group.keeper
+        # The keeper is, by construction, the best-ranked logical copy — i.e. the
+        # first pair — so pair it with that pair's physical parts for the
+        # per-file breakdown (#17). ``rank_copies_with_parts`` sorts identically
+        # to the ``rank_copies`` call that set ``group.keeper``.
         keeper_json = None
-        if keeper is not None:
-            keeper_parts = parts_by_copy.get((keeper.media_id, keeper.part_id), [keeper])
-            keeper_json = _copy_json(keeper, keeper_parts, include_arr=include_arr)
+        if group.keeper is not None and pairs:
+            keeper_json = _copy_json(group.keeper, pairs[0][1], include_arr=include_arr)
 
         return {
             "rating_key": group.rating_key,
