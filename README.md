@@ -309,17 +309,31 @@ See [docs/unraid.md](docs/unraid.md). A starter container template is included a
 
 ### Releases
 
-Versioning follows [SemVer](https://semver.org/); the git tag is the single source of truth for a release. Pushing a `vX.Y.Z` tag triggers [`publish.yml`](.github/workflows/publish.yml), which builds and pushes the versioned GHCR image. The first release is `v1.0.0`.
+Versioning follows [SemVer](https://semver.org/); the git tag is the single source of truth for a release. Pushing a `vX.Y.Z` tag triggers [`publish.yml`](.github/workflows/publish.yml), which builds and pushes the versioned GHCR image and **signs it** (see [Verifying the release image](#verifying-the-release-image)). The first release is `v1.0.0`.
 
 Maintainers cut releases with the **`/release`** Claude Code skill (`.claude/skills/release/`), which runs preflight (on `main`, clean tree, in sync with `origin/main`, CI green on `HEAD`), bumps the version in `pyproject.toml` and `src/unraid_cache_cleaner/__init__.py` (the client `User-Agent` derives from `__version__`, so there is no third string to touch), prepends a `CHANGELOG.md` section, commits + annotated-tags on `main`, pushes, and creates the GitHub Release from that changelog section:
 
 ```
 /release [patch|minor|major]     # default: patch
 /release --version v1.2.0        # explicit version
+/release --auto-changelog        # draft the changelog from git log instead of authoring it
 /release --dry-run minor         # preview the bump + changelog, no commit/tag/push
 ```
 
-The commit history and per-release notes live in [CHANGELOG.md](CHANGELOG.md).
+The changelog is authored by hand by default; `--auto-changelog` opts into a stdlib-only helper ([`scripts/generate_changelog.py`](scripts/generate_changelog.py)) that groups `git log` by conventional-commit type into a deterministic draft you refine before committing. The commit history and per-release notes live in [CHANGELOG.md](CHANGELOG.md).
+
+### Verifying the release image
+
+Each `vX.Y.Z` release image is signed keyless with [cosign](https://docs.sigstore.dev/) using GitHub Actions OIDC — no long-lived keys or extra secrets. Verify a pulled tag against the signing workflow's identity:
+
+```bash
+cosign verify \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate-identity-regexp "(?i)^https://github\.com/BWBama85/unraid-cache-cleaner/\.github/workflows/publish\.yml@refs/tags/v" \
+  ghcr.io/bwbama85/unraid-cache-cleaner:vX.Y.Z
+```
+
+A successful verification prints the signed claims; a tampered or unsigned image fails. Signing was added after `v1.0.0`, so it applies to releases cut from that point on.
 
 ## Project Layout
 
