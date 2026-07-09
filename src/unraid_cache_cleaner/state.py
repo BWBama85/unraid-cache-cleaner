@@ -116,12 +116,23 @@ class StateStore:
         exactly what the #41 fingerprint/token fields are. Idempotent: a fresh DB
         adds them all once; an already-migrated DB is a no-op. ``table``/column
         names are internal constants, never user input, so the f-string is safe.
+
+        Concurrency-safe across processes: the service and a one-shot ``extract`` can
+        both open the DB during an upgrade and each compute ``existing`` before the
+        other's ``ALTER`` commits, so the loser would hit ``duplicate column name``.
+        That is swallowed per column — the column exists either way, so the goal is
+        met — rather than aborting startup.
         """
 
         existing = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
         for name, ddl in columns.items():
-            if name not in existing:
+            if name in existing:
+                continue
+            try:
                 self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
     def sync_candidates(self, candidates: dict[Path, FileRecord], now: float) -> None:
         """Replace the live candidate set while preserving first_seen."""
@@ -277,18 +288,16 @@ class StateStore:
         stale ``claimed`` row or a superseded ``extracted`` one; either way the new
         token revokes the prior owner's write access.
 
-        The superseded archive's recorded outputs are dropped too: when a genuinely
-        different archive reuses this path, the previous archive's extracted files
-        (which may have unrelated names, so ``complete``'s per-path upsert would not
-        overwrite them) must stop being force-protected — otherwise now-orphaned
-        media stays undeletable until its window lapses. A stale-``claimed`` recovery
-        has no recorded outputs yet, so this is a no-op there.
+        The superseded archive's recorded outputs are intentionally *left in place*
+        here: reclaim happens at claim time, before the replacement has passed its
+        integrity test or extracted. Dropping the old outputs now would strip
+        protection from the previously extracted media, and a corrupt/aborted
+        replacement (which then ``release``s the claim without completing) would
+        leave that still-wanted media exposed to the orphan sweep. The old outputs
+        are replaced only once the new extraction succeeds — see
+        :meth:`complete_extraction`.
         """
 
-        self._connection.execute(
-            "DELETE FROM extraction_outputs WHERE archive_path = ?",
-            (key,),
-        )
         self._connection.execute(
             """
             UPDATE extractions
@@ -326,6 +335,17 @@ class StateStore:
             )
             if cursor.rowcount == 0:
                 return
+            # Now that extraction has succeeded, atomically replace this archive's
+            # protected outputs: drop the superseded set (a reused path's old files
+            # may have unrelated names that the per-path upsert below would not
+            # overwrite, leaving now-orphaned media force-protected) and record the
+            # new one. Deferring the drop to here — rather than at reclaim time —
+            # keeps the previous media protected right up until the replacement is
+            # safely on disk.
+            self._connection.execute(
+                "DELETE FROM extraction_outputs WHERE archive_path = ?",
+                (key,),
+            )
             if outputs:
                 self._connection.executemany(
                     """

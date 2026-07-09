@@ -331,13 +331,19 @@ class Extractor:
                         )
                     )
                     continue
-                results.append(self._extract_one(archive, dry_run=dry_run, now=now))
+                results.append(
+                    self._extract_one(
+                        archive, dry_run=dry_run, now=now, newest_mtime=newest_mtime
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 - one bad archive must not abort the run
                 LOGGER.warning("Unexpected error processing %s: %s", archive, exc)
                 results.append(ExtractionResult(archive, FAILED, str(exc)))
         return results
 
-    def _extract_one(self, archive: Path, *, dry_run: bool, now: float) -> ExtractionResult:
+    def _extract_one(
+        self, archive: Path, *, dry_run: bool, now: float, newest_mtime: float
+    ) -> ExtractionResult:
         dest_dir = archive.parent
 
         # Dry-run is a read-only preview: it neither claims nor records, so it does
@@ -351,17 +357,18 @@ class Extractor:
         claim_token: Optional[str] = None
         if self.ledger is not None and not dry_run:
             try:
-                # Fingerprints the archive as of the claim (a hair fresher than the
-                # scan). For a multi-volume set this is the first volume only — its
-                # (size, mtime) is the set's identity; a re-download that changes only
-                # a continuation volume is treated as the same archive.
                 stat_result = archive.stat()
             except OSError as exc:
                 return ExtractionResult(
                     archive, DEFERRED_INCOMPLETE, f"archive stat failed: {exc}"
                 )
+            # Identity = (first-volume size, the set's newest mtime). Using the set's
+            # newest mtime — the same value the settle guard tracks — rather than the
+            # first volume's own means a re-download that changes only a continuation
+            # volume (``.part02.rar`` / legacy ``.rNN``) shifts the fingerprint and is
+            # re-extracted, instead of being wrongly skipped as CLAIM_DONE.
             claim = self.ledger.claim(
-                archive, now, size=stat_result.st_size, mtime=stat_result.st_mtime
+                archive, now, size=stat_result.st_size, mtime=newest_mtime
             )
             if claim.decision == CLAIM_DONE:
                 return ExtractionResult(

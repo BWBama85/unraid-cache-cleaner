@@ -82,10 +82,11 @@ class ExtractionLedgerTests(unittest.TestCase):
         # Changed mtime alone (same size) → also a new archive.
         self.assertEqual(self._claim(archive, 1300.0, size=20, mtime=200.0).decision, CLAIM_NEW)
 
-    def test_reused_path_reclaim_drops_the_old_archives_protected_outputs(self) -> None:
-        # #41 fix 1 cleanup: when a different archive reuses a path, the previous
-        # archive's recorded outputs (which may have unrelated names) must stop being
-        # force-protected — otherwise now-orphaned media stays undeletable.
+    def test_reused_path_replaces_protected_outputs_on_completion(self) -> None:
+        # #41 fix 1 cleanup: when a different archive reuses a path and its extraction
+        # *succeeds*, the previous archive's recorded outputs (which may have
+        # unrelated names) must stop being force-protected — otherwise now-orphaned
+        # media stays undeletable.
         path = Path("/data/rel/movie.rar")
         old = self._claim(path, 1000.0, size=10, mtime=100.0)
         self.store.complete_extraction(path, [Path("/data/rel/old.mkv")], 1000.0, token=old.token)
@@ -103,6 +104,57 @@ class ExtractionLedgerTests(unittest.TestCase):
             self.store.get_protected_extracted_paths(2000.0, protect_seconds=10**9),
             {Path("/data/rel/new.mkv")},
         )
+
+    def test_reclaim_keeps_old_outputs_protected_until_replacement_completes(self) -> None:
+        # #41 fix 1, corrected: a reused path whose replacement is corrupt/incomplete
+        # (claim then release, never complete) must NOT strip protection from the
+        # previously extracted media — it is still the best copy on disk.
+        path = Path("/data/rel/movie.rar")
+        old = self._claim(path, 1000.0, size=10, mtime=100.0)
+        self.store.complete_extraction(path, [Path("/data/rel/old.mkv")], 1000.0, token=old.token)
+
+        # A different archive reuses the path (identity differs) → reclaim, but its
+        # integrity test / extraction fails, so the claim is released uncompleted.
+        replacement = self._claim(path, 2000.0, size=20, mtime=200.0)
+        self.assertEqual(replacement.decision, CLAIM_NEW)
+        self.store.release_extraction(path, token=replacement.token)
+
+        # The old media stays protected — not exposed to the orphan sweep.
+        self.assertEqual(
+            self.store.get_protected_extracted_paths(2000.0, protect_seconds=10**9),
+            {Path("/data/rel/old.mkv")},
+        )
+
+    def test_ensure_columns_tolerates_a_racing_duplicate_add(self) -> None:
+        # Two processes upgrading a pre-#41 DB can both snapshot the schema before
+        # either ALTER commits; the loser's ALTER then raises "duplicate column
+        # name". _ensure_columns must swallow that (the column exists either way)
+        # rather than crash startup, so a re-run of the migration is a no-op.
+        db = Path(self._tmp.name) / "race.sqlite3"
+        legacy = sqlite3.connect(db)
+        legacy.execute(
+            """
+            CREATE TABLE extractions (
+                archive_path TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                claimed_at REAL NOT NULL,
+                extracted_at REAL
+            )
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        store = StateStore(db)  # migrates once
+        # The DB genuinely rejects a duplicate ALTER — the precondition the guard
+        # relies on (and a guard against SQLite changing the error text).
+        with self.assertRaises(sqlite3.OperationalError) as ctx:
+            store._connection.execute("ALTER TABLE extractions ADD COLUMN size INTEGER")
+        self.assertIn("duplicate column name", str(ctx.exception).lower())
+        # Re-running the whole migration (as a second process would) does not raise.
+        store._ensure_columns("extractions", {"size": "INTEGER", "mtime": "REAL", "token": "TEXT"})
+        columns = {row["name"] for row in store._connection.execute("PRAGMA table_info(extractions)")}
+        self.assertTrue({"size", "mtime", "token"} <= columns)
 
     def test_reclaim_revokes_the_previous_owners_token(self) -> None:
         # #41 fix 2: after A's claim goes stale and B reclaims, A's late

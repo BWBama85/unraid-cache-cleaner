@@ -636,6 +636,34 @@ class LedgerIdempotencyTests(unittest.TestCase):
             self.assertEqual([r.status for r in results], ["extracted"])  # not skipped_present
             self.assertEqual(len(tool2.extract_calls), 1)  # re-invoked
 
+    def test_changed_continuation_volume_reextracts_the_set(self) -> None:
+        # A multi-volume set is keyed on part01, but identity uses the set's newest
+        # mtime: if a continuation volume is replaced (part01 unchanged), the set is
+        # re-extracted rather than wrongly skipped as CLAIM_DONE.
+        clock = lambda: 2_000_000.0  # noqa: E731 - far ahead of the fixture mtimes
+        with _Fixture() as fx:
+            part01 = fx.write_rar("rel/show.part01.rar")
+            part02 = fx.write_rar("rel/show.part02.rar")
+            os.utime(part01, (1_000_000, 1_000_000))
+            os.utime(part02, (1_000_000, 1_000_000))
+            store = StateStore(fx.config().state_db_path)
+
+            first = Extractor(
+                fx.config(), tool=(tool1 := FakeTool()), ledger=StateExtractionLedger(store), clock=clock
+            )
+            self.assertEqual([r.status for r in first.extract_all((fx.watch_root,), dry_run=False)], ["extracted"])
+            self.assertEqual(len(tool1.extract_calls), 1)
+
+            # Only the continuation volume changes (newer mtime); part01 is untouched.
+            os.utime(part02, (1_500_000, 1_500_000))
+            second = Extractor(
+                fx.config(), tool=(tool2 := FakeTool()), ledger=StateExtractionLedger(store), clock=clock
+            )
+            results = second.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])  # not skipped_present
+            self.assertEqual(len(tool2.extract_calls), 1)  # re-invoked
+
 
 class IncompleteRootsTests(unittest.TestCase):
     def test_archive_under_incomplete_torrent_is_deferred(self) -> None:
