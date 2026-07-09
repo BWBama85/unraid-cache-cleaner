@@ -70,35 +70,85 @@ def copy_sort_key(copy: MediaCopy) -> Tuple[int, int, int]:
     return (resolution_rank(copy.resolution), copy.bitrate, copy.size)
 
 
-def _merge_stacks(copies: Tuple[MediaCopy, ...]) -> List[MediaCopy]:
-    """Collapse stacked parts into one logical copy each.
+def _merge_stacks_with_parts(
+    copies: Tuple[MediaCopy, ...]
+) -> List[Tuple[MediaCopy, List[MediaCopy]]]:
+    """Collapse stacked parts into ``(logical_copy, physical_parts)`` pairs.
 
     Parts sharing a non-zero ``media_id`` belong to the same Plex ``Media``
     element (a title split across several files); they are one logical copy
     whose size is the sum of its parts, not a set of duplicates. ``media_id`` of
     ``0`` means ungrouped — each such copy stands on its own. First-appearance
-    order is preserved so ranking and keeper selection are deterministic.
+    order is preserved (for both the logical copies and the parts within each)
+    so ranking and keeper selection are deterministic.
+
+    Alongside each merged logical copy this returns the physical part copies
+    that composed it, so a report can show a stacked copy's individual files and
+    their true per-file sizes (#17) without re-deriving the ``media_id``
+    grouping from the raw copies.
     """
 
     logical: List[MediaCopy] = []
+    parts: List[List[MediaCopy]] = []
     stack_index: Dict[int, int] = {}
     for copy in copies:
         if copy.media_id == 0:
             logical.append(copy)
+            parts.append([copy])
             continue
         if copy.media_id in stack_index:
             idx = stack_index[copy.media_id]
             logical[idx] = replace(logical[idx], size=logical[idx].size + copy.size)
+            parts[idx].append(copy)
         else:
             stack_index[copy.media_id] = len(logical)
             logical.append(copy)
-    return logical
+            parts.append([copy])
+    return list(zip(logical, parts))
+
+
+def _merge_stacks(copies: Tuple[MediaCopy, ...]) -> List[MediaCopy]:
+    """Collapse stacked parts into one logical copy each (parts discarded)."""
+
+    return [logical for logical, _ in _merge_stacks_with_parts(copies)]
 
 
 def rank_copies(group: DuplicateGroup) -> List[MediaCopy]:
     """Return the group's logical copies sorted best-first."""
 
     return sorted(_merge_stacks(group.copies), key=copy_sort_key, reverse=True)
+
+
+def rank_copies_with_parts(
+    group: DuplicateGroup,
+) -> List[Tuple[MediaCopy, List[MediaCopy]]]:
+    """Return ``(logical_copy, physical_parts)`` pairs sorted best-first.
+
+    Mirrors :func:`rank_copies` but keeps each logical copy paired with the
+    physical part files that compose it, so a stacked multi-part copy can be
+    reported with each part's true path and size (#17). The ordering matches
+    :func:`rank_copies` exactly (same key, same stable sort), so the keeper is
+    always the first pair's logical copy.
+    """
+
+    return sorted(
+        _merge_stacks_with_parts(group.copies),
+        key=lambda pair: copy_sort_key(pair[0]),
+        reverse=True,
+    )
+
+
+def rank_physical_copies(group: DuplicateGroup) -> List[MediaCopy]:
+    """Return the group's physical copies (parts NOT merged) sorted best-first.
+
+    Unlike :func:`rank_copies`, stacked parts stay separate so a mismatch review
+    can show each conflicting physical file and its individual size (#25) rather
+    than a single stack-merged copy that hides the second file and reports the
+    summed size. A stable sort preserves parse order for parts that tie on
+    ``(resolution, bitrate, size)``.
+    """
+
+    return sorted(group.copies, key=copy_sort_key, reverse=True)
 
 
 def _is_mismatch(group: DuplicateGroup) -> bool:

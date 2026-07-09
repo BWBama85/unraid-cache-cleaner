@@ -77,13 +77,13 @@ Minimal token-authenticated Plex Web API client (same `urllib` + `*ClientError` 
 Pure, dependency-free analysis over the Plex models — no I/O. It:
 
 - ranks the copies in a group best-first by `(resolution_rank, bitrate, size)`, so a smaller-but-better encode (e.g. 1080p x265 under a 720p copy) is still kept;
-- merges stacked parts (copies sharing a Plex `media_id`) into a single logical copy, summing their sizes, so a split-file title is not mistaken for a duplicate;
+- merges stacked parts (copies sharing a Plex `media_id`) into a single logical copy, summing their sizes, so a split-file title is not mistaken for a duplicate — while `rank_copies_with_parts`/`rank_physical_copies` expose the underlying physical part files so the report can show each part's true path and size without changing the analysis math;
 - classifies each group as `identical`, `upgrade`, or `mismatch` — where `mismatch` means the copies' file paths carry different `{imdb-…}`/`{tmdb-…}` ids (Plex merged different titles);
 - computes reclaimable bytes under the hard safety rule that **mismatch groups are never counted as reclaimable**, and summarizes totals per section (`kind`) and overall.
 
 ### `plex_report.py`
 
-The read-only orchestrator (`PlexDuplicateReporter`), mirroring `service.py`'s `run_once → write_report → log_report` shape. It resolves the video sections to scan (explicit `--section`/`PLEX_SECTIONS` ids, or auto-detected movie/TV libraries), fetches and parses each section's duplicates, analyzes them with `dedupe`, then writes a stable `sort_keys` JSON report and renders a reclaimable-sorted table. The renderer is pure (`DuplicateReport → str`), and the reporter takes an injectable `clock` so the JSON is byte-identical across runs on the same input. The subcommand is wired in `cli.py` (`plex-duplicates`), which builds a `PlexClient` without touching the qBittorrent client or state DB.
+The read-only orchestrator (`PlexDuplicateReporter`), mirroring `service.py`'s `run_once → write_report → log_report` shape. It resolves the video sections to scan (explicit `--section`/`PLEX_SECTIONS` ids, or auto-detected movie/TV libraries), fetches and parses each section's duplicates, analyzes them with `dedupe`, then writes a stable `sort_keys` JSON report and renders a reclaimable-sorted table. The renderer is pure (`DuplicateReport → str`), and the reporter takes an injectable `clock` so the JSON is byte-identical across runs on the same input. Stacked multi-part copies are represented faithfully: each JSON copy carries a `parts` array of its physical files and true per-file sizes, and a `mismatch` group's `copies` are the physical parts (unmerged) so the review view surfaces each conflicting file rather than one stack-merged row. The subcommand is wired in `cli.py` (`plex-duplicates`), which builds a `PlexClient` without touching the qBittorrent client or state DB.
 
 ### `arr.py` (optional)
 

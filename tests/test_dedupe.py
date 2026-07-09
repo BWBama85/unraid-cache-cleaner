@@ -263,6 +263,45 @@ class StackTests(unittest.TestCase):
         )
         self.assertEqual(dedupe.analyze([group]), [])
 
+    def test_rank_copies_with_parts_pairs_logical_with_its_parts(self) -> None:
+        # rank_copies_with_parts mirrors rank_copies' order but keeps each merged
+        # logical copy paired with the physical parts that composed it (#17).
+        group = _group(
+            "movie",
+            "Stacked vs single",
+            _copy(1, "/m/cd1.mkv", 3 * GB, "1080", media_id=100),
+            _copy(2, "/m/cd2.mkv", 4 * GB, "1080", media_id=100),
+            _copy(3, "/m/single.mkv", 5 * GB, "1080", media_id=200),
+        )
+        pairs = dedupe.rank_copies_with_parts(group)
+
+        # Same ordering as rank_copies, and the keeper is the first pair's copy.
+        self.assertEqual([logical for logical, _ in pairs], dedupe.rank_copies(group))
+        (top_copy, top_parts), (next_copy, next_parts) = pairs
+        # The 7 GB stack outranks the 5 GB single (same resolution, larger size).
+        self.assertEqual(top_copy.size, 7 * GB)
+        self.assertEqual([p.part_id for p in top_parts], [1, 2])
+        self.assertEqual([p.size for p in top_parts], [3 * GB, 4 * GB])
+        # An unstacked copy yields a single-element parts list (itself).
+        self.assertEqual([p.part_id for p in next_parts], [3])
+        self.assertEqual(next_copy.size, 5 * GB)
+
+    def test_rank_physical_copies_keeps_parts_separate(self) -> None:
+        # rank_physical_copies never merges stacks, so a mis-stacked pair stays
+        # two physical copies at their individual sizes (#25).
+        group = _group(
+            "movie",
+            "Mis-stacked",
+            _copy(1, "/m/A {imdb-tt0100758}/cd1.mkv", 5 * GB, "1080", media_id=7),
+            _copy(2, "/m/B {imdb-tt1291150}/cd2.mkv", 9 * GB, "1080", media_id=7),
+        )
+        physical = dedupe.rank_physical_copies(group)
+
+        self.assertEqual(len(physical), 2)
+        self.assertEqual({c.size for c in physical}, {5 * GB, 9 * GB})
+        # best-first: the larger part sorts ahead on the size tiebreak
+        self.assertEqual([c.size for c in physical], [9 * GB, 5 * GB])
+
 
 class SummarizeTests(unittest.TestCase):
     def _probe_fixture(self) -> list:

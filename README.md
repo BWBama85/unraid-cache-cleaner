@@ -154,10 +154,21 @@ sections:
 - **Reclaimable (safe)** — duplicate/upgrade copies you can safely remove.
 - **Review — possible mismatches (not counted)** — items Plex merged from
   *different* titles (e.g. the 1990 and 2014 *TMNT*). These are **never** counted
-  as reclaimable; check them by hand.
+  as reclaimable; check them by hand. A mis-stacked pair (two different titles
+  Plex split across parts of one `Media`) lists **each** physical file at its
+  true size, so both conflicting paths are visible for review.
 - **⚠️ arr-tracked (Radarr/Sonarr)** — redundant copies that Radarr/Sonarr
   tracks; see below. Shows a "not configured" hint until you set `RADARR_*` /
   `SONARR_*`.
+
+For a **stacked multi-part copy** — one release Plex splits across several files
+(`cd1.mkv` + `cd2.mkv`) that share a `media_id` — the report keeps it as one
+logical copy (its size is the sum of the parts, the unit you keep or reclaim) but
+also lists every part file with its own true size. In the JSON each copy carries
+a `parts` array (`[{file, size}, …]`), always present and single-element for an
+unstacked copy, so an operator auditing the report sees an accurate file→size
+mapping for every physical file rather than only the first part at the summed
+size.
 
 Flags:
 

@@ -93,6 +93,64 @@ _EPISODE_IDENTICAL = _episode(
     ],
 )
 
+# A reclaimable movie whose keeper is a stacked 1080p release (cd1 + cd2 under a
+# single Plex media_id) worth 14 GiB, superseding a 720p single-file copy (#17).
+_MOVIE_STACKED = _movie(
+    "900",
+    "Stacked Movie",
+    [
+        _media(
+            20,
+            "1080",
+            9000,
+            [
+                _part(201, "/movies/Stacked Movie (2020)/cd1.mkv", 5 * GiB),
+                _part(202, "/movies/Stacked Movie (2020)/cd2.mkv", 9 * GiB),
+            ],
+        ),
+        _media(21, "720", 4000, [_part(211, "/movies/Stacked Movie (2020)/single.720.mkv", 4 * GiB)]),
+    ],
+)
+
+# Two DIFFERENT films mis-stacked under one media_id (conflicting {imdb-…} ids)
+# -> mismatch. The review must show BOTH physical parts at their true sizes, not
+# one 14 GiB merged row (#25).
+_MOVIE_STACKED_MISMATCH = _movie(
+    "950",
+    "Mis-stacked",
+    [
+        _media(
+            30,
+            "1080",
+            9000,
+            [
+                _part(301, "/movies/A (1990) {imdb-tt0100758}/cd1.mkv", 5 * GiB),
+                _part(302, "/movies/B (2014) {imdb-tt1291150}/cd2.mkv", 9 * GiB),
+            ],
+        ),
+    ],
+)
+
+# A movie whose reclaim candidate is a stacked 1080p copy Radarr tracks; the 4k
+# single-file copy is the keeper. Both share {tmdb-970} so it is not a mismatch.
+_MOVIE_ARR_STACKED = _movie(
+    "970",
+    "Arr Stacked",
+    [
+        _media(40, "4k", 20000, [_part(401, "/movies/Arr Stacked {tmdb-970}/best.4k.mkv", 20 * GiB)]),
+        _media(
+            41,
+            "1080",
+            9000,
+            [
+                _part(411, "/movies/Arr Stacked {tmdb-970}/cd1.1080.mkv", 4 * GiB),
+                _part(412, "/movies/Arr Stacked {tmdb-970}/cd2.1080.mkv", 5 * GiB),
+            ],
+        ),
+    ],
+    guids=["tmdb://970"],
+)
+
 
 # --------------------------------------------------------------------------- #
 # Fake client + config helpers                                                 #
@@ -548,7 +606,11 @@ class ArrAssociationTests(unittest.TestCase):
             self.assertNotIn("arr_tracked_reclaimable_count", payload["totals"])
             for group in payload["groups"]:
                 for copy in group["copies"]:
-                    self.assertEqual(set(copy), {"file", "size", "resolution", "bitrate"})
+                    # `parts` (the per-file breakdown, #17) is always present; a
+                    # Plex-only run must still carry no arr fields.
+                    self.assertEqual(
+                        set(copy), {"file", "size", "resolution", "bitrate", "parts"}
+                    )
             # table shows the not-configured hint, not a stale placeholder
             table = reporter.render_table(reporter.generate())
             self.assertIn("Not configured", table)
@@ -637,6 +699,126 @@ class ArrAssociationTests(unittest.TestCase):
             self.assertNotIn("all safe to delete", table)
             self.assertIn("verify those before deleting", table)
             self.assertIn("[arr:?]", table)
+
+
+# --------------------------------------------------------------------------- #
+# Stacked multi-part representation (#17 / #25)                                 #
+# --------------------------------------------------------------------------- #
+
+class StackedRepresentationTests(unittest.TestCase):
+    def _client(self, item) -> FakePlexClient:
+        return FakePlexClient(
+            [PlexSection(key="1", type="movie", title="Movies")], {("1", 1): [item]}
+        )
+
+    def test_stacked_reclaimable_copy_lists_both_parts_in_json(self) -> None:
+        # #17: a stacked logical copy exposes each physical file at its true size
+        # via `parts`, while the merged size, classification, reclaimable bytes,
+        # and logical copy count are unchanged.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED))
+            group = reporter.build_payload(reporter.generate())["groups"][0]
+
+            self.assertEqual(group["classification"], "upgrade")
+            self.assertEqual(group["reclaimable_bytes"], 4 * GiB)  # reclaim the 720p single
+            copies = group["copies"]
+            self.assertEqual(len(copies), 2)  # logical count: the stack + the single
+
+            stack = next(c for c in copies if c["file"].endswith("cd1.mkv"))
+            self.assertEqual(stack["size"], 14 * GiB)  # summed logical size, unchanged
+            self.assertEqual(
+                {Path(p["file"]).name: p["size"] for p in stack["parts"]},
+                {"cd1.mkv": 5 * GiB, "cd2.mkv": 9 * GiB},
+            )
+
+            single = next(c for c in copies if c["file"].endswith("single.720.mkv"))
+            self.assertEqual([Path(p["file"]).name for p in single["parts"]], ["single.720.mkv"])
+            self.assertEqual(single["parts"][0]["size"], 4 * GiB)
+
+            keeper = group["keeper"]
+            self.assertEqual(keeper["size"], 14 * GiB)
+            self.assertEqual(
+                {Path(p["file"]).name for p in keeper["parts"]}, {"cd1.mkv", "cd2.mkv"}
+            )
+
+    def test_stacked_json_is_byte_identical_across_runs(self) -> None:
+        # #17 acceptance: the richer per-part shape stays deterministic.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED))
+            first = json.dumps(reporter.build_payload(reporter.generate()), indent=2, sort_keys=True)
+            second = json.dumps(reporter.build_payload(reporter.generate()), indent=2, sort_keys=True)
+            self.assertEqual(first, second)
+
+    def test_stacked_mismatch_shows_both_physical_parts_in_json(self) -> None:
+        # #25: a mis-stacked pair is serialized as two physical copies at their
+        # individual sizes, not one 14 GiB stack-merged copy.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED_MISMATCH))
+            group = reporter.build_payload(reporter.generate())["groups"][0]
+
+            self.assertEqual(group["classification"], "mismatch")
+            self.assertEqual(group["reclaimable_bytes"], 0)  # reclaim math unchanged
+            copies = group["copies"]
+            self.assertEqual(len(copies), 2)
+            self.assertEqual(
+                {Path(c["file"]).name: c["size"] for c in copies},
+                {"cd1.mkv": 5 * GiB, "cd2.mkv": 9 * GiB},
+            )
+            self.assertNotIn(14 * GiB, [c["size"] for c in copies])  # never the merged sum
+            for copy in copies:  # each physical copy is its own single part
+                self.assertEqual(len(copy["parts"]), 1)
+                self.assertEqual(copy["parts"][0]["size"], copy["size"])
+
+    def test_stacked_mismatch_shows_both_physical_parts_in_table(self) -> None:
+        # #25: the "Review - possible mismatches" table lists both conflicting
+        # files at their true sizes, not a single 14 GiB summed row.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED_MISMATCH))
+            table = reporter.render_table(reporter.generate())
+
+            self.assertIn("/movies/A (1990) {imdb-tt0100758}/cd1.mkv", table)
+            self.assertIn("/movies/B (2014) {imdb-tt1291150}/cd2.mkv", table)
+            self.assertIn("5.0 GiB", table)
+            self.assertIn("9.0 GiB", table)
+            self.assertNotIn("14.0 GiB", table)  # the collapse bug this fixes
+            table.encode("ascii")  # stays ASCII
+
+    def test_stacked_tracked_copy_lists_each_part_in_arr_section(self) -> None:
+        # #17 (table) + arr: a stacked reclaim candidate Radarr tracks is listed
+        # as each of its physical parts, the count stays per-logical-copy, and the
+        # per-copy association survives the richer serialization.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({"970": {"cd1.1080.mkv"}})
+            reporter = _arr_reporter(tmp, self._client(_MOVIE_ARR_STACKED), radarr=radarr)
+            report = reporter.generate()
+            payload = reporter.build_payload(report)
+            table = reporter.render_table(report)
+
+            # one logical tracked reclaim candidate (the stack), not two parts
+            self.assertEqual(payload["totals"]["arr_tracked_reclaimable_count"], 1)
+
+            stack = next(
+                c for c in payload["groups"][0]["copies"] if c["file"].endswith("cd1.1080.mkv")
+            )
+            self.assertEqual(stack["association"], "tracked")
+            self.assertEqual(stack["arr_tracked"], "radarr")
+            self.assertEqual(
+                {Path(p["file"]).name: p["size"] for p in stack["parts"]},
+                {"cd1.1080.mkv": 4 * GiB, "cd2.1080.mkv": 5 * GiB},
+            )
+
+            # the arr-tracked table lists BOTH parts at their individual sizes
+            self.assertIn("cd1.1080.mkv", table)
+            self.assertIn("cd2.1080.mkv", table)
+            self.assertIn("4.0 GiB", table)
+            self.assertIn("5.0 GiB", table)
+            self.assertIn("tracked by radarr", table)
+            table.encode("ascii")
 
 
 if __name__ == "__main__":
