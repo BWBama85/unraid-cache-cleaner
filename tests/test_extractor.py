@@ -884,6 +884,8 @@ class UnarArchiveToolTests(unittest.TestCase):
 
         self.assertEqual(members, [Path("movie.mkv"), Path("sub/movie.srt")])
         self.assertIn("-json", calls[0])
+        # Mirror extract()'s -no-recursion: don't list an inner archive's members.
+        self.assertIn("-no-recursion", calls[0])
         self.assertEqual(calls[0][-1], "/data/rel/movie.rar")
 
     def test_list_members_none_without_list_tool(self) -> None:

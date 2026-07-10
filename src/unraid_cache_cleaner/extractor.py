@@ -241,13 +241,19 @@ class UnarArchiveTool:
         PATH, a non-zero exit, an empty/garbled payload, or a subprocess error.
         ``None`` is a fail-closed signal: the extractor falls back to the
         ``(mtime, size)`` diff rather than mis-reporting an empty produced set.
+
+        ``-no-recursion`` mirrors :meth:`extract`: ``lsar`` otherwise descends into
+        an archive nested *inside* this one and lists that inner archive's members
+        (names extraction never writes), while omitting the nested archive file it
+        does write — so the listing must use the same non-recursion flag as the
+        extraction to describe exactly what lands on disk.
         """
 
         if not self.list_tool or shutil.which(self.list_tool) is None:
             return None
         try:
             proc = self._runner(
-                [self.list_tool, "-json", str(archive)],
+                [self.list_tool, "-json", "-no-recursion", str(archive)],
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
