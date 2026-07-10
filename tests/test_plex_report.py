@@ -929,23 +929,31 @@ class RankOnceTests(unittest.TestCase):
         self.assertEqual(len(seen), len(set(seen)), "a group was ranked more than once")
         self.assertEqual(len(set(seen)), expected_groups)
 
-    def test_plexonly_render_and_json_rank_each_group_once(self) -> None:
+    @staticmethod
+    def _full_command(reporter, report):
+        # Mirror cli.run_plex_duplicates: JSON, then log line, then table — all
+        # for the same report, the sequence the memo must rank each group once
+        # across (not once per method).
+        reporter.write_report(report)
+        reporter.log_report(report)
+        reporter.render_table(report)
+
+    def test_full_command_ranks_each_group_once_total(self) -> None:
+        # #19 (P2): the whole write_report -> log_report -> render_table sequence
+        # ranks each group exactly once TOTAL, not once per output method.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             reporter = _reporter(tmp, self._client(_MOVIE_STACKED_RECLAIM, _MOVIE_UPGRADE))
             report = reporter.generate()
 
             self._assert_ranked_once(
-                lambda: reporter.render_table(report), expected_groups=2
-            )
-            self._assert_ranked_once(
-                lambda: reporter.build_payload(report), expected_groups=2
+                lambda: self._full_command(reporter, report), expected_groups=2
             )
 
-    def test_arr_render_ranks_each_group_once(self) -> None:
-        # The strongest case: with *arr on, one group's ranking feeds the
-        # reclaimable count, the arr tag, and the arr-tracked rows. Without the
-        # memo that group would be ranked several times in a single render.
+    def test_arr_full_command_ranks_each_group_once_total(self) -> None:
+        # The strongest case: with *arr on, one group's ranking feeds the JSON
+        # copies, the reclaimable count, the arr tag, the arr-tracked count, and
+        # the arr-tracked rows — across three output methods. Still once each.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             radarr = FakeArrClient({"970": {"cd1.1080.mkv"}})
@@ -955,11 +963,54 @@ class RankOnceTests(unittest.TestCase):
             report = reporter.generate()
 
             self._assert_ranked_once(
-                lambda: reporter.render_table(report), expected_groups=2
+                lambda: self._full_command(reporter, report), expected_groups=2
             )
+
+    def test_new_report_invalidates_memo(self) -> None:
+        # A second, independent report must not reuse the first's ranking — the
+        # memo is scoped to the report object, and (P1) two groups with an empty
+        # Plex rating_key must never collide onto one cache entry.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED_RECLAIM, _MOVIE_UPGRADE))
+            reporter.render_table(reporter.generate())  # warm the memo on report 1
+
+            report2 = reporter.generate()  # fresh report, fresh group objects
             self._assert_ranked_once(
-                lambda: reporter.build_payload(report), expected_groups=2
+                lambda: reporter.render_table(report2), expected_groups=2
             )
+
+    def test_empty_rating_key_groups_do_not_collide(self) -> None:
+        # #19 (P1): build_duplicate_group stores a missing Plex ratingKey as "",
+        # so two such groups must still rank independently — identity keying keeps
+        # group B from rendering group A's file paths.
+        # _movie's first arg is the ratingKey; "" reproduces a Plex item that
+        # omits it (build_duplicate_group stores the missing key as "").
+        blank_a = _movie(
+            "", "Alpha",
+            [
+                _media(1, "4k", 20000, [_part(1, "/m/Alpha/a.4k.mkv", 20 * GiB)]),
+                _media(2, "1080", 9000, [_part(2, "/m/Alpha/a.1080.mkv", 8 * GiB)]),
+            ],
+        )
+        blank_b = _movie(
+            "", "Beta",
+            [
+                _media(3, "4k", 20000, [_part(3, "/m/Beta/b.4k.mkv", 10 * GiB)]),
+                _media(4, "1080", 9000, [_part(4, "/m/Beta/b.1080.mkv", 4 * GiB)]),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(blank_a, blank_b))
+            groups = {g["title"]: g for g in reporter.build_payload(reporter.generate())["groups"]}
+
+            # each group's copies reference its OWN files, not the other's
+            alpha_files = {Path(c["file"]).name for c in groups["Alpha"]["copies"]}
+            beta_files = {Path(c["file"]).name for c in groups["Beta"]["copies"]}
+            self.assertEqual(alpha_files, {"a.4k.mkv", "a.1080.mkv"})
+            self.assertEqual(beta_files, {"b.4k.mkv", "b.1080.mkv"})
+            self.assertEqual(groups["Beta"]["reclaimable_bytes"], 4 * GiB)
 
 
 if __name__ == "__main__":

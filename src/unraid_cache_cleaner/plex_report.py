@@ -93,9 +93,14 @@ class PlexDuplicateReporter:
         self.radarr_client = radarr_client
         self.sonarr_client = sonarr_client
         self.clock = clock
-        # Per-render memo of each group's best-first ranking (see _ranked_pairs),
-        # keyed by the group's unique Plex rating_key.
-        self._rank_cache: Dict[str, List[Tuple[MediaCopy, List[MediaCopy]]]] = {}
+        # Per-report memo of each group's best-first ranking (see _ranked_pairs),
+        # keyed by object identity and scoped to one report (via _begin_render) so
+        # the JSON, log, and table outputs of a single command share one ranking
+        # per group instead of re-ranking in each.
+        self._rank_cache: Dict[
+            int, Tuple[DuplicateGroup, List[Tuple[MediaCopy, List[MediaCopy]]]]
+        ] = {}
+        self._rank_cache_report: Optional[DuplicateReport] = None
 
     @property
     def _arr_enabled(self) -> bool:
@@ -215,30 +220,41 @@ class PlexDuplicateReporter:
         # serialize byte-identically.
         return (-group.reclaimable_bytes, group.kind, group.rating_key)
 
-    def _reset_rank_cache(self) -> None:
-        """Drop the per-render ranking memo. Each public entry point calls this so
-        the cache stays transient — scoped to one JSON/log/table render, never
-        leaking a stale ranking across renders."""
+    def _begin_render(self, report: DuplicateReport) -> None:
+        """Point the ranking memo at ``report``, clearing it only when the report
+        changes.
 
-        self._rank_cache = {}
+        A single command renders one report three times — ``write_report`` ->
+        ``build_payload``, then ``log_report``, then ``render_table`` — so scoping
+        the memo to the report object (not resetting it per output method) ranks
+        every group exactly once across all three outputs (#19). A later,
+        different report starts fresh, so no stale ranking is ever reused."""
+
+        if self._rank_cache_report is not report:
+            self._rank_cache = {}
+            self._rank_cache_report = report
 
     def _ranked_pairs(
         self, group: DuplicateGroup
     ) -> List[Tuple[MediaCopy, List[MediaCopy]]]:
-        """``dedupe.rank_copies_with_parts(group)``, memoized for this render.
+        """``dedupe.rank_copies_with_parts(group)``, memoized per report.
 
         The JSON body, the reclaimable rows (count + #48 part sub-rows), the arr
         tag, the arr-tracked rows, and the arr-tracked count each need a group's
         best-first ranking; without memoization one group is stack-merged and
-        sorted five-plus times per render (#19). Keyed by the group's unique Plex
-        ``rating_key`` (also the uniqueness tiebreak in ``_group_sort_key``).
+        sorted five-plus times per render, and re-ranked again by each of the
+        three command outputs (#19). Keyed by object identity — ``DuplicateGroup``
+        carries an unhashable ``external_ids`` dict *and* a Plex ``rating_key``
+        that is ``""`` when the item omits it (so it can't key uniquely) — with a
+        strong reference held so a live entry's ``id()`` can never be recycled by
+        another group, re-validated against the stored group for defence in depth.
         """
 
-        cached = self._rank_cache.get(group.rating_key)
-        if cached is not None:
-            return cached
+        cached = self._rank_cache.get(id(group))
+        if cached is not None and cached[0] is group:
+            return cached[1]
         pairs = dedupe.rank_copies_with_parts(group)
-        self._rank_cache[group.rating_key] = pairs
+        self._rank_cache[id(group)] = (group, pairs)
         return pairs
 
     def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
@@ -280,7 +296,7 @@ class PlexDuplicateReporter:
     def build_payload(self, report: DuplicateReport) -> dict:
         """Return the stable JSON payload for ``report`` (also used by tests)."""
 
-        self._reset_rank_cache()
+        self._begin_render(report)
         summary = self._summary(report)
         include_arr = report.arr_enabled
         payload: dict = {
@@ -351,7 +367,7 @@ class PlexDuplicateReporter:
         surface even when the scan finds no duplicates and returns early.
         """
 
-        self._reset_rank_cache()
+        self._begin_render(report)
         for warning in report.warnings:
             LOGGER.warning("%s", warning)
         summary = self._summary(report)
@@ -376,7 +392,7 @@ class PlexDuplicateReporter:
     ) -> str:
         """Render the human-readable, reclaimable-sorted table (pure)."""
 
-        self._reset_rank_cache()
+        self._begin_render(report)
         summary = self._summary(report)
         scanned = ", ".join(
             f"{section.title} (#{section.key})" for section in report.sections
