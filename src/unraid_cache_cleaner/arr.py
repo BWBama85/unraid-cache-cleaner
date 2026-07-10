@@ -29,6 +29,8 @@ reliable:
 
 from __future__ import annotations
 
+import concurrent.futures
+import logging
 import urllib.error
 from dataclasses import replace
 from pathlib import Path
@@ -37,6 +39,8 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from . import dedupe
 from .http_client import JsonHttpClient
 from .models import DuplicateGroup, MediaCopy
+
+LOGGER = logging.getLogger(__name__)
 
 TRACKED = "tracked"
 UNTRACKED = "untracked"
@@ -121,6 +125,18 @@ class RadarrClient(_ArrClient):
         return index
 
 
+#: Sonarr exposes episode files only per series — ``GET /api/v3/episodefile``
+#: requires a ``seriesId`` (or explicit ``episodeFileIds``); an unfiltered call is
+#: rejected — so the tracked-basename index costs one request per series. A
+#: bounded thread pool turns those from hundreds of *serial* round-trips into a
+#: handful of concurrent batches without opening a socket per series at once. The
+#: bound (stdlib-only, 3.9-compatible) is the "explicit bound" the fan-out needs.
+_SONARR_MAX_WORKERS = 8
+#: Log a progress line every this many completed series (and once at the end), so
+#: a large TV library shows the index advancing instead of looking hung.
+_SONARR_PROGRESS_EVERY = 50
+
+
 class SonarrClient(_ArrClient):
     """Sonarr v3 client: the set of all tracked episode-file basenames.
 
@@ -132,26 +148,62 @@ class SonarrClient(_ArrClient):
     service_name = "Sonarr"
 
     def fetch_tracked_index(self) -> Set[str]:
-        # N+1: one /series call plus one /episodefile call per series. Fine for a
-        # manual, one-shot report against a LAN Sonarr; a library with hundreds of
-        # series means hundreds of serial round-trips. Bulk retrieval is a
-        # follow-up optimization, not needed for correctness.
+        """Return every tracked episode-file basename across the whole library.
+
+        Sonarr has no bulk episode-file endpoint, so this fans one
+        ``/api/v3/episodefile`` request out per series through a bounded
+        :class:`~concurrent.futures.ThreadPoolExecutor`. Each worker still calls
+        :meth:`_get_json`, so the fail-closed opener, timeout, redirect guard, and
+        header-only API key all still apply; the opener carries no per-request
+        mutable state (no cookie jar), so concurrent GETs are safe. A single
+        worker failure aborts the whole index — the ``*ClientError`` propagates
+        and the report degrades that kind to ``unknown`` — rather than returning a
+        partial, misleading set.
+        """
+
         series_list = self._get_json("/api/v3/series")
+        series_ids = [
+            series["id"]
+            for series in series_list or []
+            if isinstance(series, dict) and series.get("id") is not None
+        ]
+        if not series_ids:
+            return set()
+
+        total = len(series_ids)
         basenames: Set[str] = set()
-        for series in series_list or []:
-            if not isinstance(series, dict):
-                continue
-            series_id = series.get("id")
-            if series_id is None:
-                continue
-            files = self._get_json("/api/v3/episodefile", {"seriesId": str(series_id)})
-            for episode_file in files or []:
-                if not isinstance(episode_file, dict):
-                    continue
-                path = episode_file.get("path")
-                if path:
-                    basenames.add(Path(str(path)).name)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_SONARR_MAX_WORKERS, total)
+        ) as pool:
+            futures = [
+                pool.submit(self._episode_file_basenames, series_id)
+                for series_id in series_ids
+            ]
+            try:
+                for done, future in enumerate(
+                    concurrent.futures.as_completed(futures), start=1
+                ):
+                    basenames |= future.result()
+                    if done % _SONARR_PROGRESS_EVERY == 0 or done == total:
+                        LOGGER.info("Sonarr: indexed %s/%s series", done, total)
+            except ArrClientError:
+                for pending in futures:
+                    pending.cancel()  # don't fan out the rest once the index is void
+                raise
         return basenames
+
+    def _episode_file_basenames(self, series_id: object) -> Set[str]:
+        """Tracked episode-file basenames for one series (one ``/episodefile`` GET)."""
+
+        files = self._get_json("/api/v3/episodefile", {"seriesId": str(series_id)})
+        names: Set[str] = set()
+        for episode_file in files or []:
+            if not isinstance(episode_file, dict):
+                continue
+            path = episode_file.get("path")
+            if path:
+                names.add(Path(str(path)).name)
+        return names
 
 
 def _refresh(group: DuplicateGroup, copies: tuple[MediaCopy, ...]) -> DuplicateGroup:

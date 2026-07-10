@@ -6,6 +6,7 @@ import io
 import json
 import socket
 import sys
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -134,6 +135,99 @@ class ArrClientTests(unittest.TestCase):
         # one /series call plus one /episodefile call per series
         paths = [urlparse(r.full_url).path for r in opener.requests]
         self.assertEqual(paths.count("/api/v3/episodefile"), 2)
+
+    @staticmethod
+    def _sonarr_responder(series):
+        """A /series + /episodefile responder: one file per series, named eN.mkv."""
+
+        def responder(req) -> bytes:
+            path = urlparse(req.full_url).path
+            if path == "/api/v3/series":
+                return json.dumps(series).encode("utf-8")
+            sid = parse_qs(urlparse(req.full_url).query)["seriesId"][0]
+            return json.dumps([{"path": f"/tv/s{sid}/e{sid}.mkv"}]).encode("utf-8")
+
+        return responder
+
+    def test_sonarr_aggregates_all_series_one_request_each(self) -> None:
+        # The parallel fan-out (#19) still fetches each series exactly once and
+        # unions every basename — no series dropped, none double-fetched.
+        series = [{"id": i} for i in range(1, 21)]  # 20 series
+        opener = _RecordingOpener(self._sonarr_responder(series))
+        client = _sonarr(opener)
+
+        basenames = client.fetch_tracked_index()
+
+        self.assertEqual(basenames, {f"e{i}.mkv" for i in range(1, 21)})
+        paths = [urlparse(r.full_url).path for r in opener.requests]
+        self.assertEqual(paths.count("/api/v3/series"), 1)
+        self.assertEqual(paths.count("/api/v3/episodefile"), 20)
+
+    def test_sonarr_fetches_series_concurrently(self) -> None:
+        # Bounded-parallel fan-out (#19): the episodefile calls must overlap, not
+        # run serially. A Barrier the size of the series count releases only when
+        # every worker reaches it together; serial execution would block the first
+        # worker until the timeout trips the barrier, so a clean return with the
+        # full basename set proves the requests ran concurrently.
+        n = min(4, arr._SONARR_MAX_WORKERS)
+        series = [{"id": i} for i in range(1, n + 1)]
+        barrier = threading.Barrier(n, timeout=5)
+        base = self._sonarr_responder(series)
+
+        def responder(req) -> bytes:
+            if urlparse(req.full_url).path == "/api/v3/episodefile":
+                barrier.wait()  # every episodefile worker must be in flight at once
+            return base(req)
+
+        client = _sonarr(_RecordingOpener(responder))
+
+        self.assertEqual(
+            client.fetch_tracked_index(), {f"e{i}.mkv" for i in range(1, n + 1)}
+        )
+
+    def test_sonarr_worker_failure_fails_closed(self) -> None:
+        # A single failed episodefile fetch aborts the whole index rather than
+        # returning a partial set — a partial index would mislabel tracked TV
+        # copies as unknown and risk calling a re-downloading copy safe.
+        series = [{"id": 1}, {"id": 2}, {"id": 3}]
+
+        def responder(req) -> bytes:
+            path = urlparse(req.full_url).path
+            if path == "/api/v3/series":
+                return json.dumps(series).encode("utf-8")
+            sid = parse_qs(urlparse(req.full_url).query)["seriesId"][0]
+            if sid == "2":
+                raise _http_error(500, b"boom")
+            return json.dumps([{"path": f"/tv/s{sid}.mkv"}]).encode("utf-8")
+
+        client = _sonarr(_RecordingOpener(responder))
+
+        with self.assertRaises(ArrClientError) as ctx:
+            client.fetch_tracked_index()
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
+
+    def test_sonarr_logs_progress_for_large_library(self) -> None:
+        # A large library logs progress so the index doesn't look hung; the final
+        # line reports completion of every series.
+        count = arr._SONARR_PROGRESS_EVERY + 5
+        series = [{"id": i} for i in range(1, count + 1)]
+        client = _sonarr(_RecordingOpener(self._sonarr_responder(series)))
+
+        with self.assertLogs("unraid_cache_cleaner.arr", level="INFO") as cm:
+            client.fetch_tracked_index()
+
+        progress = [line for line in cm.output if "indexed" in line]
+        self.assertTrue(progress)
+        self.assertTrue(any(f"{count}/{count} series" in line for line in progress))
+
+    def test_sonarr_empty_series_makes_no_episodefile_calls(self) -> None:
+        opener = _RecordingOpener(lambda req: json.dumps([]).encode("utf-8"))
+        client = _sonarr(opener)
+
+        self.assertEqual(client.fetch_tracked_index(), set())
+        paths = [urlparse(r.full_url).path for r in opener.requests]
+        self.assertNotIn("/api/v3/episodefile", paths)
 
     def test_401_raises_and_no_key_leak(self) -> None:
         opener = _RecordingOpener(_raiser(_http_error(401, b"denied")))

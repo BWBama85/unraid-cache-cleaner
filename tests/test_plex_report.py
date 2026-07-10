@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -151,6 +152,27 @@ _MOVIE_ARR_STACKED = _movie(
     guids=["tmdb://970"],
 )
 
+# A reclaimable movie whose RECLAIM CANDIDATE is a stacked 1080p release (cd1 +
+# cd2 under one media_id); the 4k single-file copy is the keeper. For a Plex-only
+# run the reclaimable-safe table must surface both candidate parts at their true
+# sizes (#48), and the keeper's file is never listed as reclaimable.
+_MOVIE_STACKED_RECLAIM = _movie(
+    "800",
+    "Reclaim Stacked",
+    [
+        _media(50, "4k", 20000, [_part(501, "/movies/Reclaim Stacked (2020)/best.4k.mkv", 20 * GiB)]),
+        _media(
+            51,
+            "1080",
+            9000,
+            [
+                _part(511, "/movies/Reclaim Stacked (2020)/cd1.1080.mkv", 5 * GiB),
+                _part(512, "/movies/Reclaim Stacked (2020)/cd2.1080.mkv", 6 * GiB),
+            ],
+        ),
+    ],
+)
+
 
 # --------------------------------------------------------------------------- #
 # Fake client + config helpers                                                 #
@@ -219,6 +241,13 @@ def _config(tmp: Path, **overrides) -> Config:
 
 def _reporter(tmp: Path, client: FakePlexClient, *, config=None) -> PlexDuplicateReporter:
     return PlexDuplicateReporter(config or _config(tmp), client, clock=lambda: 1234.5)
+
+
+def _reclaimable_section(table: str) -> str:
+    """Isolate the 'Reclaimable (safe)' block so an assertion targets only it,
+    not the mismatch or arr-tracked sections that follow."""
+
+    return table.split("Reclaimable (safe)", 1)[1].split("Review - possible")[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -819,6 +848,118 @@ class StackedRepresentationTests(unittest.TestCase):
             self.assertIn("5.0 GiB", table)
             self.assertIn("tracked by radarr", table)
             table.encode("ascii")
+
+    def test_stacked_reclaim_candidate_lists_parts_in_reclaimable_table(self) -> None:
+        # #48: a Plex-only run surfaces a stacked reclaim candidate's physical
+        # parts (path + true per-file size) in the Reclaimable (safe) section,
+        # matching the fidelity the JSON already provides.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED_RECLAIM))
+            table = reporter.render_table(reporter.generate())
+            safe = _reclaimable_section(table)
+
+            self.assertIn("/movies/Reclaim Stacked (2020)/cd1.1080.mkv", safe)
+            self.assertIn("/movies/Reclaim Stacked (2020)/cd2.1080.mkv", safe)
+            self.assertIn("5.0 GiB", safe)  # cd1 at its true size
+            self.assertIn("6.0 GiB", safe)  # cd2 at its true size
+            self.assertIn("11.0 GiB", safe)  # summary line reclaimable total unchanged
+            # the keeper is kept — its file is never listed as a reclaimable part
+            self.assertNotIn("best.4k.mkv", safe)
+            table.encode("ascii")  # stays ASCII
+
+    def test_single_file_reclaimable_rows_unchanged(self) -> None:
+        # #48: the common single-file case adds no part sub-rows — the reclaimable
+        # section stays one summary line per group (no indented file paths).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_UPGRADE))
+            table = reporter.render_table(reporter.generate())
+            safe = _reclaimable_section(table)
+
+            self.assertIn("Big Movie", safe)  # summary line present
+            self.assertNotIn("big.1080.mkv", safe)  # no per-part sub-row
+            self.assertNotIn("/movies/Big Movie", safe)
+
+    def test_arr_enabled_reclaimable_section_omits_part_subrows(self) -> None:
+        # #48 is scoped to Plex-only runs: with the *arr layer on, the reclaimable
+        # summary stays compact — a stacked tracked candidate's parts appear in the
+        # arr-tracked section, not duplicated into Reclaimable (safe).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({"970": {"cd1.1080.mkv"}})
+            reporter = _arr_reporter(tmp, self._client(_MOVIE_ARR_STACKED), radarr=radarr)
+            table = reporter.render_table(reporter.generate())
+            safe = _reclaimable_section(table)
+
+            # compact summary — no indented part paths in THIS section
+            self.assertNotIn("cd1.1080.mkv", safe)
+            self.assertNotIn("cd2.1080.mkv", safe)
+            # they still appear elsewhere (the arr-tracked section)
+            self.assertIn("cd1.1080.mkv", table)
+
+
+# --------------------------------------------------------------------------- #
+# rank-once memoization (#19)                                                  #
+# --------------------------------------------------------------------------- #
+
+class RankOnceTests(unittest.TestCase):
+    """The render path must rank each group at most once per render (#19)."""
+
+    def _client(self, *items) -> FakePlexClient:
+        return FakePlexClient(
+            [PlexSection(key="1", type="movie", title="Movies")],
+            {("1", 1): list(items)},
+        )
+
+    def _assert_ranked_once(self, render, *, expected_groups: int) -> None:
+        # rank_copies_with_parts is called only by the reporter's per-render memo
+        # (summarize/analyze use rank_copies), so spying on it counts exactly the
+        # render's ranking work. One id per group and no repeats => once per group.
+        real = dedupe.rank_copies_with_parts
+        seen: list = []
+
+        def spy(group):
+            seen.append(id(group))
+            return real(group)
+
+        with mock.patch.object(dedupe, "rank_copies_with_parts", side_effect=spy):
+            render()
+
+        self.assertEqual(len(seen), len(set(seen)), "a group was ranked more than once")
+        self.assertEqual(len(set(seen)), expected_groups)
+
+    def test_plexonly_render_and_json_rank_each_group_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED_RECLAIM, _MOVIE_UPGRADE))
+            report = reporter.generate()
+
+            self._assert_ranked_once(
+                lambda: reporter.render_table(report), expected_groups=2
+            )
+            self._assert_ranked_once(
+                lambda: reporter.build_payload(report), expected_groups=2
+            )
+
+    def test_arr_render_ranks_each_group_once(self) -> None:
+        # The strongest case: with *arr on, one group's ranking feeds the
+        # reclaimable count, the arr tag, and the arr-tracked rows. Without the
+        # memo that group would be ranked several times in a single render.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({"970": {"cd1.1080.mkv"}})
+            reporter = _arr_reporter(
+                tmp, self._client(_MOVIE_ARR_STACKED, _MOVIE_UPGRADE), radarr=radarr
+            )
+            report = reporter.generate()
+
+            self._assert_ranked_once(
+                lambda: reporter.render_table(report), expected_groups=2
+            )
+            self._assert_ranked_once(
+                lambda: reporter.build_payload(report), expected_groups=2
+            )
 
 
 if __name__ == "__main__":
