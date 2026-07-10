@@ -658,7 +658,9 @@ class FilesystemTests(unittest.TestCase):
         # (a purge-phase failure, post-commit), the first part is deleted + audited,
         # the second is audited as an error, and the result is a partial error carrying
         # only the first part's freed bytes — the shared #70 loop's protocol, run over
-        # staged paths but auditing the original media paths.
+        # staged paths but auditing the original media paths. #72: the still-staged
+        # second part also gets an explicit "left staged" row so the leftover the
+        # startup sweep must reconcile is discoverable (not only via the generic error).
         with tempfile.TemporaryDirectory() as tmp:
             media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
             deleter = _FakeDeleter(fail_on_call=2)  # 2nd unlink fails (real os.rename mover)
@@ -672,12 +674,65 @@ class FilesystemTests(unittest.TestCase):
             self.assertFalse(cd2.exists())
             self.assertEqual(len(deleter.calls), 2)
             self.assertTrue(all(str(c).endswith(STAGING_SUFFIX) for c in deleter.calls))
-            self.assertEqual([r.status for r in audit.records], ["deleted", "error"])
+            self.assertEqual([r.status for r in audit.records], ["deleted", "error", "error"])
             self.assertEqual(
                 [Path(r.path) for r in audit.records],
-                [media_root / "movie" / "cd1.mkv", media_root / "movie" / "cd2.mkv"],
+                [
+                    media_root / "movie" / "cd1.mkv",
+                    media_root / "movie" / "cd2.mkv",   # the failed delete
+                    media_root / "movie" / "cd2.mkv",   # the same part, now flagged left-staged
+                ],
             )
+            self.assertIn("left staged", audit.records[2].message)
+            self.assertIn(STAGING_SUFFIX, audit.records[2].message)
             self.assertEqual(len(audit.batches), 1)       # one flush batch
+
+    def test_purge_failure_enumerates_unattempted_staged_tail(self) -> None:
+        # #72: in a THREE-part stack whose SECOND unlink fails post-commit, the failed
+        # part AND the un-attempted third part both remain staged. The loop stops at the
+        # first failure (protocol unchanged), but every still-staged part is now flagged
+        # "left staged" — so no leftover the startup sweep must reconcile is silent.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root = Path(tmp) / "media"
+            (media_root / "movie").mkdir(parents=True)
+            cd1 = media_root / "movie" / "cd1.mkv"
+            cd2 = media_root / "movie" / "cd2.mkv"
+            cd3 = media_root / "movie" / "cd3.mkv"
+            cd1.write_bytes(b"aaaaa")
+            cd2.write_bytes(b"bbb")
+            cd3.write_bytes(b"cc")
+            keeper = _keeper()
+            stacked = _copy(
+                "/plex/movie/cd1.mkv", 10, media_id=21, association="untracked",
+                parts=[
+                    {"part_id": 2, "file": "/plex/movie/cd1.mkv", "size": 5},
+                    {"part_id": 3, "file": "/plex/movie/cd2.mkv", "size": 3},
+                    {"part_id": 4, "file": "/plex/movie/cd3.mkv", "size": 2},
+                ],
+            )
+            group = _group([keeper, stacked], keeper=keeper)
+            config = _config(web_media_path_map=((Path("/plex"), media_root),))
+            deleter = _FakeDeleter(fail_on_call=2)  # cd1 unlinks, cd2 fails, cd3 unattempted
+            audit = _FakeAudit()
+            service = _service(_report([group]), config=config, deleter=deleter, audit=audit)
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.reclaimed_bytes, 5)   # only cd1's bytes freed
+            self.assertEqual(len(deleter.calls), 2)       # stopped at cd2; cd3 never attempted
+            # deleted(cd1), error(cd2 delete), left-staged(cd2), left-staged(cd3)
+            self.assertEqual(
+                [r.status for r in audit.records], ["deleted", "error", "error", "error"]
+            )
+            self.assertEqual(
+                [Path(r.path) for r in audit.records],
+                [cd1, cd2, cd2, cd3],
+            )
+            self.assertIn("left staged", audit.records[2].message)
+            self.assertIn("left staged", audit.records[3].message)
+            # Both leftovers are physically present at their staging siblings.
+            self.assertTrue(cd2.with_name(cd2.name + STAGING_SUFFIX).exists())
+            self.assertTrue(cd3.with_name(cd3.name + STAGING_SUFFIX).exists())
+            self.assertEqual(len(audit.batches), 1)
 
     def test_purge_failure_before_any_commit_rolls_back(self) -> None:
         # #71 (Codex): an unlink failing BEFORE any delete commits is recoverable —
@@ -753,6 +808,186 @@ class FilesystemTests(unittest.TestCase):
             self.assertEqual([r.status for r in audit.records], ["error"])
             self.assertEqual(Path(audit.records[0].path), cd1)
             self.assertIn("left staged", audit.records[0].message)
+
+
+# --------------------------------------------------------------------------- #
+# Staging reconciliation sweep (#72)                                           #
+# --------------------------------------------------------------------------- #
+
+class StagingSweepTests(unittest.TestCase):
+    """``reconcile_staging`` recovers the two out-of-process residues the in-process
+    rollback can't reach: a crash mid-move (restore) and a post-commit purge leftover
+    (remove), fail-closed on anything ambiguous."""
+
+    def _service_for(self, tmp, *, dry_run=False, nested=False, deleter=os.unlink,
+                     mover=os.rename):
+        media_root = Path(tmp) / "media"
+        (media_root / "movie").mkdir(parents=True)
+        maps = [(Path("/plex"), media_root)]
+        if nested:  # an overlapping map entry nested inside the first
+            maps.append((Path("/plex/movie"), media_root / "movie"))
+        audit = _FakeAudit()
+        config = _config(web_media_path_map=tuple(maps), web_actions_dry_run=dry_run)
+        service = _service(
+            _report([]), config=config, audit=audit, deleter=deleter, mover=mover
+        )
+        return service, media_root, audit
+
+    def test_restores_crash_staged_when_original_missing(self) -> None:
+        # A crash between the stage rename and the unlink/rollback leaves the media at
+        # its staging sibling with the original gone. The sweep renames it back.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp)
+            original = media_root / "movie" / "cd1.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            staged.write_bytes(b"recovered")
+            report = service.reconcile_staging()
+            self.assertEqual(
+                (report.restored, report.removed, report.would_remove, report.skipped),
+                (1, 0, 0, 0),
+            )
+            self.assertTrue(original.exists())
+            self.assertEqual(original.read_bytes(), b"recovered")
+            self.assertFalse(staged.exists())
+            self.assertEqual([r.status for r in audit.records], ["restored"])
+            self.assertEqual(Path(audit.records[0].path), original)
+
+    def test_removes_leftover_when_original_present(self) -> None:
+        # A completed-delete leftover (or a re-created original): the media is already
+        # back at the original path, so the staged copy is redundant and is removed.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp)
+            original = media_root / "movie" / "cd1.mkv"
+            original.write_bytes(b"live")
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            staged.write_bytes(b"stale")
+            report = service.reconcile_staging()
+            self.assertEqual(
+                (report.restored, report.removed, report.would_remove, report.skipped),
+                (0, 1, 0, 0),
+            )
+            self.assertTrue(original.exists())
+            self.assertEqual(original.read_bytes(), b"live")  # the present original is untouched
+            self.assertFalse(staged.exists())                 # leftover removed
+            self.assertEqual([r.status for r in audit.records], ["removed"])
+
+    def test_dry_run_restores_but_defers_removal(self) -> None:
+        # Dry-run still restores (recovery is non-destructive) but never deletes: a
+        # removable leftover is counted `would_remove` and left in place.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp, dry_run=True)
+            movie = media_root / "movie"
+            staged_a = movie / ("a.mkv" + STAGING_SUFFIX)  # original missing -> restore
+            staged_a.write_bytes(b"A")
+            (movie / "b.mkv").write_bytes(b"live")         # original present -> would_remove
+            staged_b = movie / ("b.mkv" + STAGING_SUFFIX)
+            staged_b.write_bytes(b"B")
+            report = service.reconcile_staging()
+            self.assertEqual(report.restored, 1)
+            self.assertEqual(report.would_remove, 1)
+            self.assertEqual(report.removed, 0)
+            self.assertTrue((movie / "a.mkv").exists())     # restored even in dry-run
+            self.assertFalse(staged_a.exists())
+            self.assertTrue(staged_b.exists())              # removal deferred
+            statuses = sorted(r.status for r in audit.records)
+            self.assertEqual(statuses, ["restored", "skipped"])
+            skip = next(r for r in audit.records if r.status == "skipped")
+            self.assertIn("dry-run", skip.message)
+
+    def test_truncatable_name_is_skipped_not_reconstructed(self) -> None:
+        # A staged base that fills the directory's NAME_MAX budget could be a truncation
+        # of a longer original (staging cuts on a byte boundary) — the original can't be
+        # reconstructed, so it is flagged, never restored or removed.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp)
+            movie = media_root / "movie"
+            try:
+                name_max = int(os.pathconf(movie, "PC_NAME_MAX"))
+            except (OSError, ValueError, AttributeError):
+                name_max = 255
+            base = "x" * (name_max - len(STAGING_SUFFIX))  # base fills the whole budget
+            staged = movie / (base + STAGING_SUFFIX)
+            staged.write_bytes(b"data")
+            report = service.reconcile_staging()
+            self.assertEqual(report.skipped, 1)
+            self.assertEqual(report.restored, 0)
+            self.assertTrue(staged.exists())  # untouched
+            self.assertEqual([r.status for r in audit.records], ["skipped"])
+            self.assertIn("truncat", audit.records[0].message.lower())
+
+    def test_symlink_sibling_is_skipped(self) -> None:
+        # A symlink bearing our suffix was never created by staging (which renames a
+        # validated regular file); the sweep never restores or deletes through it.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp)
+            movie = media_root / "movie"
+            target = movie / "real.dat"
+            target.write_bytes(b"real")
+            link = movie / ("cd1.mkv" + STAGING_SUFFIX)
+            os.symlink(target, link)
+            report = service.reconcile_staging()
+            self.assertEqual(report.skipped, 1)
+            self.assertTrue(link.is_symlink())  # untouched
+            self.assertTrue(target.exists())    # target intact
+            self.assertEqual([r.status for r in audit.records], ["skipped"])
+            self.assertIn("symlink", audit.records[0].message)
+
+    def test_overlapping_roots_reconcile_each_sibling_once(self) -> None:
+        # Two map entries whose container prefixes nest collapse to one walk, so a
+        # sibling in the shared subtree is reconciled exactly once (not double-counted).
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp, nested=True)
+            staged = media_root / "movie" / ("cd1.mkv" + STAGING_SUFFIX)
+            staged.write_bytes(b"d")
+            report = service.reconcile_staging()
+            self.assertEqual(report.restored, 1)  # once, despite two overlapping roots
+            self.assertEqual(len(audit.records), 1)
+
+    def test_restore_failure_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            def mover(src, dst):
+                raise OSError("cross-device or read-only")
+
+            service, media_root, audit = self._service_for(tmp, mover=mover)
+            staged = media_root / "movie" / ("cd1.mkv" + STAGING_SUFFIX)
+            staged.write_bytes(b"d")
+            report = service.reconcile_staging()
+            self.assertEqual((report.restored, report.skipped), (0, 1))
+            self.assertTrue(staged.exists())  # left in place for manual recovery
+            self.assertIn("could not restore", audit.records[0].message)
+
+    def test_remove_failure_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(
+                tmp, deleter=_FakeDeleter(fail=True)
+            )
+            original = media_root / "movie" / "cd1.mkv"
+            original.write_bytes(b"live")
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            staged.write_bytes(b"stale")
+            report = service.reconcile_staging()
+            self.assertEqual((report.removed, report.skipped), (0, 1))
+            self.assertTrue(staged.exists())  # left in place
+            self.assertIn("could not remove", audit.records[0].message)
+
+    def test_no_media_path_map_is_noop(self) -> None:
+        audit = _FakeAudit()
+        service = _service(
+            _report([]), config=_config(web_media_path_map=()), audit=audit
+        )
+        report = service.reconcile_staging()
+        self.assertEqual(report.total, 0)
+        self.assertEqual(audit.records, [])
+
+    def test_ignores_non_staging_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp)
+            keep = media_root / "movie" / "keep.mkv"
+            keep.write_bytes(b"keep")
+            report = service.reconcile_staging()
+            self.assertEqual(report.total, 0)
+            self.assertTrue(keep.exists())
+            self.assertEqual(audit.records, [])
 
 
 # --------------------------------------------------------------------------- #
@@ -915,7 +1150,9 @@ class ArrRoutingTests(unittest.TestCase):
             [Path("/lib/cd1.mkv"), Path("/lib/cd2.mkv")],   # audit uses media paths, in order
         )
         self.assertEqual(audit.records[0].message, "id=1 rating_key=900 part_id=2")
-        self.assertTrue(audit.records[1].message.startswith("id=2 rating_key=900:"))
+        self.assertTrue(
+            audit.records[1].message.startswith("id=2 rating_key=900 part_id=2:")
+        )
         self.assertEqual(len(audit.batches), 1)              # one flush batch, not per-part
 
     def test_stacked_tracked_copy_validates_all_parts_before_delete(self) -> None:

@@ -44,7 +44,10 @@ Fail-closed on every axis:
   atomic and cannot fail cross-device), and only once *all* parts stage does the
   unlink pass run; a failure to stage any part rolls the already-staged parts back,
   leaving the copy intact with nothing deleted. The guarantee covers in-process
-  failures (``EROFS``/``EACCES`` surface at the rename, where rollback is clean); a
+  failures (``EROFS``/``EACCES`` surface at the rename, where rollback is clean); the
+  two out-of-process residues a rollback cannot reach — a crash mid-move and a
+  post-commit purge failure — are reconciled by the startup staging sweep
+  (:meth:`ReclaimService.reconcile_staging`, #72). A
   ``*arr`` reclaim is *not* transactional — a Radarr/Sonarr ``DELETE`` cannot be
   rolled back — so its parts are prevalidated whole but deleted independently, and a
   mid-delete failure is surfaced as a ``partial`` error (audited), not rolled back.
@@ -66,7 +69,7 @@ from . import arr, dedupe
 from .arr import ArrClientError
 from .config import Config
 from .models import ActionRecord
-from .planner import is_within
+from .planner import collapse_roots, is_within
 
 LOGGER = logging.getLogger(__name__)
 
@@ -96,7 +99,20 @@ STATUS_WOULD_DELETE = "would-delete"
 STATUS_REFUSED = "refused"
 STATUS_ERROR = "error"
 
+#: Statuses the startup staging-reconciliation sweep (#72) writes to the ``actions``
+#: audit trail — a crash-staged file brought back (``restored``), a completed-delete
+#: leftover cleaned up (``removed``), or an ambiguous sibling left untouched
+#: (``skipped``: a truncated/unreconstructable name, a symlink, or an ``OSError``).
+STATUS_RESTORED = "restored"
+STATUS_REMOVED = "removed"
+STATUS_SKIPPED = "skipped"
+
 BACKEND_FILESYSTEM = "filesystem"
+
+#: Audit ``action`` for the reconciliation sweep, distinct from the reclaim actions
+#: (``web-reclaim:filesystem`` / ``web-reclaim:<arr>``) so the ``/actions`` history
+#: can tell an operator-triggered delete from an automatic staging cleanup.
+RECONCILE_ACTION = "web-reclaim:reconcile"
 
 #: Suffix appended in-place (same directory → same filesystem, so the rename is
 #: atomic and never hits ``EXDEV``) to stage a filesystem part aside before it is
@@ -219,6 +235,16 @@ class _DeleteJob:
     #: The :class:`ReclaimResult` ``error`` message, given the exception and the
     #: bytes already freed before this part failed.
     partial_message: Callable[[BaseException, int], str]
+    #: The two-phase filesystem staging sibling this job unlinks, or ``None`` for a
+    #: backend that does not stage (``*arr``). When a *post-commit* purge failure
+    #: aborts the unlink pass, every not-yet-purged part — the one that failed *and*
+    #: the un-attempted tail — is left at its staging sibling; :meth:`_execute_deletes`
+    #: uses this to audit each leftover as a "left staged" row (#72), so the startup
+    #: reconciliation sweep's job is fully discoverable in the audit trail.
+    staged_path: Optional[Path] = None
+    #: ``ActionRecord.message`` for a "left staged" leftover row, given the staged
+    #: path. Set together with ``staged_path`` on a staged (filesystem) job.
+    leftover_message: Optional[Callable[[Path], str]] = None
 
 
 class _ActionIndex:
@@ -374,6 +400,25 @@ def _as_opt_int(value: object) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+@dataclass
+class StagingSweepReport:
+    """Outcome counts from one :meth:`ReclaimService.reconcile_staging` sweep.
+
+    ``restored`` — crash-staged files brought back to their original path;
+    ``removed`` — completed-delete leftovers cleaned up; ``would_remove`` — leftovers
+    left in place because ``dry_run`` suppressed the delete; ``skipped`` — ambiguous
+    siblings (unreconstructable name, symlink, or ``OSError``) left untouched."""
+
+    restored: int = 0
+    removed: int = 0
+    would_remove: int = 0
+    skipped: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.restored + self.removed + self.would_remove + self.skipped
+
+
 class ReclaimService:
     """Serialized, fail-closed reclaim of report-selected duplicate copies."""
 
@@ -466,6 +511,235 @@ class ReclaimService:
 
         self._log_summary(results)
         return ReclaimResponse(200, True, self.dry_run, "", results)
+
+    # -- staging reconciliation (#72) ---------------------------------------- #
+
+    def reconcile_staging(self) -> StagingSweepReport:
+        """Reconcile orphaned ``*.uncc-reclaim`` staging siblings under the configured
+        media roots — the two-phase filesystem reclaim's (#64) only *out-of-process*
+        residue, which its in-process rollback cannot reach.
+
+        Two windows strand a sibling: a crash after a stage rename but before the
+        unlink/rollback (the original is gone, sitting at its staging path), and a
+        post-commit purge failure (an earlier unlink committed, so a later part can no
+        longer be rolled back and stays staged). This sweep closes both, fail-closed:
+
+        * **original missing** → restore the sibling to the original name — recovers
+          the stranded media, and never clobbers (it runs only when the original is
+          absent).
+        * **original present** → remove the sibling — its media is already back at the
+          original path, so the copy staged for deletion is redundant. Suppressed under
+          ``dry_run`` (counted ``would_remove``); this is the sweep's only *deleting*
+          action.
+        * **ambiguous** — a name too long to have staged un-truncated (so the original
+          can't be reconstructed), a symlink, or any ``OSError`` — is left untouched
+          and audited ``skipped``; provenance is never guessed at.
+
+        Held under the reclaim lock so it cannot race a concurrent reclaim's staging.
+        Every outcome is logged and audited; returns the summary counts.
+        """
+
+        report = StagingSweepReport()
+        roots = self._staging_roots()
+        if not roots:
+            return report
+        with self._lock:
+            records: List[ActionRecord] = []
+            for root in roots:
+                for sibling in self._find_staging_siblings(root):
+                    self._reconcile_one_sibling(sibling, records, report)
+            self._flush_audit(records)
+        if report.total:
+            LOGGER.info(
+                "web reclaim: staging sweep restored=%s removed=%s would_remove=%s "
+                "skipped=%s dry_run=%s",
+                report.restored,
+                report.removed,
+                report.would_remove,
+                report.skipped,
+                self.dry_run,
+            )
+        return report
+
+    def _staging_roots(self) -> Tuple[Path, ...]:
+        """The mounted media roots to sweep: every configured ``container_prefix``,
+        de-duplicated and de-nested (overlapping maps visit each subtree once) and
+        filtered to those actually mounted as directories in this container."""
+
+        prefixes = [container for _plex, container in self._config.web_media_path_map]
+        return tuple(root for root in collapse_roots(prefixes) if root.is_dir())
+
+    @staticmethod
+    def _find_staging_siblings(root: Path) -> List[Path]:
+        """Every ``*.uncc-reclaim`` file under ``root``, not following symlinked dirs
+        (``followlinks=False``). ``os.walk`` swallows per-directory errors by default,
+        so an unreadable subtree is skipped rather than aborting the sweep."""
+
+        siblings: List[Path] = []
+        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+            for name in filenames:
+                if len(name) > len(STAGING_SUFFIX) and name.endswith(STAGING_SUFFIX):
+                    siblings.append(Path(dirpath) / name)
+        return siblings
+
+    def _reconcile_one_sibling(
+        self, sibling: Path, records: List[ActionRecord], report: StagingSweepReport
+    ) -> None:
+        # A symlink bearing our suffix is not one of ours (staging always renames a
+        # validated regular file) — never restore or delete through it.
+        if os.path.islink(sibling):
+            self._skip_sibling(sibling, records, report, "is a symlink, not a staging file")
+            return
+        original = self._original_for_staging(sibling)
+        if original is None:
+            self._skip_sibling(
+                sibling,
+                records,
+                report,
+                "name may be truncated to NAME_MAX; original path is not "
+                "reconstructable — reconcile by hand",
+            )
+            return
+        try:
+            original_present = os.path.lexists(original)
+        except OSError as exc:
+            self._skip_sibling(sibling, records, report, f"could not stat {original}: {exc}")
+            return
+        if original_present:
+            self._remove_leftover(sibling, original, records, report)
+        else:
+            self._restore_crash_staged(sibling, original, records, report)
+
+    @staticmethod
+    def _original_for_staging(sibling: Path) -> Optional[Path]:
+        """The original media path a staging sibling maps back to — or ``None`` when
+        the staged name may have been truncated to the directory's ``NAME_MAX``
+        (:meth:`_staging_path`), so the original can't be reconstructed unambiguously
+        and the sibling must be flagged instead of acted on."""
+
+        base = sibling.name[: -len(STAGING_SUFFIX)]
+        if not base:
+            return None
+        try:
+            name_max = int(os.pathconf(sibling.parent, "PC_NAME_MAX"))
+        except (OSError, ValueError, AttributeError):
+            name_max = 255
+        max_base = max(1, name_max - len(STAGING_SUFFIX.encode("utf-8")))
+        # ``_staging_path`` only truncates when the original overflows ``max_base``,
+        # cutting the base to exactly that budget. A staged base at (or over) the
+        # budget is therefore indistinguishable from a truncation of a longer name —
+        # so it is ambiguous. A shorter base was provably never truncated.
+        if len(base.encode("utf-8", "surrogatepass")) >= max_base:
+            return None
+        return sibling.with_name(base)
+
+    def _restore_crash_staged(
+        self,
+        sibling: Path,
+        original: Path,
+        records: List[ActionRecord],
+        report: StagingSweepReport,
+    ) -> None:
+        # No-clobber by construction: only reached when the original is absent. Mirrors
+        # the in-process rollback's lexists-then-rename under the lock; the sweep runs
+        # before the server serves, so no concurrent writer can recreate the original
+        # in the window.
+        size = self._sibling_size(sibling)
+        try:
+            self._filesystem_mover(sibling, original)
+        except OSError as exc:
+            self._skip_sibling(
+                sibling, records, report, f"could not restore to {original}: {exc}"
+            )
+            return
+        report.restored += 1
+        LOGGER.info("web reclaim: staging sweep restored %s -> %s", sibling, original)
+        records.append(
+            ActionRecord(
+                path=original,
+                action=RECONCILE_ACTION,
+                status=STATUS_RESTORED,
+                size=size,
+                message=f"restored crash-staged file from {sibling}",
+            )
+        )
+
+    def _remove_leftover(
+        self,
+        sibling: Path,
+        original: Path,
+        records: List[ActionRecord],
+        report: StagingSweepReport,
+    ) -> None:
+        size = self._sibling_size(sibling)
+        if self.dry_run:
+            report.would_remove += 1
+            LOGGER.info(
+                "web reclaim: staging sweep would remove %s (dry-run; original %s present)",
+                sibling,
+                original,
+            )
+            records.append(
+                ActionRecord(
+                    path=original,
+                    action=RECONCILE_ACTION,
+                    status=STATUS_SKIPPED,
+                    size=size,
+                    message=f"dry-run: staging leftover {sibling} left in place (original present)",
+                )
+            )
+            return
+        try:
+            self._filesystem_deleter(sibling)
+        except OSError as exc:
+            self._skip_sibling(
+                sibling,
+                records,
+                report,
+                f"could not remove leftover (original {original} present): {exc}",
+            )
+            return
+        report.removed += 1
+        LOGGER.info(
+            "web reclaim: staging sweep removed leftover %s (original %s present)",
+            sibling,
+            original,
+        )
+        records.append(
+            ActionRecord(
+                path=original,
+                action=RECONCILE_ACTION,
+                status=STATUS_REMOVED,
+                size=size,
+                message=f"removed staging leftover {sibling}; original present",
+            )
+        )
+
+    def _skip_sibling(
+        self,
+        sibling: Path,
+        records: List[ActionRecord],
+        report: StagingSweepReport,
+        reason: str,
+    ) -> None:
+        report.skipped += 1
+        LOGGER.warning("web reclaim: staging sweep skipped %s: %s", sibling, reason)
+        records.append(
+            ActionRecord(
+                path=sibling,
+                action=RECONCILE_ACTION,
+                status=STATUS_SKIPPED,
+                size=self._sibling_size(sibling),
+                message=reason,
+            )
+        )
+
+    @staticmethod
+    def _sibling_size(sibling: Path) -> int:
+        try:
+            return os.lstat(sibling).st_size
+        except OSError:
+            return 0
 
     # -- per-target ---------------------------------------------------------- #
 
@@ -560,6 +834,14 @@ class ReclaimService:
                 partial_message=(
                     lambda exc, done, p=original: (
                         f"partial: deleted {done} bytes, then failed on {p}: {exc}"
+                    )
+                ),
+                staged_path=staged_path,
+                leftover_message=(
+                    lambda sp, p=original: (
+                        f"rating_key={target.rating_key} part_id={target.part_id}: "
+                        f"purge aborted; {p} left staged at {sp} "
+                        "(reconciled on next startup)"
                     )
                 ),
             )
@@ -819,7 +1101,10 @@ class ReclaimService:
                     f"id={file_id} rating_key={target.rating_key} part_id={target.part_id}"
                 ),
                 error_message=(
-                    lambda exc, fid=file_id: f"id={fid} rating_key={target.rating_key}: {exc}"
+                    lambda exc, fid=file_id: (
+                        f"id={fid} rating_key={target.rating_key} "
+                        f"part_id={target.part_id}: {exc}"
+                    )
                 ),
                 partial_message=(
                     lambda exc, done, name=plex_path.name: (
@@ -953,7 +1238,7 @@ class ReclaimService:
 
         records: List[ActionRecord] = []
         deleted_bytes = 0
-        for job in jobs:
+        for index, job in enumerate(jobs):
             try:
                 job.perform()
             except catch as exc:  # the backend deleter's own typed failure
@@ -968,6 +1253,13 @@ class ReclaimService:
                         message=job.error_message(exc),
                     )
                 )
+                # Post-commit purge failure (filesystem, #72): a prior unlink already
+                # committed, so this is irreversible. The failed part AND every
+                # un-attempted part behind it remain at their staging siblings; audit
+                # each as a "left staged" row so no leftover is silent and the startup
+                # sweep's later reconciliation is attributable. ``*arr`` jobs carry no
+                # ``staged_path``, so this loop is a no-op for them.
+                records.extend(self._staged_leftover_records(jobs[index:], action))
                 self._flush_audit(records)
                 return self._error(
                     target, backend, deleted_bytes, job.partial_message(exc, deleted_bytes)
@@ -984,6 +1276,27 @@ class ReclaimService:
             )
         self._flush_audit(records)
         return self._deleted(target, backend, deleted_bytes, success_message)
+
+    @staticmethod
+    def _staged_leftover_records(
+        remaining: Sequence[_DeleteJob], action: str
+    ) -> List[ActionRecord]:
+        """"Left staged" audit rows for the still-staged parts of an aborted purge —
+        the part that failed to unlink plus every un-attempted part behind it. Only
+        jobs carrying a ``staged_path`` (filesystem) contribute a row; the startup
+        sweep reconciles each named sibling on the next run (#72)."""
+
+        return [
+            ActionRecord(
+                path=job.audit_path,
+                action=action,
+                status=STATUS_ERROR,
+                size=job.size,
+                message=job.leftover_message(job.staged_path),
+            )
+            for job in remaining
+            if job.staged_path is not None and job.leftover_message is not None
+        ]
 
     # -- helpers ------------------------------------------------------------- #
 
