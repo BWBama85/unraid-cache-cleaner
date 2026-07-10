@@ -161,8 +161,15 @@ section for the full contract. On Unraid specifically:
    media share (e.g. host `/mnt/user/Media` → container `/media`) and set
    `WEB_MEDIA_PATH_MAP=/mnt/user/Media:/media` so the container can translate the
    Plex-reported path. An unmapped path is refused, never guessed.
-5. **Audit trail.** Every real delete is recorded in the SQLite state DB under
-   `/config`, so you can review what the UI removed.
+5. **Audit trail + history page.** Every real delete is recorded in the SQLite
+   state DB under `/config`; the read-only **`/actions`** page (linked from the
+   report) lists what the UI removed, newest first.
+6. **Reverse proxy? Set the allowed origin.** The template binds `0.0.0.0`, so the
+   reclaim *form* requires a same-origin request (a cross-site form POST is refused
+   even without an `Origin` header) — direct LAN access to `http://<tower>:8080`
+   works out of the box. If you front the UI with a TLS-terminating reverse proxy,
+   set `WEB_ALLOWED_ORIGINS` to its external origin (e.g. `https://media.example.com`)
+   so the browser's `https` origin is accepted. The JSON API stays token-only.
 
 ## Common Misconfiguration
 

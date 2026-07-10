@@ -8,10 +8,15 @@ fail-closed **action layer** that reclaims selected redundant copies (Phase 2).
 
 Read path (always on):
 
-* it NEVER regenerates the report — no Plex / ``*arr`` / qBittorrent / SQLite
-  access happens on a GET; it only reads a file the ``plex-duplicates`` subcommand
-  (or a cron) already wrote, so a page load can never fan out to Plex or block on a
-  network round-trip.
+* it NEVER regenerates the report — no Plex / ``*arr`` / qBittorrent access happens
+  on a GET; it only reads a file the ``plex-duplicates`` subcommand (or a cron)
+  already wrote, so a page load can never fan out to Plex or block on a network
+  round-trip.
+* the read-only ``/actions`` + ``/api/actions`` history views (#62) are the *one*
+  GET that touches SQLite: a bounded, indexed, newest-first SELECT of the
+  ``web-reclaim:*`` audit rows over a long-lived, query-only connection (opened once,
+  reused, never creating or migrating the DB) so a page load is a pure ``SELECT`` and
+  never checkpoints (see :class:`~unraid_cache_cleaner.state.WebActionHistoryReader`).
 
 Action path (Phase 2, off unless ``WEB_ENABLE_ACTIONS=true``):
 
@@ -20,6 +25,11 @@ Action path (Phase 2, off unless ``WEB_ENABLE_ACTIONS=true``):
   which owns the entire safety envelope (token gate, fresh-snapshot resolution,
   keeper/mismatch/unknown refusals, TOCTOU re-validation, audit). This module only
   parses the request and renders the result — it never deletes anything itself.
+* on top of that token gate this module enforces a CSRF/origin check (#63): the
+  JSON API stays token-only when it sends no ``Origin`` (so ``curl`` works), but a
+  browser reclaim form on a *non-loopback* bind must present a matching ``Origin``
+  (or same-origin ``Referer``); a ``WEB_ALLOWED_ORIGINS`` allow-list covers a
+  reverse-proxy deployment where the server sees plain HTTP.
 * when no reclaim service is attached (the plain viewer, or actions disabled),
   every non-``GET`` verb is answered ``405``, exactly as in Phase 1.
 
@@ -33,6 +43,7 @@ an empty-state page rather than a ``500``.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import threading
@@ -41,10 +52,11 @@ from html import escape as _escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 from urllib.parse import parse_qsl, urlparse
 
 from .config import Config
+from .state import WebActionHistoryReader
 from .web_actions import ReclaimResponse, ReclaimService, ReclaimTarget
 
 LOGGER = logging.getLogger(__name__)
@@ -58,6 +70,14 @@ _MAX_ACTION_BODY_BYTES = 256 * 1024
 #: A provider returns the parsed report payload dict, or ``None`` when no usable
 #: report exists yet (missing file, unreadable, malformed, or not an object).
 ReportProvider = Callable[[], Optional[dict]]
+
+#: A provider returns the recent web-reclaim audit rows (newest first), or ``None``
+#: when no audit store is available (a missing/legacy DB). Backs the read-only
+#: ``/actions`` history viewer (#62); shaped to accept ``state.WebActionHistoryReader``.
+ActionHistoryProvider = Callable[[], Optional[List[dict]]]
+
+#: Rows the ``/actions`` history endpoint requests per load (the reader caps this).
+_ACTION_HISTORY_LIMIT = 200
 
 
 def _csp(actions_enabled: bool) -> str:
@@ -145,12 +165,23 @@ class DuplicateReportViewer:
     is trivially unit-testable with an injected fake provider.
     """
 
-    def __init__(self, provider: ReportProvider, *, actions_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        provider: ReportProvider,
+        *,
+        actions_enabled: bool = False,
+        action_history: Optional[ActionHistoryProvider] = None,
+    ) -> None:
         self._provider = provider
         # When True the page renders the no-JS reclaim form (checkboxes + a token
         # field). Off for the plain read-only viewer, so the form and its relaxed
         # ``form-action`` CSP never appear unless an operator opted into actions.
         self._actions_enabled = actions_enabled
+        # Optional read-only audit history (#62). When wired, ``/actions`` and
+        # ``/api/actions`` surface the recent web-reclaim rows and the report page
+        # links to them. ``None`` (the plain viewer) leaves those routes an empty,
+        # "unavailable" state — they never construct a store themselves.
+        self._action_history = action_history
 
     def render_html(self) -> str:
         """Render the current report, degrading a corrupt one to the empty state.
@@ -162,11 +193,18 @@ class DuplicateReportViewer:
         500" guarantee holds for structural corruption, not just a bad top level.
         """
 
+        show_history = self._action_history is not None
         try:
-            return render_report_html(self._provider(), actions_enabled=self._actions_enabled)
+            return render_report_html(
+                self._provider(),
+                actions_enabled=self._actions_enabled,
+                show_history_link=show_history,
+            )
         except Exception:  # noqa: BLE001 — any structural corruption degrades gracefully
             LOGGER.warning("rendering the duplicate report failed; showing empty state", exc_info=True)
-            return render_report_html(None, actions_enabled=self._actions_enabled)
+            return render_report_html(
+                None, actions_enabled=self._actions_enabled, show_history_link=show_history
+            )
 
     def report_api(self) -> dict:
         """The JSON API contract: a stable wrapper around the report snapshot.
@@ -183,6 +221,39 @@ class DuplicateReportViewer:
             LOGGER.warning("reading the duplicate report failed; reporting unavailable", exc_info=True)
             payload = None
         return {"available": payload is not None, "report": payload}
+
+    def _read_action_history(self) -> Optional[List[dict]]:
+        """The recent web-reclaim audit rows, or ``None`` when no store is wired or a
+        read failed. A read failure degrades to "unavailable" rather than raising, so
+        a page load never 500s on a locked/absent DB."""
+
+        if self._action_history is None:
+            return None
+        try:
+            return self._action_history()
+        except Exception:  # noqa: BLE001 — a broken/locked store degrades to unavailable
+            LOGGER.warning("reading the reclaim action history failed; showing unavailable", exc_info=True)
+            return None
+
+    def actions_api(self) -> dict:
+        """The JSON contract for ``/api/actions``: ``{available, actions:[...]}``.
+
+        ``available`` is ``False`` when no audit store is wired or the DB is
+        missing/legacy; a readable-but-empty store is ``available: true`` with an
+        empty list."""
+
+        rows = self._read_action_history()
+        return {"available": rows is not None, "actions": rows or []}
+
+    def render_actions_html(self) -> str:
+        """Render the read-only action-history page, degrading to an empty/unavailable
+        state rather than raising on a broken store."""
+
+        try:
+            return render_actions_html(self._read_action_history())
+        except Exception:  # noqa: BLE001 — structural surprise degrades gracefully
+            LOGGER.warning("rendering the action history failed; showing empty state", exc_info=True)
+            return render_actions_html(None)
 
     @staticmethod
     def render_not_found() -> str:
@@ -211,6 +282,7 @@ main { max-width: 1100px; margin: 0 auto; }
 h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
 h2 { font-size: 1.15rem; margin: 2rem 0 .5rem; }
 .sub { color: #666; margin: 0 0 1rem; font-size: .9rem; }
+.nav { margin: .1rem 0 1rem; font-size: .9rem; }
 .totals { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1rem 0; }
 .tile { background: #fff; border: 1px solid #e2e5e9; border-radius: 8px; padding: .6rem .9rem; }
 .tile .n { font-size: 1.3rem; font-weight: 600; }
@@ -264,20 +336,36 @@ def _page(title: str, body: str, *, footer_note: str = _READONLY_FOOTER) -> str:
     )
 
 
-def render_report_html(payload: Optional[dict], *, actions_enabled: bool = False) -> str:
+def _history_nav(show_history_link: bool) -> str:
+    """A same-origin link to the read-only action-history page, or nothing."""
+
+    if not show_history_link:
+        return ""
+    return '<p class="nav"><a href="/actions">View reclaim action history &rarr;</a></p>'
+
+
+def render_report_html(
+    payload: Optional[dict],
+    *,
+    actions_enabled: bool = False,
+    show_history_link: bool = False,
+) -> str:
     """Render the report payload as a full HTML page (pure).
 
     When ``actions_enabled`` the reclaimable section is wrapped in a no-JS form
     (a checkbox per redundant copy + a token field) that POSTs to
     ``/actions/reclaim``; otherwise the page is the Phase 1 read-only viewer.
+    ``show_history_link`` adds a link to the read-only ``/actions`` audit page.
     """
 
     footer = _ACTION_FOOTER if actions_enabled else _READONLY_FOOTER
+    nav = _history_nav(show_history_link)
 
     if payload is None:
         body = (
             "<h1>Plex duplicate report</h1>"
-            '<p class="sub">No report available yet.</p>'
+            + nav
+            + '<p class="sub">No report available yet.</p>'
             '<div class="empty">Run <code>unraid-cache-cleaner plex-duplicates</code> '
             "(or wait for the scheduled scan) to generate a report, then reload this "
             "page. This viewer only displays an existing report — it never runs a "
@@ -289,7 +377,7 @@ def render_report_html(payload: Optional[dict], *, actions_enabled: bool = False
     totals = payload.get("totals") or {}
     arr_enabled = bool(payload.get("arr_enabled"))
 
-    parts: List[str] = ["<h1>Plex duplicate report</h1>"]
+    parts: List[str] = ["<h1>Plex duplicate report</h1>", nav]
     parts.append(f'<p class="sub">{_render_meta(payload)}</p>')
     parts.append(_render_totals(totals, arr_enabled))
     parts.append(_render_messages(payload.get("warnings"), "warn"))
@@ -364,6 +452,81 @@ def render_reclaim_result_html(response: ReclaimResponse) -> str:
         body.append('<div class="empty">No targets were selected.</div>')
     body.append('<p class="sub"><a href="/">&larr; Back to the report</a></p>')
     return _page("Reclaim result", "".join(body), footer_note=_ACTION_FOOTER)
+
+
+# --------------------------------------------------------------------------- #
+# Action-history page (#62) — read-only view of the web-reclaim audit rows      #
+# --------------------------------------------------------------------------- #
+
+def _action_backend(action: object) -> str:
+    """The backend an audit row targeted, from its ``web-reclaim:<backend>`` action
+    (``filesystem``/``radarr``/``sonarr``); unrecognized values pass through."""
+
+    text = str(action or "")
+    prefix = "web-reclaim:"
+    return text[len(prefix):] if text.startswith(prefix) else (text or "?")
+
+
+def _status_tag(status: object) -> str:
+    text = str(status or "?")
+    css = {"deleted": "keep", "error": "tracked"}.get(text, "unknown")
+    return f'<span class="tag {css}">{_esc(text)}</span>'
+
+
+def _action_row(row: dict) -> str:
+    occurred = row.get("occurred_at")
+    stamp = _utc_stamp(occurred) if isinstance(occurred, (int, float)) else str(occurred)
+    # An ``error`` row records the target's size for the audit trail, but nothing was
+    # actually freed — so only a ``deleted`` row shows reclaimed bytes; a failure
+    # shows a dash, never a misleading "N GiB reclaimed" next to a red error tag.
+    reclaimed = _fmt_gib(row.get("size", 0)) if row.get("status") == "deleted" else "—"
+    return (
+        "<tr>"
+        f'<td class="num">{_esc(stamp)}</td>'
+        f'<td>{_esc(_action_backend(row.get("action")))}</td>'
+        f'<td>{_status_tag(row.get("status"))}</td>'
+        f'<td class="num">{_esc(reclaimed)}</td>'
+        f'<td><code>{_esc(row.get("path", "?"))}</code></td>'
+        f'<td>{_esc(row.get("message", ""))}</td>'
+        "</tr>"
+    )
+
+
+def render_actions_html(rows: Optional[List[dict]]) -> str:
+    """Render the read-only reclaim action-history page (pure).
+
+    ``None`` (no store wired, or a missing/legacy DB) and an empty list each render a
+    friendly empty state; a populated list renders a newest-first table. Every stored
+    string (path, message) is HTML-escaped, exactly like the report viewer."""
+
+    body: List[str] = [
+        "<h1>Reclaim action history</h1>",
+        '<p class="nav"><a href="/">&larr; Back to the report</a></p>',
+    ]
+    if rows is None:
+        body.append(
+            '<div class="empty">No action history is available yet. Each delete the browser '
+            "action layer makes (and any failure) is recorded in the SQLite state store and "
+            "listed here, newest first. Enable actions "
+            "(<code>WEB_ENABLE_ACTIONS=true</code>) and reclaim a copy to populate it.</div>"
+        )
+    elif not rows:
+        body.append(
+            '<div class="empty">No reclaim actions have been recorded yet. Deletes made '
+            "through the browser action layer will appear here, newest first.</div>"
+        )
+    else:
+        body.append(
+            f'<p class="sub">{len(rows)} most recent reclaim action(s), newest first. '
+            "Dry-run previews and refusals are not deletes, so they are not recorded.</p>"
+        )
+        table_rows = "".join(_action_row(row) for row in rows)
+        body.append(
+            "<table><thead><tr><th>Time (UTC)</th><th>Backend</th><th>Status</th>"
+            "<th>Reclaimed</th><th>Path</th><th>Detail</th></tr></thead>"
+            f"<tbody>{table_rows}</tbody></table>"
+        )
+    return _page("Reclaim action history", "".join(body), footer_note=_READONLY_FOOTER)
 
 
 def _render_meta(payload: dict) -> str:
@@ -655,6 +818,106 @@ def _parse_form_reclaim(raw: bytes) -> tuple:
 
 
 # --------------------------------------------------------------------------- #
+# CSRF / origin policy (#63) — pure, so the whole matrix is unit-testable       #
+# --------------------------------------------------------------------------- #
+
+def _is_loopback_bind(address: str) -> bool:
+    """Whether ``address`` binds only loopback (so the default posture is unchanged).
+
+    ``0.0.0.0``/``::``/``""`` bind *all* interfaces — reachable off-box — so they are
+    treated as exposed (non-loopback). ``localhost`` and any loopback IP are
+    loopback. An unresolvable/hostname bind is treated as exposed (fail-closed to the
+    stricter browser-origin requirement)."""
+
+    addr = (address or "").strip()
+    if addr in ("", "0.0.0.0", "::", "*"):
+        return False
+    if addr == "localhost":
+        return True
+    if addr.startswith("[") and addr.endswith("]"):
+        addr = addr[1:-1]  # a bracketed IPv6 literal, e.g. [::1]
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
+
+
+def _normalize_origin(value: Optional[str]) -> Optional[str]:
+    """Normalize a URL to its ``scheme://host[:port]`` origin, dropping the default
+    port (browsers omit ``:80``/``:443`` in ``Origin``). Returns ``None`` for a
+    missing, opaque (``"null"``), or malformed value so it can never match."""
+
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value.strip())
+        # ``.port`` raises ValueError on a non-numeric or out-of-range port; a client
+        # controls this header, so a hostile ``Origin: http://h:999999`` must refuse
+        # (return None), never crash the request thread with an uncaught exception.
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if not scheme or not parsed.netloc:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # re-bracket an IPv6 literal for the reassembled origin
+    if port is None or (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def _origin_matches(candidate: Optional[str], host: str, allowed_origins: Sequence[str]) -> bool:
+    """Whether a request ``Origin``/``Referer`` origin is permitted.
+
+    With an explicit ``allowed_origins`` allow-list (for a TLS-terminating proxy),
+    the origin must be one of those exactly (scheme + host + port). Without one, it
+    must be same-origin against the client ``Host`` at the server's real scheme
+    (plain ``http``) — so an ``https`` origin behind a proxy is refused unless the
+    operator lists it, rather than trusting an unverifiable scheme."""
+
+    normalized = _normalize_origin(candidate)
+    if normalized is None:
+        return False
+    if allowed_origins:
+        return normalized in allowed_origins
+    return normalized == _normalize_origin(f"http://{host}")
+
+
+def _request_origin_ok(
+    *,
+    origin: Optional[str],
+    referer: Optional[str],
+    host: str,
+    allowed_origins: Sequence[str],
+    browser_path: bool,
+    require_browser_origin: bool,
+) -> bool:
+    """The CSRF/origin decision for one reclaim request.
+
+    * **JSON API** (``browser_path=False``): an ``Origin``, if present, must match;
+      its absence is allowed (the token still gates ``curl``/programmatic clients).
+    * **Browser form** (``browser_path=True``): an ``Origin`` — or a same-origin
+      ``Referer`` fallback — must match. When ``require_browser_origin`` (a
+      non-loopback bind), the *absence* of both is refused, so a cross-site form POST
+      that omits ``Origin`` is rejected. On a loopback bind the absence is tolerated,
+      keeping the default deployment's behavior unchanged."""
+
+    if not browser_path:
+        if not origin:
+            return True
+        return _origin_matches(origin, host, allowed_origins)
+
+    candidate = origin or referer
+    if not candidate:
+        return not require_browser_origin
+    return _origin_matches(candidate, host, allowed_origins)
+
+
+# --------------------------------------------------------------------------- #
 # HTTP server                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -686,6 +949,14 @@ class _Handler(BaseHTTPRequestHandler):
         service = self._reclaim
         return bool(service is not None and service.enabled)
 
+    @property
+    def _allowed_origins(self) -> Sequence[str]:
+        return getattr(self.server, "web_allowed_origins", ())  # type: ignore[attr-defined]
+
+    @property
+    def _require_browser_origin(self) -> bool:
+        return bool(getattr(self.server, "require_browser_origin", False))  # type: ignore[attr-defined]
+
     def _resolve(self, path: str) -> tuple:
         """Return ``(status, content_type, body_bytes)`` for a route.
 
@@ -703,6 +974,15 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             if path == "/api/report":
                 body = json.dumps(self._viewer.report_api(), sort_keys=True).encode("utf-8")
+                return HTTPStatus.OK, "application/json; charset=utf-8", body
+            if path == "/actions":
+                return (
+                    HTTPStatus.OK,
+                    "text/html; charset=utf-8",
+                    self._viewer.render_actions_html().encode("utf-8"),
+                )
+            if path == "/api/actions":
+                body = json.dumps(self._viewer.actions_api(), sort_keys=True).encode("utf-8")
                 return HTTPStatus.OK, "application/json; charset=utf-8", body
             if path == "/healthz":
                 return HTTPStatus.OK, "text/plain; charset=utf-8", b"ok\n"
@@ -777,7 +1057,7 @@ class _Handler(BaseHTTPRequestHandler):
         part_id}], token?}`` body. The token may also arrive as an ``X-Action-Token``
         header. Returns the reclaim result as JSON with the service's status code."""
 
-        if not self._origin_ok():
+        if not self._origin_ok(browser_path=False):
             self._write_json(HTTPStatus.FORBIDDEN, {"message": "cross-origin request refused"})
             return
         raw = self._read_body()
@@ -804,12 +1084,15 @@ class _Handler(BaseHTTPRequestHandler):
         ``report_generated_at``, and repeated ``target=rating_key:part_id``). Renders
         an HTML result page."""
 
-        if not self._origin_ok():
+        if not self._origin_ok(browser_path=True):
             self._write_html(
                 HTTPStatus.FORBIDDEN,
                 _page(
                     "Reclaim refused",
                     '<h1>Cross-origin request refused</h1>'
+                    '<p class="sub">This reclaim form must be submitted from the report '
+                    "page on this same server. If you reach the UI through a reverse "
+                    "proxy, set <code>WEB_ALLOWED_ORIGINS</code> to its external origin.</p>"
                     '<p class="sub"><a href="/">&larr; Back to the report</a></p>',
                     footer_note=_ACTION_FOOTER,
                 ),
@@ -824,17 +1107,20 @@ class _Handler(BaseHTTPRequestHandler):
         )
         self._write_html(response.status_code, render_reclaim_result_html(response))
 
-    def _origin_ok(self) -> bool:
-        """Reject a cross-origin POST (a CSRF defense on top of the token): if an
-        ``Origin`` header is present it must match the request ``Host``. A request
-        with no ``Origin`` (curl, the JSON API) is allowed — the token still gates
-        it."""
+    def _origin_ok(self, *, browser_path: bool) -> bool:
+        """Apply the CSRF/origin policy (:func:`_request_origin_ok`) to this request,
+        reading its ``Origin``/``Referer``/``Host`` headers. ``browser_path`` selects
+        the stricter browser-form rule (Origin/Referer required on a non-loopback
+        bind) over the token-only JSON-API rule."""
 
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        host = self.headers.get("Host") or ""
-        return urlparse(origin).netloc == host
+        return _request_origin_ok(
+            origin=self.headers.get("Origin"),
+            referer=self.headers.get("Referer"),
+            host=self.headers.get("Host") or "",
+            allowed_origins=self._allowed_origins,
+            browser_path=browser_path,
+            require_browser_origin=self._require_browser_origin,
+        )
 
     def _read_body(self) -> Optional[bytes]:
         """Read the request body, enforcing the size cap. Returns ``None`` (after
@@ -890,7 +1176,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", _csp(self._actions_enabled))
-        self.send_header("Referrer-Policy", "no-referrer")
+        # ``same-origin`` when the action form is served, so a same-origin form POST
+        # carries a ``Referer`` the CSRF check can use as an ``Origin`` fallback while
+        # still sending no referrer cross-site; ``no-referrer`` for the read-only
+        # viewer, which has no form and leaks nothing.
+        self.send_header(
+            "Referrer-Policy", "same-origin" if self._actions_enabled else "no-referrer"
+        )
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         LOGGER.debug("web %s - %s", self.address_string(), format % args)
@@ -912,6 +1204,8 @@ class DuplicateReportServer:
         viewer: DuplicateReportViewer,
         *,
         reclaim_service: Optional[ReclaimService] = None,
+        require_browser_origin: bool = False,
+        allowed_origins: Sequence[str] = (),
     ) -> None:
         self._httpd = ThreadingHTTPServer((bind_address, port), _Handler)
         self._httpd.daemon_threads = True
@@ -919,6 +1213,11 @@ class DuplicateReportServer:
         # ``None`` (or a service whose actions are disabled) keeps the server a
         # read-only viewer — every POST is 405.
         self._httpd.reclaim_service = reclaim_service  # type: ignore[attr-defined]
+        # CSRF/origin policy (#63). ``require_browser_origin`` (set by ``build_server``
+        # for a non-loopback bind) makes a browser reclaim form prove its origin;
+        # ``allowed_origins`` is the normalized allow-list for a reverse-proxy setup.
+        self._httpd.require_browser_origin = require_browser_origin  # type: ignore[attr-defined]
+        self._httpd.web_allowed_origins = tuple(allowed_origins)  # type: ignore[attr-defined]
         self._started = False
 
     @property
@@ -954,11 +1253,41 @@ class DuplicateReportServer:
         self._httpd.server_close()
 
 
+def _normalized_allowed_origins(raw: Sequence[str]) -> tuple:
+    """Normalize the configured allow-list to comparable ``scheme://host[:port]``
+    origins, dropping unparseable entries and duplicates."""
+
+    normalized: List[str] = []
+    for entry in raw or ():
+        origin = _normalize_origin(entry)
+        if origin is None:
+            # A dropped entry silently collapses the allow-list toward the weaker
+            # same-origin-vs-Host fallback, so surface the misconfiguration loudly.
+            LOGGER.warning(
+                "ignoring unparseable WEB_ALLOWED_ORIGINS entry %r "
+                "(expected a full origin like https://media.example.com)",
+                entry,
+            )
+            continue
+        if origin not in normalized:
+            normalized.append(origin)
+    return tuple(normalized)
+
+
+def _default_action_history(config: Config) -> ActionHistoryProvider:
+    """A history provider reading the config's state DB read-only (a long-lived,
+    query-only connection that never creates or migrates it), so ``/actions`` works
+    whether or not actions are enabled."""
+
+    return WebActionHistoryReader(config.state_db_path, limit=_ACTION_HISTORY_LIMIT)
+
+
 def build_server(
     config: Config,
     *,
     provider: Optional[ReportProvider] = None,
     reclaim_service: Optional[ReclaimService] = None,
+    action_history: Optional[ActionHistoryProvider] = None,
 ) -> DuplicateReportServer:
     """Construct a viewer server from ``config`` (tests inject a fake provider).
 
@@ -966,12 +1295,33 @@ def build_server(
     the audit store) and passed in; when it is ``None`` — or its actions are
     disabled — the server is the Phase 1 read-only viewer. The page renders the
     action form only when the attached service actually has actions enabled.
+
+    ``action_history`` backs the read-only ``/actions`` page; when omitted it reads
+    the config's state DB read-only. The CSRF/origin posture is derived from the bind
+    address (loopback stays permissive; a non-loopback bind requires a browser form
+    to prove its origin) plus the ``WEB_ALLOWED_ORIGINS`` allow-list.
     """
 
     if provider is None:
         provider = file_report_provider(config.plex_duplicate_report_path)
+    if action_history is None:
+        action_history = _default_action_history(config)
     actions_enabled = reclaim_service is not None and reclaim_service.enabled
-    viewer = DuplicateReportViewer(provider, actions_enabled=actions_enabled)
+    viewer = DuplicateReportViewer(
+        provider, actions_enabled=actions_enabled, action_history=action_history
+    )
+    allowed_origins = _normalized_allowed_origins(config.web_allowed_origins)
+    # Require a browser form to prove its origin on a non-loopback bind OR whenever an
+    # allow-list is configured: configuring ``WEB_ALLOWED_ORIGINS`` is the signal for a
+    # reverse-proxy deployment, which can forward to a *loopback* bind — leaving
+    # ``require_browser_origin`` off there would accept an origin-less cross-site form
+    # POST through the proxy before the allow-list is ever consulted.
+    require_browser_origin = bool(allowed_origins) or not _is_loopback_bind(config.web_bind_address)
     return DuplicateReportServer(
-        config.web_bind_address, config.web_port, viewer, reclaim_service=reclaim_service
+        config.web_bind_address,
+        config.web_port,
+        viewer,
+        reclaim_service=reclaim_service,
+        require_browser_origin=require_browser_origin,
+        allowed_origins=allowed_origins,
     )

@@ -187,6 +187,16 @@ class Config:
     web_actions_dry_run: bool = True
     web_action_token: str = ""
     web_media_path_map: tuple[tuple[Path, Path], ...] = ()
+    # CSRF/origin hardening for a non-loopback bind (#63). When the server binds
+    # beyond loopback (the Unraid ``0.0.0.0`` path), a browser reclaim form must
+    # present a matching ``Origin`` (or same-origin ``Referer``); the JSON API stays
+    # token-only when it sends no ``Origin`` (so ``curl`` still works). ``web_allowed_origins``
+    # is an explicit allow-list of full origins (``scheme://host[:port]``) for a
+    # deployment behind a TLS-terminating reverse proxy, where the server sees plain
+    # HTTP and a client-supplied ``Host`` cannot be trusted to infer the external
+    # scheme. Empty (the default) keeps the same-origin-vs-``Host`` check. Appended
+    # with a default so existing positional Config(...) calls and from_env keep working.
+    web_allowed_origins: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -244,6 +254,7 @@ class Config:
             web_actions_dry_run=_parse_bool(os.getenv("WEB_ACTIONS_DRY_RUN"), True),
             web_action_token=os.getenv("WEB_ACTION_TOKEN", ""),
             web_media_path_map=_parse_path_map(os.getenv("WEB_MEDIA_PATH_MAP")),
+            web_allowed_origins=_parse_str_list(os.getenv("WEB_ALLOWED_ORIGINS")),
         )
         config.ensure_directories()
         return config

@@ -103,10 +103,15 @@ The project's **first inbound listener** — every other surface is an outbound
 client. A stdlib `ThreadingHTTPServer` + `BaseHTTPRequestHandler` (no
 Flask/FastAPI, per the stdlib-only rule) that serves the on-disk
 `plex_duplicate_report_path` snapshot as a browsable HTML page (`/`) and a JSON
-API (`/api/report`), plus a `/healthz` liveness route. The GET path is rigorously
-read-only: it constructs **no** Plex/`*arr`/qBittorrent/SQLite client and never
+API (`/api/report`), plus a `/healthz` liveness route and a read-only
+action-history view (`/actions` + `/api/actions`). The GET path is rigorously
+read-only: it constructs **no** Plex/`*arr`/qBittorrent client and never
 regenerates the report — a page load only reads a file the `plex-duplicates`
-subcommand (or a cron) already wrote, so it can never fan out to Plex. The
+subcommand (or a cron) already wrote, so it can never fan out to Plex. The one GET
+that touches SQLite is the history view, a bounded, indexed, newest-first SELECT of
+the `web-reclaim:*` audit rows over a long-lived, query-only connection (opened once,
+reused, never creating or migrating the DB) so a page load is a pure SELECT that never
+checkpoints (`state.WebActionHistoryReader`). The
 rendering functions are pure over the report dict, and the report is supplied by
 an injectable provider (the default reads the file; tests inject a fake), so the
 server is unit-tested end-to-end on an ephemeral port without any network
@@ -130,8 +135,13 @@ entire safety envelope and is constructed with injected collaborators (report
 provider, filesystem deleter, Radarr/Sonarr clients, audit sink, clock) so every
 path is fake-tested without a real socket or disk write. Fail-closed on every
 axis: disabled + dry-run by default; a shared `WEB_ACTION_TOKEN` is required
-(enabling actions without one refuses every request) and a cross-origin POST is
-rejected; targets are resolved only against a *fresh* server-side report snapshot
+(enabling actions without one refuses every request); on top of the token a
+CSRF/origin check scales with the bind address — loopback stays permissive (the
+default), but a non-loopback bind requires a browser reclaim *form* to present a
+matching `Origin`/`Referer` (a cross-site form POST is refused even without
+`Origin`), while the JSON API stays token-only when no `Origin` is sent, and a
+`WEB_ALLOWED_ORIGINS` allow-list covers a TLS-terminating reverse proxy; targets
+are resolved only against a *fresh* server-side report snapshot
 (client-supplied path/association/size/backend are never trusted) and a stale
 `generated_at` is a `409`; the keeper, `mismatch` groups, and `unknown`
 associations are refused; one lock serializes snapshot → validate → delete →
@@ -158,7 +168,7 @@ This version focuses on safe orphan cleanup for qBittorrent download/cache paths
 
 - subscribe to qBittorrent push events
 - regenerate the report or trigger a Plex rescan from the web UI (it serves the on-disk snapshot)
-- offer an undo/quarantine or action-history UI (deletes are audited to the `actions` table)
+- offer an undo/quarantine for a completed delete (a read-only action-history UI exists at `/actions`, backed by the audited `web-reclaim:*` rows, but a delete is not reversible)
 - publish metrics
 
 ### Opt-in RAR extraction

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import secrets
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -47,6 +48,87 @@ _BUSY_TIMEOUT_SECONDS = 30.0
 # Keep it >= the archive tool's own timeout (default 3600s) so a genuinely slow
 # extraction is never mistaken for a crash and reclaimed out from under itself.
 CLAIM_TTL_SECONDS = 7200
+
+#: SQL ``LIKE`` prefix selecting only the web GUI's reclaim audit rows (written by
+#: :class:`~unraid_cache_cleaner.web_actions.ReclaimService` as ``web-reclaim:*``),
+#: so the read-only history endpoint never surfaces the cleaner's/extractor's own
+#: rows in the shared ``actions`` table.
+_WEB_RECLAIM_LIKE = "web-reclaim:%"
+
+#: Hard cap on the history the read-only endpoint returns, so a page load can never
+#: pull an unbounded audit table into memory regardless of the requested limit.
+_ACTION_HISTORY_MAX = 1000
+
+
+class WebActionHistoryReader:
+    """A long-lived, read-only reader for the web-reclaim audit rows (#62).
+
+    Backs the ``/actions`` + ``/api/actions`` history endpoints. Design points, each
+    answering a way the naive per-request read went wrong:
+
+    * **One long-lived connection, reused** (opened lazily on first use, guarded by a
+      lock). A *per-request* connection on a WAL DB is a write on GET — opening it
+      creates the ``-wal``/``-shm`` sidecars and closing the last one checkpoints the
+      WAL back into the main file. A single reused connection makes a page load a pure
+      ``SELECT``: it never opens/closes per request, so it never checkpoints. The lock
+      serializes concurrent request threads (SQLite forbids concurrent use of one
+      connection).
+    * **``PRAGMA query_only``** hard-refuses any write on the connection, so the reader
+      can never mutate the audit table even by mistake.
+    * **Never creates the DB**: the connection is opened only once the file exists, so
+      a page load on a fresh install returns ``None`` (unavailable) rather than
+      creating ``state.sqlite3``.
+    * A legacy store with no ``actions`` table, or a corrupt/non-SQLite file, returns
+      ``None`` (unavailable) — never a propagated exception or a page 500.
+
+    Only ``web-reclaim:*`` rows are returned (not the cleaner's/extractor's own
+    ``actions`` rows), ordered ``occurred_at DESC, id DESC`` and capped. The
+    ``ix_actions_occurred_at`` index (created by :meth:`StateStore._initialize`) lets
+    that query walk newest-first and stop at the ``LIMIT`` instead of scanning and
+    sorting the whole shared table.
+    """
+
+    def __init__(self, db_path: Path, *, limit: int = 200) -> None:
+        self._db_path = db_path
+        self._limit = max(0, min(int(limit), _ACTION_HISTORY_MAX))
+        self._lock = threading.Lock()
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def __call__(self) -> Optional[list[dict]]:
+        if self._limit == 0:
+            return None
+        with self._lock:
+            conn = self._ensure_conn()
+            if conn is None:
+                return None
+            try:
+                rows = conn.execute(
+                    "SELECT path, action, status, size, message, occurred_at "
+                    "FROM actions WHERE action LIKE ? "
+                    "ORDER BY occurred_at DESC, id DESC LIMIT ?",
+                    (_WEB_RECLAIM_LIKE, self._limit),
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                # Legacy store (no ``actions`` table → OperationalError) or a corrupt
+                # file (DatabaseError, the parent class): unavailable, not empty.
+                return None
+            return [dict(row) for row in rows]
+
+    def _ensure_conn(self) -> Optional[sqlite3.Connection]:
+        if self._conn is not None:
+            return self._conn
+        if not self._db_path.exists():
+            return None  # never create the DB from a page load
+        try:
+            conn = sqlite3.connect(
+                self._db_path, check_same_thread=False, timeout=_BUSY_TIMEOUT_SECONDS
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+        except sqlite3.DatabaseError:
+            return None
+        self._conn = conn
+        return conn
 
 
 class StateStore:
@@ -128,6 +210,16 @@ class StateStore:
                     occurred_at REAL NOT NULL
                 )
                 """
+            )
+            # Index for the read-only web history query (#62): a plain index on
+            # ``occurred_at`` implicitly carries the rowid (= ``id``), so traversing it
+            # in reverse yields ``occurred_at DESC, id DESC`` directly — the planner
+            # walks newest-first, applies the ``action LIKE 'web-reclaim:%'`` filter,
+            # and stops at the ``LIMIT`` instead of scanning and sorting the whole
+            # (potentially large) shared actions table on every page load. Created
+            # here so an existing store gains it on the next open (additive migration).
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_actions_occurred_at ON actions(occurred_at)"
             )
             # One row per archive that has been claimed/extracted. Replaces the
             # bash tool's flat processed_files.log: `status='claimed'` is an

@@ -126,6 +126,7 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `WEB_ACTIONS_DRY_RUN` | `true` | When actions are on, report what a reclaim *would* delete and touch nothing (mirrors `DRY_RUN`). Set `false` only after reviewing a dry run |
 | `WEB_ACTION_TOKEN` | empty | Shared secret every reclaim must present (`X-Action-Token` header or the form field). **Required** to actually delete: with actions enabled but no token, every reclaim is refused |
 | `WEB_MEDIA_PATH_MAP` | empty | Comma-separated `plex_prefix:container_prefix` pairs mapping Plex-reported paths to this container's mounts, e.g. `/mnt/user/Media:/media`. Needed for a filesystem delete of an *untracked* copy; an unmapped path is refused |
+| `WEB_ALLOWED_ORIGINS` | empty | Comma-separated allow-list of external origins (e.g. `https://media.example.com`) that may submit the reclaim form. Set this behind a TLS-terminating reverse proxy, where the server sees plain HTTP and can't trust `Host` to infer the external scheme. Empty uses the same-origin-vs-`Host` check (the LAN default). See [CSRF/origin hardening](#reclaiming-duplicates-from-the-browser-phase-2) |
 
 > **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup. The optional `RADARR_*`/`SONARR_*` variables add [`*arr`-tracking annotations](#radarrsonarr-tracking-optional) to that report; each is inert unless both its URL and API key are set.
 
@@ -250,6 +251,8 @@ Open `http://<host>:8080/`. Routes:
 | --- | --- | --- |
 | `/` | GET | The HTML report (totals, reclaimable, mismatch review, `*arr`-tracked) |
 | `/api/report` | GET | `{"available": bool, "report": <report JSON or null>}` |
+| `/actions` | GET | Read-only [action-history](#action-history) page — what the browser layer has deleted |
+| `/api/actions` | GET | `{"available": bool, "actions": [...]}` — the recent `web-reclaim:*` audit rows |
 | `/healthz` | GET | `ok` (liveness) |
 | `/api/reclaim` | POST | Reclaim endpoint (JSON) — only when actions are enabled; `405` otherwise |
 | `/actions/reclaim` | POST | Browser-form reclaim — only when actions are enabled |
@@ -280,7 +283,17 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
 - **Token-gated.** Every reclaim must present `WEB_ACTION_TOKEN` (via the
   `X-Action-Token` header or the form's token field). Enabling actions **without**
   a token refuses every request — there is never an unauthenticated delete endpoint.
-  A cross-origin POST is also rejected.
+- **CSRF/origin hardened.** On top of the token, a same-origin check defends against
+  a cross-site request forgery. It scales with the bind address:
+  - **Loopback bind (`127.0.0.1`, the code default):** behavior is unchanged — a
+    form POST with no `Origin` is accepted (the token still gates it).
+  - **Non-loopback bind (`0.0.0.0`, the container default):** a browser reclaim
+    **form** must carry a matching `Origin` (or same-origin `Referer`); a cross-site
+    form POST is refused *even if it omits `Origin`*. The **JSON API** stays
+    token-only when it sends no `Origin`, so `curl`/scripts keep working.
+  - **Behind a TLS reverse proxy:** the server sees plain HTTP and can't trust the
+    client `Host` to infer the external `https` scheme, so set `WEB_ALLOWED_ORIGINS`
+    to the external origin(s) the browser sends (e.g. `https://media.example.com`).
 - **Honors the report's safety signals.** The keeper is never deleted, a `mismatch`
   group (Plex merged different titles) is never reclaimed, and an `unknown`
   association is never auto-deleted. Targets are resolved against a *fresh*
@@ -304,6 +317,24 @@ curl -X POST http://<host>:8080/api/reclaim \
 
 Because it deletes media, keep it bound to a trusted LAN, keep a token set, and
 prefer routing tracked copies through Radarr/Sonarr over raw filesystem deletes.
+
+#### Action history
+
+Every real delete (and any partial failure) the browser layer makes is recorded in
+the SQLite state store's `actions` table, so you can answer "what did the GUI
+delete". Two **read-only** views surface it:
+
+- **`GET /actions`** — a page listing the most recent reclaim deletes, newest first
+  (time, backend, status, bytes reclaimed, path, detail). The report page links to
+  it whenever the state store is reachable.
+- **`GET /api/actions`** — `{"available": bool, "actions": [...]}` for scripting.
+
+These read only the `web-reclaim:*` rows (not the cleaner's own deletes), over a
+long-lived, query-only connection (opened once and reused, never creating or
+migrating the database) so a page load is a pure indexed `SELECT` that never writes —
+they work even after you turn actions back off, and a missing/legacy store simply
+reports `available: false`. Dry-run previews and refusals aren't deletes, so they
+are not recorded.
 
 ## RAR extraction
 

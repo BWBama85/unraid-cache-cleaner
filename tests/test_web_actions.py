@@ -27,6 +27,7 @@ from unraid_cache_cleaner.config import Config
 from unraid_cache_cleaner.web import (
     DuplicateReportServer,
     DuplicateReportViewer,
+    build_server,
     render_report_html,
 )
 from unraid_cache_cleaner.web_actions import (
@@ -683,9 +684,16 @@ class ActionIndexTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 @contextmanager
-def _serve(payload, service):
+def _serve(payload, service, *, require_browser_origin=False, allowed_origins=()):
     viewer = DuplicateReportViewer(lambda: payload, actions_enabled=service.enabled)
-    server = DuplicateReportServer("127.0.0.1", 0, viewer, reclaim_service=service)
+    server = DuplicateReportServer(
+        "127.0.0.1",
+        0,
+        viewer,
+        reclaim_service=service,
+        require_browser_origin=require_browser_origin,
+        allowed_origins=allowed_origins,
+    )
     server.start_background()
     try:
         yield f"http://127.0.0.1:{server.port}"
@@ -782,6 +790,147 @@ class HttpEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Reclaim result", raw)
         self.assertIn(b"DRY-RUN", raw)
+
+
+class CsrfHardeningHttpTests(unittest.TestCase):
+    """#63: the browser-form origin gate on a non-loopback bind, driven over HTTP."""
+
+    def _dry_service(self):
+        payload = _untracked_payload()
+        return payload, _service(payload, config=_config(web_actions_dry_run=True))
+
+    def test_loopback_form_without_origin_still_works(self) -> None:
+        # The default (loopback) posture is unchanged: a form POST with no Origin
+        # is accepted (the token still gates it).
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(payload, service, require_browser_origin=False) as base:
+            status, raw = _post(
+                base + "/actions/reclaim", form, {"Content-Type": "application/x-www-form-urlencoded"}
+            )
+        self.assertEqual(status, 200)
+        self.assertIn(b"Reclaim result", raw)
+
+    def test_nonloopback_form_without_origin_is_403(self) -> None:
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(payload, service, require_browser_origin=True) as base:
+            status, raw = _post(
+                base + "/actions/reclaim", form, {"Content-Type": "application/x-www-form-urlencoded"}
+            )
+        self.assertEqual(status, 403)
+        self.assertIn(b"Cross-origin request refused", raw)
+
+    def test_nonloopback_form_with_matching_origin_ok(self) -> None:
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(payload, service, require_browser_origin=True) as base:
+            status, raw = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Origin": base},
+            )
+        self.assertEqual(status, 200)
+        self.assertIn(b"Reclaim result", raw)
+
+    def test_nonloopback_form_with_cross_origin_is_403(self) -> None:
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(payload, service, require_browser_origin=True) as base:
+            status, _ = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Origin": "http://evil.example"},
+            )
+        self.assertEqual(status, 403)
+
+    def test_nonloopback_form_same_origin_referer_fallback_ok(self) -> None:
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(payload, service, require_browser_origin=True) as base:
+            status, _ = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Referer": base + "/"},
+            )
+        self.assertEqual(status, 200)
+
+    def test_allowlist_accepts_external_proxy_origin(self) -> None:
+        # Behind a TLS proxy the browser Origin is the external https origin, which
+        # only the allow-list can vouch for (the server itself is plain http).
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(
+            payload, service, require_browser_origin=True,
+            allowed_origins=("https://media.example.com",),
+        ) as base:
+            status, _ = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://media.example.com"},
+            )
+        self.assertEqual(status, 200)
+
+    def test_nonloopback_json_without_origin_still_token_only(self) -> None:
+        # The JSON API is unaffected by the browser-form requirement: no Origin +
+        # a valid token succeeds even on a non-loopback bind.
+        payload = _untracked_payload()
+        service = _service(payload, config=_config(web_actions_dry_run=True))
+        body = json.dumps({"report_generated_at": GEN, "targets": [{"rating_key": "900", "part_id": 2}]}).encode()
+        with _serve(payload, service, require_browser_origin=True) as base:
+            status, _ = _post(
+                base + "/api/reclaim", body, {"Content-Type": "application/json", "X-Action-Token": "tok"}
+            )
+        self.assertEqual(status, 200)
+
+    def test_allowlist_on_loopback_bind_still_requires_browser_origin(self) -> None:
+        # A reverse proxy can forward to a LOOPBACK bind, so configuring an allow-list
+        # must flip on the browser-origin requirement there too — otherwise an
+        # origin-less cross-site form POST slips through before the list is consulted.
+        payload = _untracked_payload()
+        config = _config(
+            web_actions_dry_run=True,
+            web_bind_address="127.0.0.1",  # loopback
+            web_allowed_origins=("https://ext.example",),
+        )
+        service = _service(payload, config=config)
+        server = build_server(config, provider=lambda: payload, reclaim_service=service)
+        server.start_background()
+        try:
+            base = f"http://127.0.0.1:{server.port}"
+            form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+            no_origin, _ = _post(
+                base + "/actions/reclaim", form, {"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            listed, _ = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://ext.example"},
+            )
+        finally:
+            server.shutdown()
+        self.assertEqual(no_origin, 403)  # origin-less form POST refused despite loopback
+        self.assertEqual(listed, 200)     # the allow-listed proxy origin is accepted
+
+    def test_malformed_origin_is_clean_403_not_dropped_connection(self) -> None:
+        # A hostile bad-port Origin must yield a clean 403, never crash the request
+        # thread (urlparse(...).port raises ValueError) and drop the connection.
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(payload, service, require_browser_origin=True) as base:
+            status, _ = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Origin": "http://evil:999999"},
+            )
+        self.assertEqual(status, 403)
+
+    def test_referrer_policy_same_origin_when_actions_enabled(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        with _serve(payload, service) as base:
+            with urllib.request.urlopen(base + "/", timeout=5) as resp:
+                self.assertEqual(resp.headers.get("Referrer-Policy"), "same-origin")
 
 
 class ActionFormRenderTests(unittest.TestCase):

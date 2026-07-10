@@ -274,6 +274,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(config.web_actions_dry_run)
                 self.assertEqual(config.web_action_token, "")
                 self.assertEqual(config.web_media_path_map, ())
+                self.assertEqual(config.web_allowed_origins, ())
 
     def test_web_action_env_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -285,6 +286,7 @@ class ConfigTests(unittest.TestCase):
                 "WEB_ACTIONS_DRY_RUN": "false",
                 "WEB_ACTION_TOKEN": "s3cr3t",
                 "WEB_MEDIA_PATH_MAP": "/mnt/user/Media:/media, /mnt/user/TV:/tv",
+                "WEB_ALLOWED_ORIGINS": "https://media.example.com, http://192.168.1.5:8080",
             }
             with mock.patch.dict(os.environ, env, clear=True):
                 config = Config.from_env()
@@ -294,6 +296,10 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(
                     config.web_media_path_map,
                     ((Path("/mnt/user/Media"), Path("/media")), (Path("/mnt/user/TV"), Path("/tv"))),
+                )
+                self.assertEqual(
+                    config.web_allowed_origins,
+                    ("https://media.example.com", "http://192.168.1.5:8080"),
                 )
 
     def test_web_media_path_map_skips_malformed_entries(self) -> None:

@@ -25,8 +25,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from unraid_cache_cleaner.web import (
     DuplicateReportServer,
     DuplicateReportViewer,
+    _is_loopback_bind,
+    _normalize_origin,
+    _normalized_allowed_origins,
+    _request_origin_ok,
     build_server,
     file_report_provider,
+    render_actions_html,
     render_report_html,
 )
 
@@ -404,6 +409,224 @@ class SecurityAndRoutingTests(unittest.TestCase):
         self.assertTrue(all(status == 200 for status in results))
 
 
+class OriginPolicyTests(unittest.TestCase):
+    """The pure CSRF/origin decision (#63), exercised as a full matrix."""
+
+    def test_normalize_origin_drops_default_ports_and_lowercases(self) -> None:
+        self.assertEqual(_normalize_origin("http://Host.Example:80"), "http://host.example")
+        self.assertEqual(_normalize_origin("https://Host.Example:443"), "https://host.example")
+        self.assertEqual(_normalize_origin("http://host:8080"), "http://host:8080")
+        self.assertEqual(_normalize_origin("http://[::1]:8080"), "http://[::1]:8080")
+
+    def test_normalize_origin_rejects_opaque_and_malformed(self) -> None:
+        for bad in (None, "", "null", "not-a-url", "/relative/path"):
+            self.assertIsNone(_normalize_origin(bad), bad)
+
+    def test_normalize_origin_rejects_bad_port_without_raising(self) -> None:
+        # urlparse(...).port raises ValueError on a bad port; a client controls this
+        # header, so it must refuse (None), never crash the request thread.
+        for bad in ("http://h:999999", "http://h:abc", "http://h:-1"):
+            self.assertIsNone(_normalize_origin(bad), bad)
+
+    def test_is_loopback_bind(self) -> None:
+        for addr in ("127.0.0.1", "::1", "[::1]", "localhost", "127.5.5.5"):
+            self.assertTrue(_is_loopback_bind(addr), addr)
+        for addr in ("0.0.0.0", "::", "", "192.168.1.5", "media.example.com"):
+            self.assertFalse(_is_loopback_bind(addr), addr)
+
+    def _ok(self, **kw):
+        base = dict(
+            origin=None, referer=None, host="127.0.0.1:8080",
+            allowed_origins=(), browser_path=True, require_browser_origin=False,
+        )
+        base.update(kw)
+        return _request_origin_ok(**base)
+
+    # -- JSON API (token-only friendly) -------------------------------------- #
+    def test_json_no_origin_allowed(self) -> None:
+        self.assertTrue(self._ok(browser_path=False, origin=None))
+
+    def test_json_matching_origin_allowed(self) -> None:
+        self.assertTrue(self._ok(browser_path=False, origin="http://127.0.0.1:8080"))
+
+    def test_json_mismatched_origin_refused(self) -> None:
+        self.assertFalse(self._ok(browser_path=False, origin="http://evil.example"))
+
+    def test_json_no_origin_allowed_even_with_allowlist(self) -> None:
+        # The JSON API stays token-only when it sends no Origin (curl), regardless of
+        # a configured allow-list.
+        self.assertTrue(self._ok(browser_path=False, origin=None,
+                                 allowed_origins=("https://media.example.com",)))
+
+    # -- Browser form on a loopback bind (unchanged default) ----------------- #
+    def test_form_loopback_no_headers_allowed(self) -> None:
+        self.assertTrue(self._ok(require_browser_origin=False, origin=None, referer=None))
+
+    def test_form_loopback_mismatched_origin_still_refused(self) -> None:
+        self.assertFalse(self._ok(require_browser_origin=False, origin="http://evil.example"))
+
+    # -- Browser form on a non-loopback bind (hardened) ---------------------- #
+    def test_form_nonloopback_missing_headers_refused(self) -> None:
+        self.assertFalse(self._ok(require_browser_origin=True, origin=None, referer=None))
+
+    def test_form_nonloopback_matching_origin_allowed(self) -> None:
+        self.assertTrue(self._ok(require_browser_origin=True, origin="http://127.0.0.1:8080"))
+
+    def test_form_nonloopback_referer_fallback(self) -> None:
+        # No Origin, but a same-origin Referer satisfies the check; a cross-site
+        # Referer does not.
+        self.assertTrue(self._ok(require_browser_origin=True, origin=None,
+                                 referer="http://127.0.0.1:8080/"))
+        self.assertFalse(self._ok(require_browser_origin=True, origin=None,
+                                  referer="http://evil.example/x"))
+
+    def test_form_nonloopback_https_needs_allowlist(self) -> None:
+        # Behind a TLS proxy the browser Origin is https but the server is http, so a
+        # bare Host comparison is scheme-mismatched (refused) until the operator lists
+        # the external origin.
+        self.assertFalse(self._ok(require_browser_origin=True, host="media.example.com",
+                                  origin="https://media.example.com"))
+        self.assertTrue(self._ok(require_browser_origin=True, host="media.example.com",
+                                 origin="https://media.example.com",
+                                 allowed_origins=("https://media.example.com",)))
+
+    def test_allowlist_rejects_unlisted_origin(self) -> None:
+        self.assertFalse(self._ok(require_browser_origin=True,
+                                  origin="http://127.0.0.1:8080",
+                                  allowed_origins=("https://media.example.com",)))
+
+    def test_normalized_allowlist_drops_and_warns_on_bad_entry(self) -> None:
+        # A scheme-less entry can't be honored; it is dropped (collapsing toward the
+        # weaker Host fallback) and the misconfiguration is logged, not silent.
+        with self.assertLogs("unraid_cache_cleaner.web", level="WARNING") as logs:
+            result = _normalized_allowed_origins(("media.example.com", "https://ok.example:443"))
+        self.assertEqual(result, ("https://ok.example",))  # default https port normalized away
+        self.assertTrue(any("WEB_ALLOWED_ORIGINS" in line for line in logs.output))
+
+    def test_bad_port_origin_over_http_is_clean_refusal(self) -> None:
+        # End-to-end: a hostile bad-port Origin refuses, never raising.
+        self.assertFalse(self._ok(require_browser_origin=True, origin="http://h:999999"))
+
+
+@contextmanager
+def _serve_with_history(report, history):
+    viewer = DuplicateReportViewer(lambda: report, action_history=history)
+    server = DuplicateReportServer("127.0.0.1", 0, viewer)
+    server.start_background()
+    try:
+        yield f"http://127.0.0.1:{server.port}"
+    finally:
+        server.shutdown()
+
+
+def _action_row(**overrides):
+    row = {
+        "path": "/lib/old.mkv",
+        "action": "web-reclaim:filesystem",
+        "status": "deleted",
+        "size": 5 * GiB,
+        "message": "rating_key=900 part_id=2",
+        "occurred_at": 1_720_000_000.0,
+    }
+    row.update(overrides)
+    return row
+
+
+class ActionHistoryViewerTests(unittest.TestCase):
+    """The read-only ``/actions`` + ``/api/actions`` history views (#62)."""
+
+    def test_render_none_is_unavailable_state(self) -> None:
+        html = render_actions_html(None)
+        self.assertIn("No action history is available", html)
+        self.assertIn("WEB_ENABLE_ACTIONS", html)
+
+    def test_render_empty_is_no_actions_state(self) -> None:
+        html = render_actions_html([])
+        self.assertIn("No reclaim actions have been recorded", html)
+
+    def test_render_rows_are_a_newest_first_table(self) -> None:
+        html = render_actions_html([_action_row(), _action_row(action="web-reclaim:radarr")])
+        self.assertIn("Reclaim action history", html)
+        self.assertIn("filesystem", html)
+        self.assertIn("radarr", html)
+        self.assertIn("5.0 GiB", html)
+        self.assertIn("2024-07-03", html)  # occurred_at stamped as UTC
+        self.assertIn("/lib/old.mkv", html)
+
+    def test_error_row_does_not_claim_reclaimed_bytes(self) -> None:
+        # An error row audits the target size, but nothing was freed — the Reclaimed
+        # column must not show "N GiB" next to a failed delete.
+        html = render_actions_html([
+            _action_row(status="error", size=5 * GiB, message="permission denied")
+        ])
+        self.assertNotIn("5.0 GiB", html)
+        self.assertIn("—", html)
+        # A successful delete still shows its reclaimed size.
+        ok = render_actions_html([_action_row(status="deleted", size=5 * GiB)])
+        self.assertIn("5.0 GiB", ok)
+
+    def test_render_escapes_hostile_path_and_message(self) -> None:
+        html = render_actions_html([
+            _action_row(path="/m/<script>x</script>.mkv", message='<img src=x onerror="a()">')
+        ])
+        self.assertNotIn("<script>x", html)
+        self.assertNotIn("<img src=x", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_api_reports_unavailable_when_history_is_none(self) -> None:
+        with _serve_with_history(None, lambda: None) as base:
+            status, headers, body = _get(base + "/api/actions")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "application/json; charset=utf-8")
+        data = json.loads(body)
+        self.assertFalse(data["available"])
+        self.assertEqual(data["actions"], [])
+
+    def test_api_reports_rows_when_available(self) -> None:
+        rows = [_action_row()]
+        with _serve_with_history(None, lambda: rows) as base:
+            status, _, body = _get(base + "/api/actions")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["available"])
+        self.assertEqual(len(data["actions"]), 1)
+        self.assertEqual(data["actions"][0]["action"], "web-reclaim:filesystem")
+
+    def test_actions_page_renders(self) -> None:
+        with _serve_with_history(None, lambda: [_action_row()]) as base:
+            status, headers, body = _get(base + "/actions")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "text/html; charset=utf-8")
+        self.assertIn(b"Reclaim action history", body)
+
+    def test_report_page_links_to_history_when_wired(self) -> None:
+        with _serve_with_history(_payload(), lambda: []) as base:
+            _, _, body = _get(base + "/")
+        self.assertIn('href="/actions"', body.decode("utf-8"))
+
+    def test_report_page_has_no_history_link_without_provider(self) -> None:
+        # The plain viewer (no action_history) does not advertise the history page.
+        with _serve(lambda: _payload()) as base:
+            _, _, report_body = _get(base + "/")
+            api_status, _, api_body = _get(base + "/api/actions")
+        self.assertNotIn('href="/actions"', report_body.decode("utf-8"))
+        # And the routes still answer read-only, reporting unavailable.
+        self.assertEqual(api_status, 200)
+        self.assertFalse(json.loads(api_body)["available"])
+
+    def test_provider_exception_degrades_to_unavailable(self) -> None:
+        def boom():
+            raise RuntimeError("db locked")
+
+        with _serve_with_history(None, boom) as base:
+            page_status, _, page_body = _get(base + "/actions")
+            api_status, _, api_body = _get(base + "/api/actions")
+        self.assertEqual(page_status, 200)
+        self.assertIn("No action history is available", page_body.decode("utf-8"))
+        self.assertEqual(api_status, 200)
+        self.assertFalse(json.loads(api_body)["available"])
+
+
 class RenderPureFunctionTests(unittest.TestCase):
     def test_render_none_is_empty_state(self) -> None:
         html = render_report_html(None)
@@ -417,6 +640,8 @@ class RenderPureFunctionTests(unittest.TestCase):
             web_bind_address = "127.0.0.1"
             web_port = 0
             plex_duplicate_report_path = Path("/nonexistent/does-not-exist.json")
+            state_db_path = Path("/nonexistent/state.sqlite3")
+            web_allowed_origins = ()
 
         server = build_server(_Cfg())
         server.start_background()
