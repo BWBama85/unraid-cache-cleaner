@@ -38,7 +38,16 @@ Fail-closed on every axis:
   drift / an id reused for a different same-named file) — no full-library fan-out, so
   a tracked reclaim costs at most one GET + one DELETE per part.
 * **Stacked-safe** — a logical copy's parts are *all* prevalidated before *any* is
-  deleted, so a multi-part copy is removed whole or refused whole.
+  deleted, so a multi-part copy is removed whole or refused whole. For a filesystem
+  copy this is enforced transactionally (#64): every part is first staged aside (an
+  in-place rename to a ``*.uncc-reclaim`` sibling — same directory, so the rename is
+  atomic and cannot fail cross-device), and only once *all* parts stage does the
+  unlink pass run; a failure to stage any part rolls the already-staged parts back,
+  leaving the copy intact with nothing deleted. The guarantee covers in-process
+  failures (``EROFS``/``EACCES`` surface at the rename, where rollback is clean); a
+  ``*arr`` reclaim is *not* transactional — a Radarr/Sonarr ``DELETE`` cannot be
+  rolled back — so its parts are prevalidated whole but deleted independently, and a
+  mid-delete failure is surfaced as a ``partial`` error (audited), not rolled back.
 """
 
 from __future__ import annotations
@@ -67,8 +76,14 @@ LOGGER = logging.getLogger(__name__)
 ReportProvider = Callable[[], Optional[dict]]
 
 #: A filesystem deleter removes one already-validated container path. Injected so a
-#: test can record calls without touching disk; production passes ``os.unlink``.
+#: test can record calls without touching disk; production passes ``os.unlink``. In
+#: the two-phase filesystem reclaim (#64) this unlinks the *staged* path.
 FilesystemDeleter = Callable[[Path], None]
+
+#: A filesystem mover renames ``src`` → ``dst`` (production: ``os.rename``). Used to
+#: stage a part aside before deleting it and to roll a staged part back on failure
+#: (#64); injected so a test can drive a mid-stage rename failure.
+FilesystemMover = Callable[[Path, Path], None]
 
 #: An audit sink persists the action records for a completed reclaim (real deletes
 #: and delete failures only — a dry-run or a refusal touches nothing to audit).
@@ -82,6 +97,12 @@ STATUS_REFUSED = "refused"
 STATUS_ERROR = "error"
 
 BACKEND_FILESYSTEM = "filesystem"
+
+#: Suffix appended in-place (same directory → same filesystem, so the rename is
+#: atomic and never hits ``EXDEV``) to stage a filesystem part aside before it is
+#: unlinked (#64). A leftover ``*.uncc-reclaim`` sibling means an earlier reclaim was
+#: interrupted mid-flight; staging refuses to clobber it rather than guess.
+STAGING_SUFFIX = ".uncc-reclaim"
 
 _MISMATCH = dedupe.MISMATCH
 
@@ -174,6 +195,30 @@ class _CopyEntry:
     #: keeper's file — such a target is refused even though it is not the keeper by
     #: identity.
     keeper_paths: frozenset = frozenset()
+
+
+@dataclass(frozen=True)
+class _DeleteJob:
+    """One prevalidated physical delete, plus the audit text the shared delete loop
+    (:meth:`ReclaimService._execute_deletes`) records for it.
+
+    ``perform`` runs the backend delete (and may raise the backend's exception);
+    ``audit_path`` is always the *original media path* (never a temporary staging
+    path), so the ``actions`` history reads the same regardless of how the delete is
+    carried out. The two message hooks are callables because their text depends on
+    the raised exception (and, for the partial summary, the running deleted-byte
+    total)."""
+
+    audit_path: Path
+    size: int
+    perform: Callable[[], None]
+    #: ``ActionRecord.message`` for the ``deleted`` row (exception-independent).
+    deleted_message: str
+    #: ``ActionRecord.message`` for the ``error`` row, given the raised exception.
+    error_message: Callable[[BaseException], str]
+    #: The :class:`ReclaimResult` ``error`` message, given the exception and the
+    #: bytes already freed before this part failed.
+    partial_message: Callable[[BaseException, int], str]
 
 
 class _ActionIndex:
@@ -338,6 +383,7 @@ class ReclaimService:
         provider: ReportProvider,
         *,
         filesystem_deleter: FilesystemDeleter = os.unlink,
+        filesystem_mover: FilesystemMover = os.rename,
         radarr: Optional[object] = None,
         sonarr: Optional[object] = None,
         audit: Optional[AuditSink] = None,
@@ -346,6 +392,7 @@ class ReclaimService:
         self._config = config
         self._provider = provider
         self._filesystem_deleter = filesystem_deleter
+        self._filesystem_mover = filesystem_mover
         self._radarr = radarr
         self._sonarr = sonarr
         self._audit = audit
@@ -491,40 +538,190 @@ class ReclaimService:
                 target, BACKEND_FILESYSTEM, total, f"{len(validated)} file(s) via filesystem"
             )
 
-        records: List[ActionRecord] = []
-        deleted_bytes = 0
-        for container_path, size in validated:
-            try:
-                self._filesystem_deleter(container_path)
-            except OSError as exc:
-                records.append(
-                    ActionRecord(
-                        path=container_path,
-                        action="web-reclaim:filesystem",
-                        status=STATUS_ERROR,
-                        size=size,
-                        message=f"rating_key={target.rating_key} part_id={target.part_id}: {exc}",
+        # Two-phase move (#64): stage every part aside first, so a per-file failure
+        # surfaces at the rename (where rollback is clean) instead of after an unlink
+        # has irreversibly committed. Only once ALL parts stage does the unlink pass
+        # run — so a stacked copy is truly removed whole or refused whole.
+        staged, stage_error = self._stage_for_delete(target, validated)
+        if stage_error is not None:
+            return stage_error
+
+        jobs = [
+            _DeleteJob(
+                # The audit and the operator-facing message name the *original* media
+                # path, never the transient staging path.
+                audit_path=original,
+                size=size,
+                perform=(lambda sp=staged_path: self._filesystem_deleter(sp)),
+                deleted_message=f"rating_key={target.rating_key} part_id={target.part_id}",
+                error_message=(
+                    lambda exc: f"rating_key={target.rating_key} part_id={target.part_id}: {exc}"
+                ),
+                partial_message=(
+                    lambda exc, done, p=original: (
+                        f"partial: deleted {done} bytes, then failed on {p}: {exc}"
                     )
-                )
-                self._flush_audit(records)
-                return self._error(
-                    target,
-                    BACKEND_FILESYSTEM,
-                    deleted_bytes,
-                    f"partial: deleted {deleted_bytes} bytes, then failed on {container_path}: {exc}",
-                )
-            deleted_bytes += size
-            records.append(
-                ActionRecord(
-                    path=container_path,
-                    action="web-reclaim:filesystem",
-                    status=STATUS_DELETED,
-                    size=size,
-                    message=f"rating_key={target.rating_key} part_id={target.part_id}",
-                )
+                ),
             )
-        self._flush_audit(records)
-        return self._deleted(target, BACKEND_FILESYSTEM, deleted_bytes, f"{len(validated)} file(s)")
+            for original, staged_path, size in staged
+        ]
+        return self._execute_deletes(
+            target,
+            BACKEND_FILESYSTEM,
+            jobs,
+            action="web-reclaim:filesystem",
+            catch=OSError,
+            success_message=f"{len(staged)} file(s)",
+            # If an unlink fails before ANY delete has committed, the copy is still
+            # fully staged and recoverable: roll every part back and refuse with
+            # nothing deleted, rather than leaving originals renamed away and the later
+            # (un-attempted) staged parts orphaned and un-audited.
+            on_uncommitted_failure=(
+                lambda exc: self._refuse_and_rollback_purge(target, staged, exc)
+            ),
+        )
+
+    def _refuse_and_rollback_purge(
+        self, target: ReclaimTarget, staged: List[Tuple[Path, Path, int]], exc: BaseException
+    ) -> ReclaimResult:
+        """A staged part failed to unlink before any delete committed. Every part is
+        still staged (the failed unlink raised, so its staged file also remains), so
+        roll them all back and refuse with nothing deleted — preserving the
+        whole-or-refused guarantee through the purge phase for the recoverable case."""
+
+        orphans = self._rollback_staged(staged)
+        return self._stage_failure_result(
+            target, f"could not delete a staged part: {exc}", orphans
+        )
+
+    def _stage_for_delete(
+        self, target: ReclaimTarget, validated: List[Tuple[Path, int]]
+    ) -> Tuple[Optional[List[Tuple[Path, Path, int]]], Optional[ReclaimResult]]:
+        """Phase 1 of the two-phase filesystem delete: rename every prevalidated part
+        to its ``*.uncc-reclaim`` staging sibling, returning ``(staged, None)`` where
+        ``staged`` is ``[(original, staged_path, size)]``.
+
+        The rename is in-place (same directory → same filesystem), so it is atomic and
+        cannot hit ``EXDEV`` even when parts resolve under different media roots. If any
+        part fails to stage — a pre-existing staging sibling (an interrupted prior run,
+        never clobbered) or an ``OSError`` — the parts already staged are rolled back
+        and ``(None, error_result)`` is returned with **nothing deleted**. A rollback
+        that itself fails leaves that part orphaned at its staging path; those are the
+        only records audited here (a clean rollback mutates nothing, so it audits
+        nothing — mirroring a validation refusal)."""
+
+        staged: List[Tuple[Path, Path, int]] = []
+        for original, size in validated:
+            staged_path = self._staging_path(original)
+            reason: Optional[str] = None
+            if os.path.lexists(staged_path):
+                reason = (
+                    f"a stale staging file {staged_path.name} already exists next to "
+                    f"{original} (an earlier reclaim was interrupted?); refusing to "
+                    "clobber it — remove it by hand and retry"
+                )
+            else:
+                try:
+                    self._filesystem_mover(original, staged_path)
+                except OSError as exc:
+                    reason = f"could not stage {original} for deletion: {exc}"
+            if reason is not None:
+                orphans = self._rollback_staged(staged)
+                return None, self._stage_failure_result(target, reason, orphans)
+            staged.append((original, staged_path, size))
+        return staged, None
+
+    @staticmethod
+    def _staging_path(original: Path) -> Path:
+        """The staging sibling for ``original`` — its basename plus ``STAGING_SUFFIX``,
+        but bounded so the component never exceeds the directory's ``NAME_MAX``.
+
+        A media file whose basename is already near the limit (e.g. 244+ bytes on
+        ext4's 255-byte cap) would otherwise make ``basename + '.uncc-reclaim'`` too
+        long, failing the stage rename with ``ENAMETOOLONG`` and refusing a reclaim a
+        direct unlink would have handled. The base is truncated on a byte boundary (the
+        limit is bytes, not characters); a truncation collision with another sibling is
+        caught by the ``lexists`` guard in :meth:`_stage_for_delete` and refused, never
+        silently clobbered."""
+
+        suffix = STAGING_SUFFIX
+        try:
+            name_max = int(os.pathconf(original.parent, "PC_NAME_MAX"))
+        except (OSError, ValueError, AttributeError):
+            name_max = 255  # conservative default (ext4/xfs/btrfs/zfs)
+        encoded = original.name.encode("utf-8", "surrogatepass")
+        max_base = max(1, name_max - len(suffix.encode("utf-8")))
+        if len(encoded) > max_base:
+            base = encoded[:max_base].decode("utf-8", "ignore")
+        else:
+            base = original.name
+        return original.with_name(base + suffix)
+
+    def _rollback_staged(
+        self, staged: List[Tuple[Path, Path, int]]
+    ) -> List[Tuple[Path, Path, int]]:
+        """Best-effort restore of already-staged parts (reverse order), returning the
+        parts that could **not** be restored — orphaned at their staging path. A
+        rollback failure is the only path in the two-phase delete that leaves the
+        filesystem changed, so the caller audits those orphans."""
+
+        orphans: List[Tuple[Path, Path, int]] = []
+        for original, staged_path, size in reversed(staged):
+            if os.path.lexists(original):
+                # The original path reappeared during the staging window (another
+                # process recreated the file). ``os.rename`` would silently clobber it,
+                # destroying a new file while we report "nothing deleted" — so leave the
+                # staged copy as an orphan for manual reconciliation instead.
+                LOGGER.error(
+                    "reclaim rollback skipped: %s reappeared; leaving staged copy at %s",
+                    original,
+                    staged_path,
+                )
+                orphans.append((original, staged_path, size))
+                continue
+            try:
+                self._filesystem_mover(staged_path, original)
+            except OSError as exc:
+                LOGGER.error(
+                    "reclaim rollback failed: %s could not be restored to %s (%s)",
+                    staged_path,
+                    original,
+                    exc,
+                )
+                orphans.append((original, staged_path, size))
+        return orphans
+
+    def _stage_failure_result(
+        self,
+        target: ReclaimTarget,
+        reason: str,
+        orphans: List[Tuple[Path, Path, int]],
+    ) -> ReclaimResult:
+        """Build the ``error`` result for a staging failure (0 bytes reclaimed),
+        auditing any parts a failed rollback left orphaned at their staging path."""
+
+        if orphans:
+            records = [
+                ActionRecord(
+                    path=original,
+                    action="web-reclaim:filesystem",
+                    status=STATUS_ERROR,
+                    size=size,
+                    message=(
+                        f"rating_key={target.rating_key} part_id={target.part_id}: "
+                        f"could not restore original; file left staged at {staged_path}"
+                    ),
+                )
+                for original, staged_path, size in orphans
+            ]
+            self._flush_audit(records)
+            detail = (
+                f"; {len(orphans)} file(s) could not be rolled back and remain staged "
+                "(manual restore needed)"
+            )
+        else:
+            detail = "; rolled back, nothing deleted"
+        return self._error(target, BACKEND_FILESYSTEM, 0, f"{reason}{detail}")
 
     def _validate_fs_part(self, part: _Part) -> Tuple[Optional[Path], Optional[str]]:
         """Resolve a Plex path to a real, mounted, size-matching regular file under a
@@ -613,40 +810,33 @@ class ReclaimService:
         if self.dry_run:
             return self._would_delete(target, backend, total, f"{len(resolved)} file(s) via {backend}")
 
-        records: List[ActionRecord] = []
-        deleted_bytes = 0
-        for file_id, plex_path, size in resolved:
-            try:
-                self._delete_arr(client, backend, file_id)
-            except ArrClientError as exc:
-                records.append(
-                    ActionRecord(
-                        path=plex_path,
-                        action=f"web-reclaim:{backend}",
-                        status=STATUS_ERROR,
-                        size=size,
-                        message=f"id={file_id} rating_key={target.rating_key}: {exc}",
+        jobs = [
+            _DeleteJob(
+                audit_path=plex_path,
+                size=size,
+                perform=(lambda fid=file_id: self._delete_arr(client, backend, fid)),
+                deleted_message=(
+                    f"id={file_id} rating_key={target.rating_key} part_id={target.part_id}"
+                ),
+                error_message=(
+                    lambda exc, fid=file_id: f"id={fid} rating_key={target.rating_key}: {exc}"
+                ),
+                partial_message=(
+                    lambda exc, done, name=plex_path.name: (
+                        f"partial: {backend} delete failed for {name}: {exc}"
                     )
-                )
-                self._flush_audit(records)
-                return self._error(
-                    target,
-                    backend,
-                    deleted_bytes,
-                    f"partial: {backend} delete failed for {plex_path.name}: {exc}",
-                )
-            deleted_bytes += size
-            records.append(
-                ActionRecord(
-                    path=plex_path,
-                    action=f"web-reclaim:{backend}",
-                    status=STATUS_DELETED,
-                    size=size,
-                    message=f"id={file_id} rating_key={target.rating_key} part_id={target.part_id}",
-                )
+                ),
             )
-        self._flush_audit(records)
-        return self._deleted(target, backend, deleted_bytes, f"{len(resolved)} file(s) via {backend}")
+            for file_id, plex_path, size in resolved
+        ]
+        return self._execute_deletes(
+            target,
+            backend,
+            jobs,
+            action=f"web-reclaim:{backend}",
+            catch=ArrClientError,
+            success_message=f"{len(resolved)} file(s) via {backend}",
+        )
 
     def _resolve_arr_targets(
         self, backend: str, client: object, entry: _CopyEntry
@@ -727,6 +917,73 @@ class ReclaimService:
             client.delete_movie_file(file_id)  # type: ignore[attr-defined]
         else:
             client.delete_episode_file(file_id)  # type: ignore[attr-defined]
+
+    # -- shared delete-and-audit loop ---------------------------------------- #
+
+    def _execute_deletes(
+        self,
+        target: ReclaimTarget,
+        backend: str,
+        jobs: Sequence[_DeleteJob],
+        *,
+        action: str,
+        catch: type[BaseException],
+        success_message: str,
+        on_uncommitted_failure: Optional[Callable[[BaseException], ReclaimResult]] = None,
+    ) -> ReclaimResult:
+        """Run the prevalidated per-part delete-and-audit loop shared by both
+        backends — the one place that owns the security-sensitive partial-failure
+        protocol (whole-or-refused audit, deleted-byte accounting, flush timing).
+
+        For each job: call its deleter; on the first failure (an exception of type
+        ``catch``) append an ``error`` :class:`~.models.ActionRecord`, flush the audit
+        batch, and return a ``partial`` error :class:`ReclaimResult`; otherwise add the
+        freed bytes, append a ``deleted`` record, and continue. On completion, flush
+        the batch and return a ``deleted`` result. Callers own prevalidation — it runs
+        fully before any job here — and supply the deleter, the exception it raises,
+        and every per-part/summary message (see :class:`_DeleteJob`).
+
+        ``on_uncommitted_failure`` (filesystem only) is invoked instead of the
+        partial-error path when a deleter fails *before any delete has committed*
+        (``deleted_bytes == 0``): the backend can then undo the whole operation
+        cleanly and produce its own result, so no partial-delete audit row is written
+        for an outcome that is about to be rolled back. A failure after the first
+        commit is irreversible, so it always takes the partial-error path.
+        """
+
+        records: List[ActionRecord] = []
+        deleted_bytes = 0
+        for job in jobs:
+            try:
+                job.perform()
+            except catch as exc:  # the backend deleter's own typed failure
+                if deleted_bytes == 0 and on_uncommitted_failure is not None:
+                    return on_uncommitted_failure(exc)
+                records.append(
+                    ActionRecord(
+                        path=job.audit_path,
+                        action=action,
+                        status=STATUS_ERROR,
+                        size=job.size,
+                        message=job.error_message(exc),
+                    )
+                )
+                self._flush_audit(records)
+                return self._error(
+                    target, backend, deleted_bytes, job.partial_message(exc, deleted_bytes)
+                )
+            deleted_bytes += job.size
+            records.append(
+                ActionRecord(
+                    path=job.audit_path,
+                    action=action,
+                    status=STATUS_DELETED,
+                    size=job.size,
+                    message=job.deleted_message,
+                )
+            )
+        self._flush_audit(records)
+        return self._deleted(target, backend, deleted_bytes, success_message)
 
     # -- helpers ------------------------------------------------------------- #
 

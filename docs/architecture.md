@@ -153,8 +153,14 @@ file id the report records for it (#61), re-validated by a single by-id `GET`
 immediately before the delete — refused on a 404 or a current-basename mismatch
 (`*arr`-side drift), and refused with a regenerate hint if the report predates the
 serialized id (no full-library fan-out). A stacked copy's parts are all
-prevalidated before any is deleted, and every real delete (or partial failure) is
-persisted via `ActionRecord` in the SQLite `actions` table.
+prevalidated before any is deleted; a filesystem copy is then removed with a
+two-phase move — every part is staged aside (an in-place rename to a
+`*.uncc-reclaim` sibling, atomic within the directory) and only unlinked once all
+parts stage, so a mid-operation failure rolls the staged parts back with nothing
+deleted (a `*arr` delete cannot be rolled back, so its parts are deleted
+independently and a mid-delete failure is surfaced as a `partial` error). Every
+real delete (or partial failure) is persisted via `ActionRecord` in the SQLite
+`actions` table, always under the original media path.
 
 ## Failure Model
 

@@ -31,6 +31,7 @@ from unraid_cache_cleaner.web import (
     render_report_html,
 )
 from unraid_cache_cleaner.web_actions import (
+    STAGING_SUFFIX,
     ReclaimService,
     ReclaimTarget,
     build_action_index,
@@ -72,14 +73,34 @@ def _config(**overrides) -> Config:
 
 
 class _FakeDeleter:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, fail_on_call: int | None = None) -> None:
         self.calls: list[Path] = []
         self._fail = fail
+        self._fail_on_call = fail_on_call  # 1-based index of the call that raises
 
     def __call__(self, path: Path) -> None:
         self.calls.append(Path(path))
-        if self._fail:
+        if self._fail or self._fail_on_call == len(self.calls):
             raise OSError("permission denied")
+
+
+class _PartialMover:
+    """``os.rename`` for every call except the configured ones, which raise ``OSError``
+    — to drive #64's stage-phase rollback. Rollback renames (which run after a forward
+    failure) go through the same seam and are recorded, so ``fail_on_calls={2}`` fails
+    only the 2nd forward rename while the later rollback rename succeeds."""
+
+    def __init__(self, fail_on_calls) -> None:
+        self.calls: list[tuple[Path, Path]] = []
+        self._fail_on = set(fail_on_calls)
+        self._n = 0
+
+    def __call__(self, src: Path, dst: Path) -> None:
+        self._n += 1
+        self.calls.append((Path(src), Path(dst)))
+        if self._n in self._fail_on:
+            raise OSError("simulated rename failure")
+        os.rename(src, dst)
 
 
 class _FakeArr:
@@ -92,10 +113,14 @@ class _FakeArr:
     fan-out).
     """
 
-    def __init__(self, files=None, *, sizes=None, fail_delete=False, fail_get=False) -> None:
+    def __init__(
+        self, files=None, *, sizes=None, fail_delete=False, fail_delete_ids=None,
+        fail_get=False,
+    ) -> None:
         self._files = files or {}
         self._sizes = sizes or {}
         self._fail_delete = fail_delete
+        self._fail_delete_ids = set(fail_delete_ids or ())
         self._fail_get = fail_get
         self.deleted: list[int] = []
         self.get_calls: list[int] = []
@@ -116,7 +141,7 @@ class _FakeArr:
     get_episode_file = get_movie_file
 
     def delete_movie_file(self, file_id: int) -> None:
-        if self._fail_delete:
+        if self._fail_delete or file_id in self._fail_delete_ids:
             raise ArrClientError("arr delete failed")
         self.deleted.append(file_id)
 
@@ -126,8 +151,10 @@ class _FakeArr:
 class _FakeAudit:
     def __init__(self) -> None:
         self.records = []
+        self.batches = []  # one entry per flush call — proves flush timing/batching
 
     def __call__(self, records, now) -> None:
+        self.batches.append(list(records))
         self.records.extend(records)
 
 
@@ -183,6 +210,7 @@ def _service(payload, **overrides):
         config,
         lambda: payload,
         filesystem_deleter=overrides.pop("deleter", lambda p: None),
+        filesystem_mover=overrides.pop("mover", os.rename),
         radarr=overrides.pop("radarr", None),
         sonarr=overrides.pop("sonarr", None),
         audit=overrides.pop("audit", None),
@@ -371,7 +399,11 @@ class FilesystemTests(unittest.TestCase):
             response = _reclaim(service)
             self.assertEqual(response.results[0].status, "deleted")
             self.assertEqual(response.results[0].backend, "filesystem")
-            self.assertEqual(deleter.calls, [real])
+            # #64: the file is staged (renamed to a sibling) and the STAGED path is
+            # unlinked; the audit still records the original media path.
+            staged = real.with_name(real.name + STAGING_SUFFIX)
+            self.assertEqual(deleter.calls, [staged])
+            self.assertFalse(real.exists())  # renamed away from its media path
             self.assertEqual(len(audit.records), 1)
             self.assertEqual(audit.records[0].status, "deleted")
             self.assertEqual(Path(audit.records[0].path), real)
@@ -493,7 +525,7 @@ class FilesystemTests(unittest.TestCase):
             deleter = _FakeDeleter()
             response = _reclaim(_service(_report([group]), config=config, deleter=deleter))
             self.assertEqual(response.results[0].status, "deleted")
-            self.assertEqual(deleter.calls, [target])
+            self.assertEqual(deleter.calls, [target.with_name(target.name + STAGING_SUFFIX)])
 
     def test_component_aware_prefix_no_false_match(self) -> None:
         # /plex should NOT match a Plex path under /plexextra.
@@ -550,6 +582,177 @@ class FilesystemTests(unittest.TestCase):
             response = _reclaim(service, part_id=2)
             self.assertEqual(response.results[0].status, "refused")
             self.assertTrue(cd1.exists())  # nothing deleted — refused whole
+
+    def _two_part_stacked(self, tmp):
+        """A two-part untracked stacked copy on disk (cd1=5B, cd2=3B) + report."""
+        media_root = Path(tmp) / "media"
+        (media_root / "movie").mkdir(parents=True)
+        cd1 = media_root / "movie" / "cd1.mkv"
+        cd2 = media_root / "movie" / "cd2.mkv"
+        cd1.write_bytes(b"aaaaa")
+        cd2.write_bytes(b"bbb")
+        keeper = _keeper()
+        stacked = _copy(
+            "/plex/movie/cd1.mkv", 8, media_id=21, association="untracked",
+            parts=[
+                {"part_id": 2, "file": "/plex/movie/cd1.mkv", "size": 5},
+                {"part_id": 3, "file": "/plex/movie/cd2.mkv", "size": 3},
+            ],
+        )
+        group = _group([keeper, stacked], keeper=keeper)
+        config = _config(web_media_path_map=((Path("/plex"), media_root),))
+        return media_root, cd1, cd2, group, config
+
+    def test_stacked_stage_failure_rolls_back_leaving_all_parts_intact(self) -> None:
+        # #64 core guarantee: if the SECOND part fails to stage, the first part's
+        # staging rename is rolled back — both parts stay intact at their original
+        # paths, nothing is unlinked, and the result is an error with zero bytes freed.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
+            mover = _PartialMover(fail_on_calls={2})  # 2nd forward rename (cd2) fails
+            deleter = _FakeDeleter()
+            audit = _FakeAudit()
+            service = _service(
+                _report([group]), config=config, deleter=deleter, mover=mover, audit=audit
+            )
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.reclaimed_bytes, 0)   # nothing freed
+            self.assertIn("rolled back, nothing deleted", result.message)
+            self.assertEqual(deleter.calls, [])           # no unlink ran
+            self.assertTrue(cd1.exists())
+            self.assertEqual(cd1.read_bytes(), b"aaaaa")  # restored, intact
+            self.assertTrue(cd2.exists())
+            self.assertEqual(cd2.read_bytes(), b"bbb")
+            self.assertEqual(audit.records, [])           # clean rollback → nothing audited
+            self.assertFalse(cd1.with_name(cd1.name + STAGING_SUFFIX).exists())  # no leftover
+
+    def test_stacked_stage_failure_with_failed_rollback_audits_orphan(self) -> None:
+        # If rollback ITSELF fails (the staged part can't be moved back), that part is
+        # orphaned at its staging path and audited as an error naming the original
+        # media path; still nothing is unlinked and zero bytes are freed.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
+            # call 1 stages cd1; call 2 (stage cd2) fails; call 3 (rollback cd1) fails
+            mover = _PartialMover(fail_on_calls={2, 3})
+            deleter = _FakeDeleter()
+            audit = _FakeAudit()
+            service = _service(
+                _report([group]), config=config, deleter=deleter, mover=mover, audit=audit
+            )
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.reclaimed_bytes, 0)
+            self.assertIn("could not be rolled back", result.message)
+            self.assertEqual(deleter.calls, [])
+            staged_cd1 = cd1.with_name(cd1.name + STAGING_SUFFIX)
+            self.assertFalse(cd1.exists())    # orphaned at its staging path
+            self.assertTrue(staged_cd1.exists())
+            self.assertTrue(cd2.exists())     # never staged
+            self.assertEqual([r.status for r in audit.records], ["error"])
+            self.assertEqual(Path(audit.records[0].path), cd1)  # audit names the media path
+            self.assertIn("left staged", audit.records[0].message)
+
+    def test_purge_failure_after_staging_is_partial_error(self) -> None:
+        # Once every part has staged, the unlink pass runs; if the SECOND unlink fails
+        # (a purge-phase failure, post-commit), the first part is deleted + audited,
+        # the second is audited as an error, and the result is a partial error carrying
+        # only the first part's freed bytes — the shared #70 loop's protocol, run over
+        # staged paths but auditing the original media paths.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
+            deleter = _FakeDeleter(fail_on_call=2)  # 2nd unlink fails (real os.rename mover)
+            audit = _FakeAudit()
+            service = _service(_report([group]), config=config, deleter=deleter, audit=audit)
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.reclaimed_bytes, 5)   # only cd1's bytes freed
+            self.assertIn("partial", result.message)
+            self.assertFalse(cd1.exists())  # both parts staged (renamed away) before any unlink
+            self.assertFalse(cd2.exists())
+            self.assertEqual(len(deleter.calls), 2)
+            self.assertTrue(all(str(c).endswith(STAGING_SUFFIX) for c in deleter.calls))
+            self.assertEqual([r.status for r in audit.records], ["deleted", "error"])
+            self.assertEqual(
+                [Path(r.path) for r in audit.records],
+                [media_root / "movie" / "cd1.mkv", media_root / "movie" / "cd2.mkv"],
+            )
+            self.assertEqual(len(audit.batches), 1)       # one flush batch
+
+    def test_purge_failure_before_any_commit_rolls_back(self) -> None:
+        # #71 (Codex): an unlink failing BEFORE any delete commits is recoverable —
+        # every part is still staged, so all are rolled back and the reclaim is refused
+        # with nothing deleted (vs. leaving originals renamed away and the later,
+        # un-attempted staged parts orphaned and un-audited).
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
+            deleter = _FakeDeleter(fail_on_call=1)  # 1st unlink fails (nothing committed)
+            audit = _FakeAudit()
+            service = _service(_report([group]), config=config, deleter=deleter, audit=audit)
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.reclaimed_bytes, 0)
+            self.assertIn("rolled back, nothing deleted", result.message)
+            self.assertEqual(len(deleter.calls), 1)       # stopped at the first failure
+            self.assertTrue(cd1.exists())
+            self.assertEqual(cd1.read_bytes(), b"aaaaa")  # both restored
+            self.assertTrue(cd2.exists())
+            self.assertEqual(cd2.read_bytes(), b"bbb")
+            self.assertEqual(audit.records, [])           # clean rollback → nothing audited
+            self.assertFalse(cd1.with_name(cd1.name + STAGING_SUFFIX).exists())
+            self.assertFalse(cd2.with_name(cd2.name + STAGING_SUFFIX).exists())
+
+    def test_long_basename_stages_with_bounded_name(self) -> None:
+        # #71 (Codex): a basename near NAME_MAX must still stage. Appending the suffix
+        # to the full name would overflow the component limit (ENAMETOOLONG) and refuse
+        # a reclaim a direct unlink would have handled; the staging name is bounded.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root = Path(tmp) / "media"
+            media_root.mkdir()
+            long_name = "x" * 250 + ".mkv"  # 254 bytes, near the 255-byte NAME_MAX
+            real = media_root / long_name
+            real.write_bytes(b"xxxxx")
+            keeper = _keeper()
+            group = _group(
+                [keeper, _copy(f"/plex/{long_name}", 5, media_id=21, association="untracked")],
+                keeper=keeper,
+            )
+            config = _config(web_media_path_map=((Path("/plex"), media_root),))
+            service = _service(_report([group]), config=config, deleter=os.unlink)
+            result = _reclaim(service).results[0]
+            self.assertEqual(result.status, "deleted")  # not ENAMETOOLONG-refused
+            self.assertFalse(real.exists())
+
+    def test_rollback_skips_recreated_original_leaving_orphan(self) -> None:
+        # #71 (Codex): if the original path reappears during the staging window,
+        # rollback must NOT clobber the new file (os.rename replaces on POSIX) — it
+        # leaves the staged copy as an audited orphan and preserves the new file.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
+            calls = []
+
+            def mover(src, dst):
+                calls.append((Path(src), Path(dst)))
+                if len(calls) == 1:
+                    os.rename(src, dst)               # stage cd1
+                    cd1.write_bytes(b"NEW-CONTENT")   # another process recreates cd1
+                else:
+                    raise OSError("stage cd2 failed")  # forces rollback of cd1
+
+            deleter = _FakeDeleter()
+            audit = _FakeAudit()
+            service = _service(
+                _report([group]), config=config, deleter=deleter, mover=mover, audit=audit
+            )
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(deleter.calls, [])           # nothing unlinked
+            self.assertIn("could not be rolled back", result.message)
+            self.assertEqual(cd1.read_bytes(), b"NEW-CONTENT")  # new file NOT clobbered
+            self.assertTrue(cd1.with_name(cd1.name + STAGING_SUFFIX).exists())  # orphan kept
+            self.assertEqual([r.status for r in audit.records], ["error"])
+            self.assertEqual(Path(audit.records[0].path), cd1)
+            self.assertIn("left staged", audit.records[0].message)
 
 
 # --------------------------------------------------------------------------- #
@@ -678,6 +881,42 @@ class ArrRoutingTests(unittest.TestCase):
         self.assertEqual(response.results[0].status, "error")
         self.assertEqual(len(audit.records), 1)
         self.assertEqual(audit.records[0].status, "error")
+
+    def test_stacked_partial_delete_failure_audits_deleted_then_error(self) -> None:
+        # #70: the shared delete-and-audit loop's whole-or-refused protocol. A
+        # two-part tracked copy whose SECOND delete fails: part one is deleted and
+        # audited, part two is audited as an error, both in ONE flush batch, and the
+        # result is a partial `error` carrying only part one's freed bytes. This is
+        # the mid-loop failure the old per-backend loops had no test for (the fakes
+        # could only fail EVERY delete).
+        keeper = _keeper()
+        stacked = _copy(
+            "/lib/cd1.mkv", 8, media_id=21, association="tracked", arr_tracked="radarr",
+            parts=[
+                {"part_id": 2, "file": "/lib/cd1.mkv", "size": 5, "arr_file_id": 1},
+                {"part_id": 3, "file": "/lib/cd2.mkv", "size": 3, "arr_file_id": 2},
+            ],
+        )
+        radarr = _FakeArr({1: "/data/cd1.mkv", 2: "/data/cd2.mkv"}, fail_delete_ids={2})
+        audit = _FakeAudit()
+        service = _service(
+            _report([_group([keeper, stacked], keeper=keeper)]), radarr=radarr, audit=audit
+        )
+        response = _reclaim(service, part_id=2)
+        result = response.results[0]
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.reclaimed_bytes, 5)          # only cd1's bytes freed
+        self.assertIn("partial", result.message)
+        self.assertIn("cd2.mkv", result.message)
+        self.assertEqual(radarr.deleted, [1])                # cd1 gone; cd2 attempted, failed
+        self.assertEqual([r.status for r in audit.records], ["deleted", "error"])
+        self.assertEqual(
+            [Path(r.path) for r in audit.records],
+            [Path("/lib/cd1.mkv"), Path("/lib/cd2.mkv")],   # audit uses media paths, in order
+        )
+        self.assertEqual(audit.records[0].message, "id=1 rating_key=900 part_id=2")
+        self.assertTrue(audit.records[1].message.startswith("id=2 rating_key=900:"))
+        self.assertEqual(len(audit.batches), 1)              # one flush batch, not per-part
 
     def test_stacked_tracked_copy_validates_all_parts_before_delete(self) -> None:
         # A two-part tracked copy: each part is re-validated by its own by-id GET

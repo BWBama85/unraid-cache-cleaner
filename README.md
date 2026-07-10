@@ -312,6 +312,11 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
   if the file is gone or now points at a different filename (drift). A tracked copy
   in a report generated before this id was recorded is refused until you regenerate
   the report.
+- **Atomic per stacked copy.** A multi-part (stacked) filesystem copy is reclaimed
+  with a two-phase move: every part is staged aside (renamed to a `*.uncc-reclaim`
+  sibling) before any is unlinked, so if one part can't be staged the rest roll back
+  and nothing is deleted. (A tracked copy's Radarr/Sonarr deletes can't be rolled
+  back, so they run independently and a mid-delete failure is reported as a partial.)
 - **Audited.** Every real delete (and any partial failure) is written to the
   SQLite state store's `actions` table, so you can answer "what did the GUI delete".
 
