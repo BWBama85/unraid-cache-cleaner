@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -278,6 +279,104 @@ class ExtractionLedgerTests(unittest.TestCase):
 
         remaining = self.store.get_protected_extracted_paths(6000.0, protect_seconds=10_000)
         self.assertEqual(remaining, {fresh})
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """WAL journaling + busy-timeout + lock-retry hardening (#45)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _journal_mode(self, store: StateStore) -> str:
+        return store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower()
+
+    def test_wal_enabled_on_a_fresh_db(self) -> None:
+        store = StateStore(Path(self._tmp.name) / "fresh.sqlite3")
+        self.assertEqual(self._journal_mode(store), "wal")
+
+    def test_wal_enabled_on_an_existing_legacy_db(self) -> None:
+        db = Path(self._tmp.name) / "legacy.sqlite3"
+        legacy = sqlite3.connect(db)
+        legacy.execute(
+            """
+            CREATE TABLE extractions (
+                archive_path TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                claimed_at REAL NOT NULL,
+                extracted_at REAL
+            )
+            """
+        )
+        legacy.commit()
+        legacy.close()
+        store = StateStore(db)
+        self.assertEqual(self._journal_mode(store), "wal")
+
+    def test_busy_timeout_is_raised_on_the_connection(self) -> None:
+        # The raised busy timeout is what makes a claim wait for a slow complete
+        # instead of failing. SQLite reports it in milliseconds.
+        store = StateStore(Path(self._tmp.name) / "bt.sqlite3")
+        busy_ms = store._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.assertEqual(busy_ms, 30000)
+
+    def test_claim_waits_for_a_briefly_held_write_lock(self) -> None:
+        # #45: a claim racing a slow complete (which holds the write lock) must
+        # wait for it to finish and then win, not surface a spurious 'failed'.
+        db = Path(self._tmp.name) / "contended.sqlite3"
+        StateStore(db)._connection.close()  # bootstrap schema + WAL
+        store = StateStore(db)  # generous default busy_timeout
+
+        lock_held = threading.Event()
+        release = threading.Event()
+
+        def holder() -> None:
+            conn = sqlite3.connect(db, timeout=30)
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO extractions (archive_path, status, claimed_at) VALUES (?, 'claimed', ?)",
+                ("/data/other.rar", 1.0),
+            )
+            lock_held.set()
+            release.wait(5)
+            conn.commit()
+            conn.close()
+
+        worker = threading.Thread(target=holder)
+        worker.start()
+        try:
+            self.assertTrue(lock_held.wait(5))  # writer now holds the lock
+            # Free the lock shortly after; the claim below must block until then.
+            releaser = threading.Timer(0.3, release.set)
+            releaser.start()
+            result = store.claim_extraction(Path("/data/movie.rar"), 1.0, size=1, mtime=1.0)
+            self.assertEqual(result.decision, CLAIM_NEW)  # waited, then won
+        finally:
+            release.set()
+            worker.join(5)
+
+    def test_claim_surfaces_when_a_lock_outlasts_the_busy_timeout(self) -> None:
+        # busy_timeout=0 → no wait: a held write lock raises immediately. This is
+        # the documented tail (past the timeout the OperationalError propagates and
+        # Extractor.extract_all retries the archive next cycle).
+        db = Path(self._tmp.name) / "starved.sqlite3"
+        StateStore(db)._connection.close()  # bootstrap schema + WAL
+        store = StateStore(db, busy_timeout_seconds=0)
+
+        blocker = sqlite3.connect(db, timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute(
+            "INSERT INTO extractions (archive_path, status, claimed_at) VALUES (?, 'claimed', ?)",
+            ("/data/other.rar", 1.0),
+        )
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                store.claim_extraction(Path("/data/movie.rar"), 1.0, size=1, mtime=1.0)
+        finally:
+            blocker.rollback()
+            blocker.close()
 
 
 if __name__ == "__main__":

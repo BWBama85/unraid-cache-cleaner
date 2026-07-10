@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 import sqlite3
 from pathlib import Path
@@ -16,6 +17,21 @@ from .models import (
     ClaimResult,
     FileRecord,
 )
+
+LOGGER = logging.getLogger(__name__)
+
+# SQLite's default busy timeout is 5s. A slow complete_extraction (an
+# executemany over many extraction_outputs rows on a contended disk) can hold the
+# write lock longer than that, so a concurrent claim_extraction INSERT would raise
+# "database is locked" and surface as a spurious extraction failure (#45). Raise
+# the per-connection wait so a claim blocks for the writer to finish instead. This
+# is SQLite's own busy-handler (it sleeps and retries acquiring the lock up to the
+# timeout), so it needs no application-level retry on top — which would only
+# compound the wait and, on the rollback-journal fallback path, risk replaying a
+# transaction whose commit failed. Past the timeout the OperationalError simply
+# propagates and the caller (Extractor.extract_all) retries the archive next
+# cycle, exactly as before — just far less often.
+_BUSY_TIMEOUT_SECONDS = 30.0
 
 # A claim held by a crashed extraction would otherwise block that archive from
 # ever being retried. A claim older than this is considered abandoned and may be
@@ -36,11 +52,46 @@ CLAIM_TTL_SECONDS = 7200
 class StateStore:
     """Tracks candidates across polling cycles."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS,
+    ) -> None:
         self.db_path = db_path
-        self._connection = sqlite3.connect(self.db_path)
+        self._connection = sqlite3.connect(self.db_path, timeout=busy_timeout_seconds)
         self._connection.row_factory = sqlite3.Row
+        self._enable_wal()
         self._initialize()
+
+    def _enable_wal(self) -> None:
+        """Switch the DB to WAL journaling so readers never block the writer.
+
+        WAL lets a read (``get_protected_extracted_paths``) run concurrently with
+        a slow write (``complete_extraction``), cutting the contention that made a
+        concurrent claim time out (#45). It does **not** permit two simultaneous
+        *writers* — that is what the raised ``busy_timeout`` covers. Setting the
+        mode is idempotent and persists in the DB header. The connection already
+        carries the raised ``busy_timeout``, so a momentary lock while a concurrent
+        process performs the one-time journal→WAL conversion is waited out rather
+        than raised. If the underlying mount genuinely rejects WAL (some network
+        filesystems do), SQLite silently keeps the prior mode instead of raising,
+        so this degrades to the default journaling rather than failing startup;
+        the effective mode is logged either way.
+        """
+
+        try:
+            row = self._connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError as exc:  # pragma: no cover - mount-dependent
+            LOGGER.warning("Could not enable WAL journaling on %s: %s", self.db_path, exc)
+            return
+        effective = (row[0] if row else "") or ""
+        if effective.lower() != "wal":
+            LOGGER.debug(
+                "WAL journaling not enabled on %s (effective mode: %s)",
+                self.db_path,
+                effective,
+            )
 
     def _initialize(self) -> None:
         with self._connection:
@@ -247,7 +298,9 @@ class StateStore:
         write lock, so a concurrent one-shot ``extract`` and a running ``service``
         cannot both win the same archive. Winning a claim always rotates the
         ``token`` so any earlier owner's in-flight ``release``/``complete`` becomes
-        a no-op (#41 fix 2).
+        a no-op (#41 fix 2). The connection's raised ``busy_timeout`` (#45) makes
+        this write wait for a slow concurrent ``complete`` rather than surfacing a
+        spurious lock failure.
         """
 
         key = str(archive)

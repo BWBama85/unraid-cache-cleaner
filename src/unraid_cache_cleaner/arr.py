@@ -79,11 +79,17 @@ class _ArrClient(JsonHttpClient):
         *,
         timeout_seconds: int = 30,
         verify_tls: bool = True,
+        max_attempts: int = 1,
     ) -> None:
         if not base_url or not api_key:
             raise ArrClientError(f"{self.service_name} URL and API key are required")
         self.api_key = api_key
-        super().__init__(base_url, timeout_seconds=timeout_seconds, verify_tls=verify_tls)
+        super().__init__(
+            base_url,
+            timeout_seconds=timeout_seconds,
+            verify_tls=verify_tls,
+            max_attempts=max_attempts,
+        )
 
     def _auth_headers(self) -> Sequence[Tuple[str, str]]:
         return (("X-Api-Key", self.api_key), ("Accept", "application/json"))

@@ -120,6 +120,16 @@ class Config:
     # leftovers are eventually reclaimed. Default 24h, comfortably longer than the
     # orphan grace.
     extract_protect_seconds: int = 86400
+    # Bounded retry-with-backoff shared by every read-oriented service HTTP client
+    # (qBittorrent/Plex/Radarr/Sonarr) via the JsonHttpClient base. This is the
+    # total number of attempts per idempotent (GET/HEAD) request: 1 = single
+    # attempt / retries off (the historical default, so behavior is unchanged
+    # until an operator opts in). Raise it (e.g. 3) so a transient 5xx or
+    # connection blip on a LAN call is retried instead of failing the whole
+    # read-only report on the first hiccup. A non-idempotent POST (qBittorrent's
+    # login) is never retried. Appended last, with a default, so existing
+    # positional Config(...) calls and from_env keep working.
+    http_max_attempts: int = 1
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -166,6 +176,7 @@ class Config:
             extract_owner=os.getenv("EXTRACT_OWNER", ""),
             extract_min_age_seconds=_parse_int(os.getenv("EXTRACT_MIN_AGE_SECONDS"), 300),
             extract_protect_seconds=_parse_int(os.getenv("EXTRACT_PROTECT_SECONDS"), 86400),
+            http_max_attempts=_parse_int(os.getenv("HTTP_MAX_ATTEMPTS"), 1),
         )
         config.ensure_directories()
         return config

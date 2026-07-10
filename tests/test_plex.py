@@ -278,5 +278,20 @@ class PlexClientTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 500)
 
 
+class NonObjectBodyTests(unittest.TestCase):
+    def test_top_level_array_becomes_plex_error_naming_the_path(self) -> None:
+        # A Plex endpoint that returned a top-level JSON array (not the usual
+        # {"MediaContainer": ...} object) must surface as PlexClientError naming
+        # the endpoint — not a bare AttributeError on .get("MediaContainer") that
+        # fetch_duplicates' 404 handler would let escape.
+        opener = _RecordingOpener(lambda req: json.dumps([{"x": 1}]).encode("utf-8"))
+        client = _client(opener)
+
+        with self.assertRaises(PlexClientError) as ctx:
+            client.fetch_sections()
+
+        self.assertIn("non-object JSON body from /library/sections", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

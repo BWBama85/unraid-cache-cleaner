@@ -98,6 +98,7 @@ def run_cleaner(config: Config, command: str) -> int:
         config.qbittorrent_password,
         timeout_seconds=config.qbittorrent_timeout_seconds,
         verify_tls=config.qbittorrent_verify_tls,
+        max_attempts=config.http_max_attempts,
     )
     state_store = StateStore(config.state_db_path)
     extractor = Extractor(config, ledger=StateExtractionLedger(state_store))
@@ -177,6 +178,7 @@ def _build_radarr(config: Config) -> Optional[RadarrClient]:
             config.radarr_api_key,
             timeout_seconds=config.radarr_timeout_seconds,
             verify_tls=config.radarr_verify_tls,
+            max_attempts=config.http_max_attempts,
         )
     return None
 
@@ -190,6 +192,7 @@ def _build_sonarr(config: Config) -> Optional[SonarrClient]:
             config.sonarr_api_key,
             timeout_seconds=config.sonarr_timeout_seconds,
             verify_tls=config.sonarr_verify_tls,
+            max_attempts=config.http_max_attempts,
         )
     return None
 
@@ -202,6 +205,7 @@ def run_plex_duplicates(config: Config, args: argparse.Namespace) -> int:
         config.plex_token,
         timeout_seconds=config.plex_timeout_seconds,
         verify_tls=config.plex_verify_tls,
+        max_attempts=config.http_max_attempts,
     )
     reporter = PlexDuplicateReporter(
         config,
