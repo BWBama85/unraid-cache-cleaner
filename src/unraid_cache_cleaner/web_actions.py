@@ -176,6 +176,30 @@ class _CopyEntry:
     keeper_paths: frozenset = frozenset()
 
 
+@dataclass(frozen=True)
+class _DeleteJob:
+    """One prevalidated physical delete, plus the audit text the shared delete loop
+    (:meth:`ReclaimService._execute_deletes`) records for it.
+
+    ``perform`` runs the backend delete (and may raise the backend's exception);
+    ``audit_path`` is always the *original media path* (never a temporary staging
+    path), so the ``actions`` history reads the same regardless of how the delete is
+    carried out. The two message hooks are callables because their text depends on
+    the raised exception (and, for the partial summary, the running deleted-byte
+    total)."""
+
+    audit_path: Path
+    size: int
+    perform: Callable[[], None]
+    #: ``ActionRecord.message`` for the ``deleted`` row (exception-independent).
+    deleted_message: str
+    #: ``ActionRecord.message`` for the ``error`` row, given the raised exception.
+    error_message: Callable[[BaseException], str]
+    #: The :class:`ReclaimResult` ``error`` message, given the exception and the
+    #: bytes already freed before this part failed.
+    partial_message: Callable[[BaseException, int], str]
+
+
 class _ActionIndex:
     """Maps every addressable ``{rating_key, part_id}`` in the current report to its
     logical copy, and records the identities that are ambiguous (the same key seen
@@ -491,40 +515,31 @@ class ReclaimService:
                 target, BACKEND_FILESYSTEM, total, f"{len(validated)} file(s) via filesystem"
             )
 
-        records: List[ActionRecord] = []
-        deleted_bytes = 0
-        for container_path, size in validated:
-            try:
-                self._filesystem_deleter(container_path)
-            except OSError as exc:
-                records.append(
-                    ActionRecord(
-                        path=container_path,
-                        action="web-reclaim:filesystem",
-                        status=STATUS_ERROR,
-                        size=size,
-                        message=f"rating_key={target.rating_key} part_id={target.part_id}: {exc}",
+        jobs = [
+            _DeleteJob(
+                audit_path=container_path,
+                size=size,
+                perform=(lambda p=container_path: self._filesystem_deleter(p)),
+                deleted_message=f"rating_key={target.rating_key} part_id={target.part_id}",
+                error_message=(
+                    lambda exc: f"rating_key={target.rating_key} part_id={target.part_id}: {exc}"
+                ),
+                partial_message=(
+                    lambda exc, done, p=container_path: (
+                        f"partial: deleted {done} bytes, then failed on {p}: {exc}"
                     )
-                )
-                self._flush_audit(records)
-                return self._error(
-                    target,
-                    BACKEND_FILESYSTEM,
-                    deleted_bytes,
-                    f"partial: deleted {deleted_bytes} bytes, then failed on {container_path}: {exc}",
-                )
-            deleted_bytes += size
-            records.append(
-                ActionRecord(
-                    path=container_path,
-                    action="web-reclaim:filesystem",
-                    status=STATUS_DELETED,
-                    size=size,
-                    message=f"rating_key={target.rating_key} part_id={target.part_id}",
-                )
+                ),
             )
-        self._flush_audit(records)
-        return self._deleted(target, BACKEND_FILESYSTEM, deleted_bytes, f"{len(validated)} file(s)")
+            for container_path, size in validated
+        ]
+        return self._execute_deletes(
+            target,
+            BACKEND_FILESYSTEM,
+            jobs,
+            action="web-reclaim:filesystem",
+            catch=OSError,
+            success_message=f"{len(validated)} file(s)",
+        )
 
     def _validate_fs_part(self, part: _Part) -> Tuple[Optional[Path], Optional[str]]:
         """Resolve a Plex path to a real, mounted, size-matching regular file under a
@@ -613,40 +628,33 @@ class ReclaimService:
         if self.dry_run:
             return self._would_delete(target, backend, total, f"{len(resolved)} file(s) via {backend}")
 
-        records: List[ActionRecord] = []
-        deleted_bytes = 0
-        for file_id, plex_path, size in resolved:
-            try:
-                self._delete_arr(client, backend, file_id)
-            except ArrClientError as exc:
-                records.append(
-                    ActionRecord(
-                        path=plex_path,
-                        action=f"web-reclaim:{backend}",
-                        status=STATUS_ERROR,
-                        size=size,
-                        message=f"id={file_id} rating_key={target.rating_key}: {exc}",
+        jobs = [
+            _DeleteJob(
+                audit_path=plex_path,
+                size=size,
+                perform=(lambda fid=file_id: self._delete_arr(client, backend, fid)),
+                deleted_message=(
+                    f"id={file_id} rating_key={target.rating_key} part_id={target.part_id}"
+                ),
+                error_message=(
+                    lambda exc, fid=file_id: f"id={fid} rating_key={target.rating_key}: {exc}"
+                ),
+                partial_message=(
+                    lambda exc, done, name=plex_path.name: (
+                        f"partial: {backend} delete failed for {name}: {exc}"
                     )
-                )
-                self._flush_audit(records)
-                return self._error(
-                    target,
-                    backend,
-                    deleted_bytes,
-                    f"partial: {backend} delete failed for {plex_path.name}: {exc}",
-                )
-            deleted_bytes += size
-            records.append(
-                ActionRecord(
-                    path=plex_path,
-                    action=f"web-reclaim:{backend}",
-                    status=STATUS_DELETED,
-                    size=size,
-                    message=f"id={file_id} rating_key={target.rating_key} part_id={target.part_id}",
-                )
+                ),
             )
-        self._flush_audit(records)
-        return self._deleted(target, backend, deleted_bytes, f"{len(resolved)} file(s) via {backend}")
+            for file_id, plex_path, size in resolved
+        ]
+        return self._execute_deletes(
+            target,
+            backend,
+            jobs,
+            action=f"web-reclaim:{backend}",
+            catch=ArrClientError,
+            success_message=f"{len(resolved)} file(s) via {backend}",
+        )
 
     def _resolve_arr_targets(
         self, backend: str, client: object, entry: _CopyEntry
@@ -727,6 +735,63 @@ class ReclaimService:
             client.delete_movie_file(file_id)  # type: ignore[attr-defined]
         else:
             client.delete_episode_file(file_id)  # type: ignore[attr-defined]
+
+    # -- shared delete-and-audit loop ---------------------------------------- #
+
+    def _execute_deletes(
+        self,
+        target: ReclaimTarget,
+        backend: str,
+        jobs: Sequence[_DeleteJob],
+        *,
+        action: str,
+        catch,
+        success_message: str,
+    ) -> ReclaimResult:
+        """Run the prevalidated per-part delete-and-audit loop shared by both
+        backends — the one place that owns the security-sensitive partial-failure
+        protocol (whole-or-refused audit, deleted-byte accounting, flush timing).
+
+        For each job: call its deleter; on the first failure (an exception of type
+        ``catch``) append an ``error`` :class:`~.models.ActionRecord`, flush the audit
+        batch, and return a ``partial`` error :class:`ReclaimResult`; otherwise add the
+        freed bytes, append a ``deleted`` record, and continue. On completion, flush
+        the batch and return a ``deleted`` result. Callers own prevalidation — it runs
+        fully before any job here — and supply the deleter, the exception it raises,
+        and every per-part/summary message (see :class:`_DeleteJob`).
+        """
+
+        records: List[ActionRecord] = []
+        deleted_bytes = 0
+        for job in jobs:
+            try:
+                job.perform()
+            except catch as exc:  # the backend deleter's own typed failure
+                records.append(
+                    ActionRecord(
+                        path=job.audit_path,
+                        action=action,
+                        status=STATUS_ERROR,
+                        size=job.size,
+                        message=job.error_message(exc),
+                    )
+                )
+                self._flush_audit(records)
+                return self._error(
+                    target, backend, deleted_bytes, job.partial_message(exc, deleted_bytes)
+                )
+            deleted_bytes += job.size
+            records.append(
+                ActionRecord(
+                    path=job.audit_path,
+                    action=action,
+                    status=STATUS_DELETED,
+                    size=job.size,
+                    message=job.deleted_message,
+                )
+            )
+        self._flush_audit(records)
+        return self._deleted(target, backend, deleted_bytes, success_message)
 
     # -- helpers ------------------------------------------------------------- #
 

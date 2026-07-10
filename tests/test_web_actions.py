@@ -92,10 +92,14 @@ class _FakeArr:
     fan-out).
     """
 
-    def __init__(self, files=None, *, sizes=None, fail_delete=False, fail_get=False) -> None:
+    def __init__(
+        self, files=None, *, sizes=None, fail_delete=False, fail_delete_ids=None,
+        fail_get=False,
+    ) -> None:
         self._files = files or {}
         self._sizes = sizes or {}
         self._fail_delete = fail_delete
+        self._fail_delete_ids = set(fail_delete_ids or ())
         self._fail_get = fail_get
         self.deleted: list[int] = []
         self.get_calls: list[int] = []
@@ -116,7 +120,7 @@ class _FakeArr:
     get_episode_file = get_movie_file
 
     def delete_movie_file(self, file_id: int) -> None:
-        if self._fail_delete:
+        if self._fail_delete or file_id in self._fail_delete_ids:
             raise ArrClientError("arr delete failed")
         self.deleted.append(file_id)
 
@@ -126,8 +130,10 @@ class _FakeArr:
 class _FakeAudit:
     def __init__(self) -> None:
         self.records = []
+        self.batches = []  # one entry per flush call — proves flush timing/batching
 
     def __call__(self, records, now) -> None:
+        self.batches.append(list(records))
         self.records.extend(records)
 
 
@@ -678,6 +684,42 @@ class ArrRoutingTests(unittest.TestCase):
         self.assertEqual(response.results[0].status, "error")
         self.assertEqual(len(audit.records), 1)
         self.assertEqual(audit.records[0].status, "error")
+
+    def test_stacked_partial_delete_failure_audits_deleted_then_error(self) -> None:
+        # #70: the shared delete-and-audit loop's whole-or-refused protocol. A
+        # two-part tracked copy whose SECOND delete fails: part one is deleted and
+        # audited, part two is audited as an error, both in ONE flush batch, and the
+        # result is a partial `error` carrying only part one's freed bytes. This is
+        # the mid-loop failure the old per-backend loops had no test for (the fakes
+        # could only fail EVERY delete).
+        keeper = _keeper()
+        stacked = _copy(
+            "/lib/cd1.mkv", 8, media_id=21, association="tracked", arr_tracked="radarr",
+            parts=[
+                {"part_id": 2, "file": "/lib/cd1.mkv", "size": 5, "arr_file_id": 1},
+                {"part_id": 3, "file": "/lib/cd2.mkv", "size": 3, "arr_file_id": 2},
+            ],
+        )
+        radarr = _FakeArr({1: "/data/cd1.mkv", 2: "/data/cd2.mkv"}, fail_delete_ids={2})
+        audit = _FakeAudit()
+        service = _service(
+            _report([_group([keeper, stacked], keeper=keeper)]), radarr=radarr, audit=audit
+        )
+        response = _reclaim(service, part_id=2)
+        result = response.results[0]
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.reclaimed_bytes, 5)          # only cd1's bytes freed
+        self.assertIn("partial", result.message)
+        self.assertIn("cd2.mkv", result.message)
+        self.assertEqual(radarr.deleted, [1])                # cd1 gone; cd2 attempted, failed
+        self.assertEqual([r.status for r in audit.records], ["deleted", "error"])
+        self.assertEqual(
+            [Path(r.path) for r in audit.records],
+            [Path("/lib/cd1.mkv"), Path("/lib/cd2.mkv")],   # audit uses media paths, in order
+        )
+        self.assertEqual(audit.records[0].message, "id=1 rating_key=900 part_id=2")
+        self.assertTrue(audit.records[1].message.startswith("id=2 rating_key=900:"))
+        self.assertEqual(len(audit.batches), 1)              # one flush batch, not per-part
 
     def test_stacked_tracked_copy_validates_all_parts_before_delete(self) -> None:
         # A two-part tracked copy: each part is re-validated by its own by-id GET
