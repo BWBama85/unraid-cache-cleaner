@@ -137,9 +137,10 @@ class ArrClientTests(unittest.TestCase):
 
         index = client.fetch_tracked_index()
 
-        # basename -> [episodeFile ids] (#61); a1/b1 carry ids, a2 has a path but
-        # no id (still a key, empty list), no-path.mkv is dropped (no path).
-        self.assertEqual(index, {"a1.mkv": [100], "a2.mkv": [], "b1.mkv": [300]})
+        # basename -> [episodeFile ids-or-None] (#61); a1/b1 carry ids, a2 has a
+        # path but no id (still a key, [None] — occurrence preserved so cross-series
+        # ambiguity can't collapse), no-path.mkv is dropped (no path).
+        self.assertEqual(index, {"a1.mkv": [100], "a2.mkv": [None], "b1.mkv": [300]})
         # one /series call plus one /episodefile call per series
         paths = [urlparse(r.full_url).path for r in opener.requests]
         self.assertEqual(paths.count("/api/v3/episodefile"), 2)
@@ -166,8 +167,9 @@ class ArrClientTests(unittest.TestCase):
 
         index = client.fetch_tracked_index()
 
-        # _sonarr_responder emits no ids, so every basename maps to an empty list.
-        self.assertEqual(index, {f"e{i}.mkv": [] for i in range(1, 21)})
+        # _sonarr_responder emits no ids, so every basename maps to [None] (one
+        # occurrence, no usable id) — the key is present so matching still works.
+        self.assertEqual(index, {f"e{i}.mkv": [None] for i in range(1, 21)})
         paths = [urlparse(r.full_url).path for r in opener.requests]
         self.assertEqual(paths.count("/api/v3/series"), 1)
         self.assertEqual(paths.count("/api/v3/episodefile"), 20)
@@ -191,7 +193,7 @@ class ArrClientTests(unittest.TestCase):
         client = _sonarr(_RecordingOpener(responder))
 
         self.assertEqual(
-            client.fetch_tracked_index(), {f"e{i}.mkv": [] for i in range(1, n + 1)}
+            client.fetch_tracked_index(), {f"e{i}.mkv": [None] for i in range(1, n + 1)}
         )
 
     def test_sonarr_worker_failure_fails_closed(self) -> None:
@@ -569,6 +571,29 @@ class AnnotateEpisodeTests(unittest.TestCase):
         self.assertEqual(by_name["e1.mkv"], (arr.TRACKED, arr.SONARR))
         self.assertIsNone(_ids_by_name(out)["e1.mkv"])
 
+    def test_shared_basename_one_missing_id_still_ambiguous(self) -> None:
+        # A basename in two series where ONE file lacks an id ([77, None]) must
+        # stay ambiguous — collapsing to the single id 77 would pin (and later
+        # delete) the wrong series' file. It is tracked but not by-id actionable.
+        group = _episode_group(
+            [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e1.720.mkv", 2 * GiB, "720")],
+        )
+        [out] = annotate([group], {}, {"e1.mkv": [77, None]})
+
+        self.assertEqual(_by_name(out)["e1.mkv"], (arr.TRACKED, arr.SONARR))
+        self.assertIsNone(_ids_by_name(out)["e1.mkv"])
+
+    def test_tracked_basename_no_usable_id_gets_no_id(self) -> None:
+        # A tracked basename whose only file lacks a usable id ([None]) forms the
+        # association but pins no id (refused by the action layer until resolvable).
+        group = _episode_group(
+            [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e1.720.mkv", 2 * GiB, "720")],
+        )
+        [out] = annotate([group], {}, {"e1.mkv": [None]})
+
+        self.assertEqual(_by_name(out)["e1.mkv"], (arr.TRACKED, arr.SONARR))
+        self.assertIsNone(_ids_by_name(out)["e1.mkv"])
+
     def test_no_basename_match_all_unknown(self) -> None:
         group = _episode_group(
             [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e2.mkv", 3 * GiB, "1080")],
@@ -600,6 +625,19 @@ class AnnotateEpisodeTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Mutation / resolve methods (#34 Phase 2)                                     #
 # --------------------------------------------------------------------------- #
+
+class AsIntTests(unittest.TestCase):
+    def test_positive_ints_pass_non_positive_and_malformed_become_none(self) -> None:
+        # An *arr file id is always a positive integer, so 0 (a common "unset"
+        # sentinel), negatives, and non-numeric values all read as absent — never
+        # as an addressable delete target (#61).
+        self.assertEqual(arr._as_int(42), 42)
+        self.assertEqual(arr._as_int("7"), 7)
+        self.assertIsNone(arr._as_int(0))
+        self.assertIsNone(arr._as_int(-1))
+        self.assertIsNone(arr._as_int("not-a-number"))
+        self.assertIsNone(arr._as_int(None))
+
 
 class ArrMutationTests(unittest.TestCase):
     def test_radarr_get_movie_file_reads_by_id(self) -> None:

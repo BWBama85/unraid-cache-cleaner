@@ -92,8 +92,9 @@ class _FakeArr:
     fan-out).
     """
 
-    def __init__(self, files=None, *, fail_delete=False, fail_get=False) -> None:
+    def __init__(self, files=None, *, sizes=None, fail_delete=False, fail_get=False) -> None:
         self._files = files or {}
+        self._sizes = sizes or {}
         self._fail_delete = fail_delete
         self._fail_get = fail_get
         self.deleted: list[int] = []
@@ -105,7 +106,12 @@ class _FakeArr:
             raise ArrClientError("arr get failed", status_code=500)
         if file_id not in self._files:
             raise ArrClientError("not found", status_code=404)
-        return {"id": file_id, "path": self._files[file_id]}
+        record = {"id": file_id, "path": self._files[file_id]}
+        # A size is included only when the test supplies one, so existing cases
+        # (no size) exercise basename-only drift and the size cross-check is opt-in.
+        if file_id in self._sizes:
+            record["size"] = self._sizes[file_id]
+        return record
 
     get_episode_file = get_movie_file
 
@@ -610,6 +616,27 @@ class ArrRoutingTests(unittest.TestCase):
         self.assertEqual(response.results[0].status, "refused")
         self.assertIn("drift", response.results[0].message)
         self.assertEqual(radarr.deleted, [])
+
+    def test_drift_size_mismatch_refused(self) -> None:
+        # The id still resolves to a same-basename file, but its size differs from
+        # the report — the id was reused for a DIFFERENT file that happens to share
+        # the basename (generic names collide across series). Size catches what
+        # basename cannot; refuse rather than delete the wrong file.
+        radarr = _FakeArr({55: "/data/old.mkv"}, sizes={55: 999})  # report part.size is 8
+        service = _service(_report([self._tracked_group("radarr")]), radarr=radarr)
+        response = _reclaim(service)
+        self.assertEqual(response.results[0].status, "refused")
+        self.assertIn("size changed", response.results[0].message)
+        self.assertEqual(radarr.deleted, [])
+
+    def test_matching_size_and_basename_deletes(self) -> None:
+        # The size cross-check must not false-refuse the correct file: a current
+        # record whose basename AND size both match the report is deleted.
+        radarr = _FakeArr({55: "/data/old.mkv"}, sizes={55: 8})  # matches report part.size
+        service = _service(_report([self._tracked_group("radarr")]), radarr=radarr)
+        response = _reclaim(service)
+        self.assertEqual(response.results[0].status, "deleted")
+        self.assertEqual(radarr.deleted, [55])
 
     def test_id_gone_404_refused(self) -> None:
         radarr = _FakeArr({})  # id 55 no longer exists

@@ -222,13 +222,14 @@ class SonarrClient(_ArrClient):
     Sonarr keys series by TVDB id, but Plex's episode guids are episode-level, so
     the join is basename-only (see the module docstring). The index still carries
     each basename's file id(s) so a tracked reclaim can delete by id (#61); a
-    basename shared across series maps to more than one id and stays not-by-id
-    actionable (the ambiguity is preserved, never collapsed to one arbitrary id).
+    basename shared across series keeps one list entry per occurrence (``None`` when
+    a file lacks an id) so the ambiguity is preserved and never collapsed to one
+    arbitrary id, which would delete the wrong series' file.
     """
 
     service_name = "Sonarr"
 
-    def fetch_tracked_index(self) -> Dict[str, List[int]]:
+    def fetch_tracked_index(self) -> Dict[str, List[Optional[int]]]:
         """Map each tracked episode-file basename to its ``episodeFile`` id(s) (#8,
         #61).
 
@@ -242,10 +243,13 @@ class SonarrClient(_ArrClient):
         report degrades that kind to ``unknown`` — rather than returning a partial,
         misleading set.
 
-        A basename whose file carries no usable id is still a key (mapping to an
-        empty list), so the *association* forms; it is simply not by-id actionable.
-        A basename shared across series maps to several ids, preserving the
-        ambiguity the reclaim path refuses on.
+        The value is the list of *every* tracked file with that basename, with a
+        ``None`` entry for one that carries no usable id — so the **occurrence
+        count** is preserved. That matters for safety: a basename shared across two
+        series where one file lacks an id must stay length-2 (ambiguous → not by-id
+        actionable), not collapse to a single pinnable id and delete the wrong
+        series' file. A basename present but with no usable id at all is ``[None]``
+        (the association still forms; it is simply not by-id actionable).
         """
 
         series_list = self._get_json("/api/v3/series")
@@ -258,7 +262,7 @@ class SonarrClient(_ArrClient):
             return {}
 
         total = len(series_ids)
-        index: Dict[str, List[int]] = {}
+        index: Dict[str, List[Optional[int]]] = {}
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(_SONARR_MAX_WORKERS, total)
         ) as pool:
@@ -271,9 +275,7 @@ class SonarrClient(_ArrClient):
                     concurrent.futures.as_completed(futures), start=1
                 ):
                     for basename, file_id in future.result():
-                        ids = index.setdefault(basename, [])
-                        if file_id is not None:
-                            ids.append(file_id)
+                        index.setdefault(basename, []).append(file_id)
                     if done % _SONARR_PROGRESS_EVERY == 0 or done == total:
                         LOGGER.info("Sonarr: indexed %s/%s series", done, total)
             finally:
@@ -434,7 +436,7 @@ def _annotate_by_id(
 
 def _annotate_by_basename(
     group: DuplicateGroup,
-    index: Dict[str, List[int]],
+    index: Dict[str, List[Optional[int]]],
     arr_name: str,
 ) -> DuplicateGroup:
     tracked_basenames = set(index.keys())
@@ -442,12 +444,16 @@ def _annotate_by_basename(
     # No reliable id anchor for episodes, so anything not uniquely tracked —
     # ambiguous or unmatched — is ``unknown`` (never ``untracked``/safe). A
     # tracked part gets its file id only when the basename maps to exactly one
-    # (a basename shared across series is ambiguous -> not by-id actionable).
+    # tracked file *and* that file has a usable id: more than one occurrence (a
+    # basename shared across series, even if only one carries an id) is ambiguous,
+    # so no id is pinned and the reclaim is refused rather than deleting the wrong
+    # file. ``ids`` preserves occurrence count via ``None`` placeholders.
     associations: List[tuple[str, Optional[str], Optional[int]]] = []
     for i, copy in enumerate(group.copies):
         if _stack_key(copy, i) in tracked_stacks:
             ids = index.get(copy.file.name) or []
-            associations.append((TRACKED, arr_name, ids[0] if len(ids) == 1 else None))
+            pinned = ids[0] if len(ids) == 1 and ids[0] is not None else None
+            associations.append((TRACKED, arr_name, pinned))
         else:
             associations.append((UNKNOWN, None, None))
     return _apply(group, associations)
@@ -456,13 +462,14 @@ def _annotate_by_basename(
 def annotate(
     groups: List[DuplicateGroup],
     radarr_index: Dict[str, Dict[str, Optional[int]]],
-    sonarr_index: Dict[str, List[int]],
+    sonarr_index: Dict[str, List[Optional[int]]],
 ) -> List[DuplicateGroup]:
     """Return ``groups`` with each copy's association (and, when tracked, its
     ``*arr`` file id) filled in.
 
     ``radarr_index`` maps TMDB id -> ``{basename: movieFile id}``;
-    ``sonarr_index`` maps episode-file basename -> ``[episodeFile ids]``. An empty
+    ``sonarr_index`` maps episode-file basename -> ``[episodeFile ids]`` (one entry
+    per tracked file with that basename, ``None`` for a file lacking an id). An empty
     index (that ``*arr`` unconfigured or unreachable) leaves the relevant kind
     ``unknown``. ``mismatch`` groups (Plex merged different titles) and
     non-movie/episode kinds are never labeled tracked/untracked — their copies keep

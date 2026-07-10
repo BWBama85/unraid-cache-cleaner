@@ -208,7 +208,7 @@ class PlexDuplicateReporter:
 
     def _build_arr_indexes(
         self, warnings: List[str]
-    ) -> Tuple[Dict[str, Dict[str, Optional[int]]], Dict[str, List[int]]]:
+    ) -> Tuple[Dict[str, Dict[str, Optional[int]]], Dict[str, List[Optional[int]]]]:
         """Fetch the Radarr/Sonarr tracked indexes, degrading gracefully.
 
         An unconfigured client contributes an empty index; a configured but
@@ -219,7 +219,7 @@ class PlexDuplicateReporter:
         """
 
         radarr_index: Dict[str, Dict[str, Optional[int]]] = {}
-        sonarr_index: Dict[str, List[int]] = {}
+        sonarr_index: Dict[str, List[Optional[int]]] = {}
         if self.radarr_client is not None:
             try:
                 radarr_index = self.radarr_client.fetch_tracked_index()

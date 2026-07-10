@@ -33,10 +33,10 @@ Fail-closed on every axis:
 * **Re-validated immediately before the delete (TOCTOU)** — a filesystem target is
   re-``lstat``'d for a matching size and a regular (non-symlink) file under the
   media root; a tracked target's ``*arr`` file id (serialized into the report by the
-  arr layer, #61) is re-validated by a single by-id GET and refused on a 404 or a
-  current basename that no longer matches the report's (``*arr``-side drift) — no
-  full-library fan-out, so a tracked reclaim costs at most one GET + one DELETE per
-  part.
+  arr layer, #61) is re-validated by a single by-id GET and refused on a 404 or if
+  the current file's basename *or* size no longer matches the report's (``*arr``-side
+  drift / an id reused for a different same-named file) — no full-library fan-out, so
+  a tracked reclaim costs at most one GET + one DELETE per part.
 * **Stacked-safe** — a logical copy's parts are *all* prevalidated before *any* is
   deleted, so a multi-part copy is removed whole or refused whole.
 """
@@ -656,11 +656,13 @@ class ReclaimService:
         ``(None, reason)``.
 
         Fail-closed on every axis: a part with no serialized id (a report predating
-        #61, or an id that could not be pinned) is refused with a regenerate hint; a
-        404 means the id is gone; a current path whose basename differs from the
-        report's is ``*arr``-side drift (the id was reused). Any single failure
-        refuses the whole (possibly stacked) copy, so a multi-part copy is deleted
-        whole or refused whole — never after one DELETE has already committed.
+        #61, or an id that could not be pinned unambiguously) is refused; a 404 means
+        the id is gone; and the by-id record is re-anchored to the report on *both*
+        the current basename *and* the current size — the same two-signal drift guard
+        the filesystem backend applies (basename bridges mount-path differences, size
+        distinguishes a same-named-but-different file the id may have been reused for).
+        Any single failure refuses the whole (possibly stacked) copy, so a multi-part
+        copy is deleted whole or refused whole — never after one DELETE has committed.
         """
 
         resolved: List[Tuple[int, Path, int]] = []
@@ -668,8 +670,9 @@ class ReclaimService:
             file_id = part.arr_file_id
             if file_id is None:
                 return None, (
-                    f"no {backend} file id recorded for {part.plex_path.name}; "
-                    "regenerate the duplicate report so it can be reclaimed by id"
+                    f"no unambiguous {backend} file id is recorded for "
+                    f"{part.plex_path.name}; regenerate the duplicate report, or (if it "
+                    f"is tracked in more than one place) remove it via {backend} directly"
                 )
             try:
                 current = self._get_arr_file(client, backend, file_id)
@@ -682,11 +685,22 @@ class ReclaimService:
                 return None, f"could not re-validate {backend} file id {file_id}: {exc}"
             current_path = current.get("path") or current.get("relativePath") or ""
             current_name = Path(str(current_path)).name
-            if current_name != part.plex_path.name:
+            if not current_name or current_name != part.plex_path.name:
                 return None, (
                     f"{backend} file id {file_id} now points at "
                     f"{current_name or 'an unnamed file'}, not {part.plex_path.name} "
                     "(library drift); refusing"
+                )
+            # Size is the discriminator basename can't provide: an id reused for a
+            # different file that happens to share the basename (generic episode
+            # names collide across series) is caught here. Only enforced when the
+            # *arr reports a positive size and the report recorded one, so a missing
+            # size never falsely refuses a correct same-file reclaim.
+            current_size = _as_opt_int(current.get("size"))
+            if current_size is not None and part.size > 0 and current_size != part.size:
+                return None, (
+                    f"{backend} file id {file_id} size changed since the report "
+                    f"({current_size} != {part.size}); refusing a stale/reused id"
                 )
             resolved.append((file_id, part.plex_path, part.size))
         return resolved, None
