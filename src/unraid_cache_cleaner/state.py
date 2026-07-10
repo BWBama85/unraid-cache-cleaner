@@ -48,6 +48,59 @@ _BUSY_TIMEOUT_SECONDS = 30.0
 # extraction is never mistaken for a crash and reclaimed out from under itself.
 CLAIM_TTL_SECONDS = 7200
 
+#: SQL ``LIKE`` prefix selecting only the web GUI's reclaim audit rows (written by
+#: :class:`~unraid_cache_cleaner.web_actions.ReclaimService` as ``web-reclaim:*``),
+#: so the read-only history endpoint never surfaces the cleaner's/extractor's own
+#: rows in the shared ``actions`` table.
+_WEB_RECLAIM_LIKE = "web-reclaim:%"
+
+#: Hard cap on the history the read-only endpoint returns, so a page load can never
+#: pull an unbounded audit table into memory regardless of the requested limit.
+_ACTION_HISTORY_MAX = 1000
+
+
+def read_recent_actions(
+    db_path: Path, *, limit: int = 200
+) -> Optional[list[dict]]:
+    """Return the most recent web-reclaim audit rows (newest first), or ``None``.
+
+    This backs the read-only ``/api/actions`` history endpoint (#62). It is a
+    module function — **not** a :class:`StateStore` method — on purpose:
+
+    * It opens its **own** short-lived connection per call, so concurrent HTTP
+      readers never share one ``sqlite3`` connection (SQLite forbids concurrent use
+      of a single connection; the action layer's audit connection is only safe
+      because the reclaim lock serializes it — this read path has no such lock).
+    * It **never creates or migrates** the database: a missing file or a legacy
+      store with no ``actions`` table returns ``None`` (an "unavailable" signal),
+      so a GET can never write to or upgrade the DB.
+
+    Only ``web-reclaim:*`` rows are returned (not the cleaner's/extractor's own
+    ``actions`` rows), ordered ``occurred_at DESC, id DESC`` and capped.
+    """
+
+    capped = max(0, min(int(limit), _ACTION_HISTORY_MAX))
+    if capped == 0 or not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(db_path, timeout=_BUSY_TIMEOUT_SECONDS)
+    except sqlite3.OperationalError:
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT path, action, status, size, message, occurred_at "
+            "FROM actions WHERE action LIKE ? "
+            "ORDER BY occurred_at DESC, id DESC LIMIT ?",
+            (_WEB_RECLAIM_LIKE, capped),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # A legacy store predating the ``actions`` table: unavailable, not empty.
+        return None
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
 
 class StateStore:
     """Tracks candidates across polling cycles."""

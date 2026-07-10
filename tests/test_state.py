@@ -12,7 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.extractor import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW
-from unraid_cache_cleaner.state import StateStore
+from unraid_cache_cleaner.models import ActionRecord
+from unraid_cache_cleaner.state import StateStore, read_recent_actions
 
 
 class ExtractionLedgerTests(unittest.TestCase):
@@ -377,6 +378,102 @@ class ConcurrencyTests(unittest.TestCase):
         finally:
             blocker.rollback()
             blocker.close()
+
+
+class ReadRecentActionsTests(unittest.TestCase):
+    """The read-only history reader backing ``/api/actions`` (#62)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "state.sqlite3"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, rows, now):
+        store = StateStore(self.db)
+        store.record_actions(rows, now)
+        store._connection.close()
+
+    def test_missing_db_is_unavailable_and_creates_nothing(self) -> None:
+        self.assertIsNone(read_recent_actions(self.db))
+        # A read of a missing DB must not create the file (read-only viewer).
+        self.assertFalse(self.db.exists())
+
+    def test_legacy_db_without_actions_table_is_unavailable(self) -> None:
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+        conn.close()
+        self.assertIsNone(read_recent_actions(self.db))
+
+    def test_empty_but_present_table_is_available_and_empty(self) -> None:
+        StateStore(self.db)._connection.close()  # creates the actions table, no rows
+        self.assertEqual(read_recent_actions(self.db), [])
+
+    def test_returns_only_web_reclaim_rows_newest_first(self) -> None:
+        self._write(
+            [
+                ActionRecord(path=Path("/lib/a.mkv"), action="web-reclaim:filesystem", status="deleted", size=5),
+            ],
+            now=100.0,
+        )
+        self._write(
+            [
+                ActionRecord(path=Path("/data/orphan.mkv"), action="delete", status="deleted", size=9),
+                ActionRecord(path=Path("/lib/b.mkv"), action="web-reclaim:radarr", status="deleted", size=7),
+            ],
+            now=200.0,
+        )
+        rows = read_recent_actions(self.db)
+        self.assertIsNotNone(rows)
+        # The cleaner's own "delete" row is filtered out; only web-reclaim survives.
+        actions = [r["action"] for r in rows]
+        self.assertEqual(actions, ["web-reclaim:radarr", "web-reclaim:filesystem"])  # newest first
+        self.assertEqual(rows[0]["path"], "/lib/b.mkv")
+        self.assertEqual(rows[0]["size"], 7)
+        self.assertEqual(rows[0]["occurred_at"], 200.0)
+
+    def test_limit_bounds_and_zero_is_unavailable(self) -> None:
+        self._write(
+            [
+                ActionRecord(path=Path(f"/lib/{i}.mkv"), action="web-reclaim:filesystem", status="deleted", size=i)
+                for i in range(5)
+            ],
+            now=100.0,
+        )
+        self.assertEqual(len(read_recent_actions(self.db, limit=2)), 2)
+        self.assertIsNone(read_recent_actions(self.db, limit=0))
+
+    def test_read_is_thread_safe_and_sees_a_concurrent_write(self) -> None:
+        # A history read from a worker thread runs concurrently with an audit write
+        # on another connection (WAL) without sharing a connection or raising.
+        self._write(
+            [ActionRecord(path=Path("/lib/seed.mkv"), action="web-reclaim:filesystem", status="deleted", size=1)],
+            now=50.0,
+        )
+        writer = StateStore(self.db, check_same_thread=False)
+        results = []
+        errors = []
+
+        def reader():
+            try:
+                for _ in range(20):
+                    results.append(read_recent_actions(self.db))
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        for i in range(20):
+            writer.record_actions(
+                [ActionRecord(path=Path(f"/lib/w{i}.mkv"), action="web-reclaim:radarr", status="deleted", size=i)],
+                now=100.0 + i,
+            )
+        thread.join(5)
+        writer._connection.close()
+        self.assertEqual(errors, [])
+        self.assertTrue(all(r is not None for r in results))
 
 
 if __name__ == "__main__":
