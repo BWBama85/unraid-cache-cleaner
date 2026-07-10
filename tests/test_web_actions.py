@@ -679,6 +679,81 @@ class FilesystemTests(unittest.TestCase):
             )
             self.assertEqual(len(audit.batches), 1)       # one flush batch
 
+    def test_purge_failure_before_any_commit_rolls_back(self) -> None:
+        # #71 (Codex): an unlink failing BEFORE any delete commits is recoverable —
+        # every part is still staged, so all are rolled back and the reclaim is refused
+        # with nothing deleted (vs. leaving originals renamed away and the later,
+        # un-attempted staged parts orphaned and un-audited).
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
+            deleter = _FakeDeleter(fail_on_call=1)  # 1st unlink fails (nothing committed)
+            audit = _FakeAudit()
+            service = _service(_report([group]), config=config, deleter=deleter, audit=audit)
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.reclaimed_bytes, 0)
+            self.assertIn("rolled back, nothing deleted", result.message)
+            self.assertEqual(len(deleter.calls), 1)       # stopped at the first failure
+            self.assertTrue(cd1.exists())
+            self.assertEqual(cd1.read_bytes(), b"aaaaa")  # both restored
+            self.assertTrue(cd2.exists())
+            self.assertEqual(cd2.read_bytes(), b"bbb")
+            self.assertEqual(audit.records, [])           # clean rollback → nothing audited
+            self.assertFalse(cd1.with_name(cd1.name + STAGING_SUFFIX).exists())
+            self.assertFalse(cd2.with_name(cd2.name + STAGING_SUFFIX).exists())
+
+    def test_long_basename_stages_with_bounded_name(self) -> None:
+        # #71 (Codex): a basename near NAME_MAX must still stage. Appending the suffix
+        # to the full name would overflow the component limit (ENAMETOOLONG) and refuse
+        # a reclaim a direct unlink would have handled; the staging name is bounded.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root = Path(tmp) / "media"
+            media_root.mkdir()
+            long_name = "x" * 250 + ".mkv"  # 254 bytes, near the 255-byte NAME_MAX
+            real = media_root / long_name
+            real.write_bytes(b"xxxxx")
+            keeper = _keeper()
+            group = _group(
+                [keeper, _copy(f"/plex/{long_name}", 5, media_id=21, association="untracked")],
+                keeper=keeper,
+            )
+            config = _config(web_media_path_map=((Path("/plex"), media_root),))
+            service = _service(_report([group]), config=config, deleter=os.unlink)
+            result = _reclaim(service).results[0]
+            self.assertEqual(result.status, "deleted")  # not ENAMETOOLONG-refused
+            self.assertFalse(real.exists())
+
+    def test_rollback_skips_recreated_original_leaving_orphan(self) -> None:
+        # #71 (Codex): if the original path reappears during the staging window,
+        # rollback must NOT clobber the new file (os.rename replaces on POSIX) — it
+        # leaves the staged copy as an audited orphan and preserves the new file.
+        with tempfile.TemporaryDirectory() as tmp:
+            media_root, cd1, cd2, group, config = self._two_part_stacked(tmp)
+            calls = []
+
+            def mover(src, dst):
+                calls.append((Path(src), Path(dst)))
+                if len(calls) == 1:
+                    os.rename(src, dst)               # stage cd1
+                    cd1.write_bytes(b"NEW-CONTENT")   # another process recreates cd1
+                else:
+                    raise OSError("stage cd2 failed")  # forces rollback of cd1
+
+            deleter = _FakeDeleter()
+            audit = _FakeAudit()
+            service = _service(
+                _report([group]), config=config, deleter=deleter, mover=mover, audit=audit
+            )
+            result = _reclaim(service, part_id=2).results[0]
+            self.assertEqual(result.status, "error")
+            self.assertEqual(deleter.calls, [])           # nothing unlinked
+            self.assertIn("could not be rolled back", result.message)
+            self.assertEqual(cd1.read_bytes(), b"NEW-CONTENT")  # new file NOT clobbered
+            self.assertTrue(cd1.with_name(cd1.name + STAGING_SUFFIX).exists())  # orphan kept
+            self.assertEqual([r.status for r in audit.records], ["error"])
+            self.assertEqual(Path(audit.records[0].path), cd1)
+            self.assertIn("left staged", audit.records[0].message)
+
 
 # --------------------------------------------------------------------------- #
 # *arr backend                                                                 #
