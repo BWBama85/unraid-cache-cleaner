@@ -411,6 +411,23 @@ class ReadRecentActionsTests(unittest.TestCase):
         StateStore(self.db)._connection.close()  # creates the actions table, no rows
         self.assertEqual(read_recent_actions(self.db), [])
 
+    def test_corrupt_non_sqlite_file_is_unavailable_not_raise(self) -> None:
+        # A non-SQLite file at the path raises sqlite3.DatabaseError (parent of
+        # OperationalError) at execute time; the reader degrades to None, not a crash.
+        self.db.write_bytes(b"this is not a database")
+        self.assertIsNone(read_recent_actions(self.db))
+
+    def test_read_does_not_write_the_main_db(self) -> None:
+        # The read path opens mode=ro, so a GET never writes the database file — no
+        # checkpoint or migration touches it (the documented no-write-on-GET guarantee).
+        self._write(
+            [ActionRecord(path=Path("/lib/a.mkv"), action="web-reclaim:filesystem", status="deleted", size=1)],
+            now=100.0,
+        )
+        before = self.db.stat().st_mtime_ns
+        self.assertEqual(len(read_recent_actions(self.db)), 1)
+        self.assertEqual(self.db.stat().st_mtime_ns, before)
+
     def test_returns_only_web_reclaim_rows_newest_first(self) -> None:
         self._write(
             [

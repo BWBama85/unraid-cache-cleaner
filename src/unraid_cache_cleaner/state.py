@@ -82,9 +82,16 @@ def read_recent_actions(
     capped = max(0, min(int(limit), _ACTION_HISTORY_MAX))
     if capped == 0 or not db_path.exists():
         return None
+    # Open **read-only** (``mode=ro`` URI): the store runs in WAL, so a read/write
+    # connection would create the ``-wal``/``-shm`` sidecars and checkpoint on close —
+    # a write triggered by a GET. ``mode=ro`` never writes; it can still read a WAL DB
+    # while a writer (the cleaner/audit connection) is live. A path that can't form a
+    # URI, or a DB that needs recovery with no writer present, degrades to unavailable.
     try:
-        conn = sqlite3.connect(db_path, timeout=_BUSY_TIMEOUT_SECONDS)
-    except sqlite3.OperationalError:
+        conn = sqlite3.connect(
+            f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_SECONDS
+        )
+    except (sqlite3.OperationalError, ValueError):
         return None
     try:
         conn.row_factory = sqlite3.Row
@@ -94,8 +101,10 @@ def read_recent_actions(
             "ORDER BY occurred_at DESC, id DESC LIMIT ?",
             (_WEB_RECLAIM_LIKE, capped),
         ).fetchall()
-    except sqlite3.OperationalError:
-        # A legacy store predating the ``actions`` table: unavailable, not empty.
+    except sqlite3.DatabaseError:
+        # A legacy store with no ``actions`` table (OperationalError) or a
+        # corrupt/non-SQLite file (DatabaseError, the parent class): unavailable,
+        # not empty — never a propagated exception or a page 500.
         return None
     finally:
         conn.close()

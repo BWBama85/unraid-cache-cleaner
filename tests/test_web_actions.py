@@ -882,6 +882,19 @@ class CsrfHardeningHttpTests(unittest.TestCase):
             )
         self.assertEqual(status, 200)
 
+    def test_malformed_origin_is_clean_403_not_dropped_connection(self) -> None:
+        # A hostile bad-port Origin must yield a clean 403, never crash the request
+        # thread (urlparse(...).port raises ValueError) and drop the connection.
+        payload, service = self._dry_service()
+        form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+        with _serve(payload, service, require_browser_origin=True) as base:
+            status, _ = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Origin": "http://evil:999999"},
+            )
+        self.assertEqual(status, 403)
+
     def test_referrer_policy_same_origin_when_actions_enabled(self) -> None:
         payload = _untracked_payload()
         service = _service(payload)

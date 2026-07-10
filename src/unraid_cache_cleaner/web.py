@@ -475,12 +475,16 @@ def _status_tag(status: object) -> str:
 def _action_row(row: dict) -> str:
     occurred = row.get("occurred_at")
     stamp = _utc_stamp(occurred) if isinstance(occurred, (int, float)) else str(occurred)
+    # An ``error`` row records the target's size for the audit trail, but nothing was
+    # actually freed — so only a ``deleted`` row shows reclaimed bytes; a failure
+    # shows a dash, never a misleading "N GiB reclaimed" next to a red error tag.
+    reclaimed = _fmt_gib(row.get("size", 0)) if row.get("status") == "deleted" else "—"
     return (
         "<tr>"
         f'<td class="num">{_esc(stamp)}</td>'
         f'<td>{_esc(_action_backend(row.get("action")))}</td>'
         f'<td>{_status_tag(row.get("status"))}</td>'
-        f'<td class="num">{_esc(_fmt_gib(row.get("size", 0)))}</td>'
+        f'<td class="num">{_esc(reclaimed)}</td>'
         f'<td><code>{_esc(row.get("path", "?"))}</code></td>'
         f'<td>{_esc(row.get("message", ""))}</td>'
         "</tr>"
@@ -829,6 +833,8 @@ def _is_loopback_bind(address: str) -> bool:
         return False
     if addr == "localhost":
         return True
+    if addr.startswith("[") and addr.endswith("]"):
+        addr = addr[1:-1]  # a bracketed IPv6 literal, e.g. [::1]
     try:
         return ipaddress.ip_address(addr).is_loopback
     except ValueError:
@@ -842,7 +848,14 @@ def _normalize_origin(value: Optional[str]) -> Optional[str]:
 
     if not value:
         return None
-    parsed = urlparse(value.strip())
+    try:
+        parsed = urlparse(value.strip())
+        # ``.port`` raises ValueError on a non-numeric or out-of-range port; a client
+        # controls this header, so a hostile ``Origin: http://h:999999`` must refuse
+        # (return None), never crash the request thread with an uncaught exception.
+        port = parsed.port
+    except ValueError:
+        return None
     scheme = parsed.scheme.lower()
     if not scheme or not parsed.netloc:
         return None
@@ -851,7 +864,6 @@ def _normalize_origin(value: Optional[str]) -> Optional[str]:
         return None
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # re-bracket an IPv6 literal for the reassembled origin
-    port = parsed.port
     if port is None or (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
         return f"{scheme}://{host}"
     return f"{scheme}://{host}:{port}"
@@ -1247,7 +1259,16 @@ def _normalized_allowed_origins(raw: Sequence[str]) -> tuple:
     normalized: List[str] = []
     for entry in raw or ():
         origin = _normalize_origin(entry)
-        if origin is not None and origin not in normalized:
+        if origin is None:
+            # A dropped entry silently collapses the allow-list toward the weaker
+            # same-origin-vs-Host fallback, so surface the misconfiguration loudly.
+            LOGGER.warning(
+                "ignoring unparseable WEB_ALLOWED_ORIGINS entry %r "
+                "(expected a full origin like https://media.example.com)",
+                entry,
+            )
+            continue
+        if origin not in normalized:
             normalized.append(origin)
     return tuple(normalized)
 

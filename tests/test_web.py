@@ -27,6 +27,7 @@ from unraid_cache_cleaner.web import (
     DuplicateReportViewer,
     _is_loopback_bind,
     _normalize_origin,
+    _normalized_allowed_origins,
     _request_origin_ok,
     build_server,
     file_report_provider,
@@ -421,8 +422,14 @@ class OriginPolicyTests(unittest.TestCase):
         for bad in (None, "", "null", "not-a-url", "/relative/path"):
             self.assertIsNone(_normalize_origin(bad), bad)
 
+    def test_normalize_origin_rejects_bad_port_without_raising(self) -> None:
+        # urlparse(...).port raises ValueError on a bad port; a client controls this
+        # header, so it must refuse (None), never crash the request thread.
+        for bad in ("http://h:999999", "http://h:abc", "http://h:-1"):
+            self.assertIsNone(_normalize_origin(bad), bad)
+
     def test_is_loopback_bind(self) -> None:
-        for addr in ("127.0.0.1", "::1", "localhost", "127.5.5.5"):
+        for addr in ("127.0.0.1", "::1", "[::1]", "localhost", "127.5.5.5"):
             self.assertTrue(_is_loopback_bind(addr), addr)
         for addr in ("0.0.0.0", "::", "", "192.168.1.5", "media.example.com"):
             self.assertFalse(_is_loopback_bind(addr), addr)
@@ -488,6 +495,18 @@ class OriginPolicyTests(unittest.TestCase):
                                   origin="http://127.0.0.1:8080",
                                   allowed_origins=("https://media.example.com",)))
 
+    def test_normalized_allowlist_drops_and_warns_on_bad_entry(self) -> None:
+        # A scheme-less entry can't be honored; it is dropped (collapsing toward the
+        # weaker Host fallback) and the misconfiguration is logged, not silent.
+        with self.assertLogs("unraid_cache_cleaner.web", level="WARNING") as logs:
+            result = _normalized_allowed_origins(("media.example.com", "https://ok.example:443"))
+        self.assertEqual(result, ("https://ok.example",))  # default https port normalized away
+        self.assertTrue(any("WEB_ALLOWED_ORIGINS" in line for line in logs.output))
+
+    def test_bad_port_origin_over_http_is_clean_refusal(self) -> None:
+        # End-to-end: a hostile bad-port Origin refuses, never raising.
+        self.assertFalse(self._ok(require_browser_origin=True, origin="http://h:999999"))
+
 
 @contextmanager
 def _serve_with_history(report, history):
@@ -533,6 +552,18 @@ class ActionHistoryViewerTests(unittest.TestCase):
         self.assertIn("5.0 GiB", html)
         self.assertIn("2024-07-03", html)  # occurred_at stamped as UTC
         self.assertIn("/lib/old.mkv", html)
+
+    def test_error_row_does_not_claim_reclaimed_bytes(self) -> None:
+        # An error row audits the target size, but nothing was freed — the Reclaimed
+        # column must not show "N GiB" next to a failed delete.
+        html = render_actions_html([
+            _action_row(status="error", size=5 * GiB, message="permission denied")
+        ])
+        self.assertNotIn("5.0 GiB", html)
+        self.assertIn("—", html)
+        # A successful delete still shows its reclaimed size.
+        ok = render_actions_html([_action_row(status="deleted", size=5 * GiB)])
+        self.assertIn("5.0 GiB", ok)
 
     def test_render_escapes_hostile_path_and_message(self) -> None:
         html = render_actions_html([
