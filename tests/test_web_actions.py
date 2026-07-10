@@ -83,24 +83,31 @@ class _FakeDeleter:
 
 
 class _FakeArr:
-    """A fake Radarr/Sonarr client recording index/delete calls.
+    """A fake Radarr/Sonarr client recording by-id lookups and delete calls.
 
-    ``ids`` is the basename -> [file id] index; ``index_calls`` proves the action
-    layer builds the index at most once per request rather than per target.
+    ``files`` maps ``{file id: current path}`` — the live ``*arr`` state a reclaim
+    re-validates a report-serialized id against (#61). A ``get_*`` for an id absent
+    from ``files`` raises ``ArrClientError(status_code=404)`` (the id is gone);
+    ``get_calls`` proves each part costs exactly one by-id GET (no full-library
+    fan-out).
     """
 
-    def __init__(self, ids=None, *, fail_delete=False, fail_index=False) -> None:
-        self._ids = ids or {}
+    def __init__(self, files=None, *, fail_delete=False, fail_get=False) -> None:
+        self._files = files or {}
         self._fail_delete = fail_delete
-        self._fail_index = fail_index
+        self._fail_get = fail_get
         self.deleted: list[int] = []
-        self.index_calls = 0
+        self.get_calls: list[int] = []
 
-    def fetch_file_index(self):
-        self.index_calls += 1
-        if self._fail_index:
-            raise ArrClientError("arr index fetch failed")
-        return {name: list(ids) for name, ids in self._ids.items()}
+    def get_movie_file(self, file_id: int) -> dict:
+        self.get_calls.append(file_id)
+        if self._fail_get:
+            raise ArrClientError("arr get failed", status_code=500)
+        if file_id not in self._files:
+            raise ArrClientError("not found", status_code=404)
+        return {"id": file_id, "path": self._files[file_id]}
+
+    get_episode_file = get_movie_file
 
     def delete_movie_file(self, file_id: int) -> None:
         if self._fail_delete:
@@ -124,14 +131,19 @@ def _keeper(file="/lib/keep.4k.mkv", size=20 * GiB, media_id=20, part_id=1):
         "size": size,
         "resolution": "4k",
         "media_id": media_id,
-        "parts": [{"part_id": part_id, "file": file, "size": size}],
+        "parts": [{"part_id": part_id, "file": file, "size": size, "arr_file_id": None}],
         "association": "untracked",
         "arr_tracked": None,
     }
 
 
-def _copy(file, size, *, media_id, association, arr_tracked=None, parts=None, resolution="1080"):
-    parts = parts or [{"part_id": 2, "file": file, "size": size}]
+def _copy(
+    file, size, *, media_id, association, arr_tracked=None, parts=None,
+    resolution="1080", arr_file_id=None,
+):
+    parts = parts or [
+        {"part_id": 2, "file": file, "size": size, "arr_file_id": arr_file_id}
+    ]
     return {
         "file": file,
         "size": size,
@@ -539,13 +551,18 @@ class FilesystemTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 class ArrRoutingTests(unittest.TestCase):
-    def _tracked_group(self, backend="radarr", file="/lib/old.mkv"):
+    def _tracked_group(self, backend="radarr", file="/lib/old.mkv", arr_file_id=55):
         keeper = _keeper()
-        copy = _copy(file, 8, media_id=21, association="tracked", arr_tracked=backend)
+        copy = _copy(
+            file, 8, media_id=21, association="tracked", arr_tracked=backend,
+            arr_file_id=arr_file_id,
+        )
         return _group([keeper, copy], keeper=keeper)
 
-    def test_tracked_radarr_hits_delete_movie_file(self) -> None:
-        radarr = _FakeArr({"old.mkv": [55]})
+    def test_tracked_radarr_deletes_by_id_after_one_get(self) -> None:
+        # The report-serialized id (55) is re-validated by a single by-id GET whose
+        # current basename still matches, then deleted — no full-library fan-out.
+        radarr = _FakeArr({55: "/data/old.mkv"})
         audit = _FakeAudit()
         service = _service(
             _report([self._tracked_group("radarr")]), radarr=radarr, audit=audit
@@ -553,43 +570,71 @@ class ArrRoutingTests(unittest.TestCase):
         response = _reclaim(service)
         self.assertEqual(response.results[0].status, "deleted")
         self.assertEqual(response.results[0].backend, "radarr")
+        self.assertEqual(radarr.get_calls, [55])  # exactly one by-id GET
         self.assertEqual(radarr.deleted, [55])
         self.assertEqual(len(audit.records), 1)
 
-    def test_tracked_sonarr_hits_delete_episode_file(self) -> None:
-        sonarr = _FakeArr({"old.mkv": [77]})
-        group = self._tracked_group("sonarr")
+    def test_tracked_sonarr_deletes_by_id(self) -> None:
+        sonarr = _FakeArr({77: "/data/tv/old.mkv"})
+        group = self._tracked_group("sonarr", arr_file_id=77)
         group["kind"] = "episode"
         service = _service(_report([group]), sonarr=sonarr)
         response = _reclaim(service)
         self.assertEqual(response.results[0].status, "deleted")
+        self.assertEqual(sonarr.get_calls, [77])
         self.assertEqual(sonarr.deleted, [77])
 
-    def test_dry_run_makes_no_arr_delete_calls(self) -> None:
-        radarr = _FakeArr({"old.mkv": [55]})
+    def test_dry_run_validates_by_id_but_makes_no_delete(self) -> None:
+        # Dry-run still runs the by-id GET validation (so a stale id previews as a
+        # refusal), but issues no DELETE and writes no audit record.
+        radarr = _FakeArr({55: "/data/old.mkv"})
+        audit = _FakeAudit()
         service = _service(
             _report([self._tracked_group("radarr")]),
             config=_config(web_actions_dry_run=True),
             radarr=radarr,
+            audit=audit,
         )
         response = _reclaim(service)
         self.assertEqual(response.results[0].status, "would-delete")
-        self.assertEqual(radarr.deleted, [])
+        self.assertEqual(radarr.get_calls, [55])  # validated
+        self.assertEqual(radarr.deleted, [])  # but not deleted
+        self.assertEqual(audit.records, [])  # and not audited
 
-    def test_ambiguous_arr_resolution_refused(self) -> None:
-        radarr = _FakeArr({"old.mkv": [1, 2]})  # two files share the basename
+    def test_drift_basename_mismatch_refused(self) -> None:
+        # The id still resolves, but now points at a DIFFERENT file (the id was
+        # reused after the report) — a drift guard refuses rather than delete it.
+        radarr = _FakeArr({55: "/data/some-other-movie.mkv"})
         service = _service(_report([self._tracked_group("radarr")]), radarr=radarr)
         response = _reclaim(service)
         self.assertEqual(response.results[0].status, "refused")
-        self.assertIn("ambiguous", response.results[0].message)
+        self.assertIn("drift", response.results[0].message)
         self.assertEqual(radarr.deleted, [])
 
-    def test_not_found_arr_resolution_refused(self) -> None:
-        radarr = _FakeArr({})  # basename no longer tracked
+    def test_id_gone_404_refused(self) -> None:
+        radarr = _FakeArr({})  # id 55 no longer exists
         service = _service(_report([self._tracked_group("radarr")]), radarr=radarr)
         response = _reclaim(service)
         self.assertEqual(response.results[0].status, "refused")
-        self.assertIn("no radarr file", response.results[0].message)
+        self.assertIn("no longer exists", response.results[0].message)
+        self.assertEqual(radarr.deleted, [])
+
+    def test_missing_id_in_report_refused_with_regenerate_hint(self) -> None:
+        # A tracked copy from a report predating #61 has no arr_file_id key at all;
+        # it is refused (fail-closed) with a regenerate hint rather than resolved
+        # live via a full-library fetch (the fallback #61 removed).
+        keeper = _keeper()
+        old_copy = _copy(
+            "/lib/old.mkv", 8, media_id=21, association="tracked", arr_tracked="radarr",
+            parts=[{"part_id": 2, "file": "/lib/old.mkv", "size": 8}],  # no arr_file_id
+        )
+        radarr = _FakeArr({55: "/data/old.mkv"})
+        service = _service(_report([_group([keeper, old_copy], keeper=keeper)]), radarr=radarr)
+        response = _reclaim(service)
+        self.assertEqual(response.results[0].status, "refused")
+        self.assertIn("regenerate", response.results[0].message)
+        self.assertEqual(radarr.get_calls, [])  # no id to look up
+        self.assertEqual(radarr.deleted, [])
 
     def test_missing_client_refused(self) -> None:
         # Tracked-by-radarr but no Radarr client wired.
@@ -599,7 +644,7 @@ class ArrRoutingTests(unittest.TestCase):
         self.assertIn("not configured", response.results[0].message)
 
     def test_arr_delete_failure_is_error_and_audited(self) -> None:
-        radarr = _FakeArr({"old.mkv": [55]}, fail_delete=True)
+        radarr = _FakeArr({55: "/data/old.mkv"}, fail_delete=True)
         audit = _FakeAudit()
         service = _service(_report([self._tracked_group("radarr")]), radarr=radarr, audit=audit)
         response = _reclaim(service)
@@ -607,34 +652,48 @@ class ArrRoutingTests(unittest.TestCase):
         self.assertEqual(len(audit.records), 1)
         self.assertEqual(audit.records[0].status, "error")
 
-    def test_arr_index_built_once_for_multiple_targets(self) -> None:
-        # Two tracked copies in one request must share a single index fetch, not
-        # one full-library fan-out per target.
+    def test_stacked_tracked_copy_validates_all_parts_before_delete(self) -> None:
+        # A two-part tracked copy: each part is re-validated by its own by-id GET
+        # before any DELETE, and both are deleted together (removed whole).
         keeper = _keeper()
-        g = _group(
-            [
-                keeper,
-                _copy("/lib/a.mkv", 8, media_id=21, association="tracked", arr_tracked="radarr",
-                      parts=[{"part_id": 2, "file": "/lib/a.mkv", "size": 8}]),
-                _copy("/lib/b.mkv", 8, media_id=22, association="tracked", arr_tracked="radarr",
-                      parts=[{"part_id": 3, "file": "/lib/b.mkv", "size": 8}]),
+        stacked = _copy(
+            "/lib/cd1.mkv", 5, media_id=21, association="tracked", arr_tracked="radarr",
+            parts=[
+                {"part_id": 2, "file": "/lib/cd1.mkv", "size": 5, "arr_file_id": 1},
+                {"part_id": 3, "file": "/lib/cd2.mkv", "size": 3, "arr_file_id": 2},
             ],
-            keeper=keeper,
         )
-        radarr = _FakeArr({"a.mkv": [1], "b.mkv": [2]})
-        service = _service(_report([g]), radarr=radarr)
-        response = service.reclaim(
-            [ReclaimTarget("900", 2), ReclaimTarget("900", 3)], token="tok", report_generated_at=GEN
-        )
-        self.assertEqual([r.status for r in response.results], ["deleted", "deleted"])
+        radarr = _FakeArr({1: "/data/cd1.mkv", 2: "/data/cd2.mkv"})
+        service = _service(_report([_group([keeper, stacked], keeper=keeper)]), radarr=radarr)
+        response = _reclaim(service)
+        self.assertEqual(response.results[0].status, "deleted")
+        self.assertEqual(response.results[0].reclaimed_bytes, 8)
+        self.assertEqual(sorted(radarr.get_calls), [1, 2])  # one GET per part
         self.assertEqual(sorted(radarr.deleted), [1, 2])
-        self.assertEqual(radarr.index_calls, 1)  # one fetch, not one per target
 
-    def test_arr_index_fetch_failure_refused(self) -> None:
-        radarr = _FakeArr({"old.mkv": [55]}, fail_index=True)
+    def test_stacked_one_bad_part_refuses_whole_copy_before_delete(self) -> None:
+        # If any part fails re-validation (here part 2's id is gone), the whole
+        # stacked copy is refused and NOTHING is deleted.
+        keeper = _keeper()
+        stacked = _copy(
+            "/lib/cd1.mkv", 5, media_id=21, association="tracked", arr_tracked="radarr",
+            parts=[
+                {"part_id": 2, "file": "/lib/cd1.mkv", "size": 5, "arr_file_id": 1},
+                {"part_id": 3, "file": "/lib/cd2.mkv", "size": 3, "arr_file_id": 2},
+            ],
+        )
+        radarr = _FakeArr({1: "/data/cd1.mkv"})  # id 2 missing -> 404
+        service = _service(_report([_group([keeper, stacked], keeper=keeper)]), radarr=radarr)
+        response = _reclaim(service)
+        self.assertEqual(response.results[0].status, "refused")
+        self.assertEqual(radarr.deleted, [])  # no part deleted
+
+    def test_arr_get_failure_non_404_refused(self) -> None:
+        radarr = _FakeArr({55: "/data/old.mkv"}, fail_get=True)
         service = _service(_report([self._tracked_group("radarr")]), radarr=radarr)
         response = _reclaim(service)
         self.assertEqual(response.results[0].status, "refused")
+        self.assertIn("re-validate", response.results[0].message)
         self.assertEqual(radarr.deleted, [])
 
     def test_non_numeric_token_is_refused_not_crash(self) -> None:

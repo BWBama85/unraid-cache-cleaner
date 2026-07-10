@@ -120,7 +120,14 @@ class MediaCopy:
     deleting it triggers a re-download), ``"untracked"`` (safe to delete), or
     ``"unknown"`` (could not be confirmed — never treat as safe). ``arr_tracked``
     names the tracking service (``"radarr"`` / ``"sonarr"``) when tracked, else
-    ``None``. Both stay at their defaults on a Plex-only run.
+    ``None``. All stay at their defaults on a Plex-only run.
+
+    ``arr_file_id`` is the ``*arr`` ``movieFile``/``episodeFile`` id backing *this
+    physical file*, captured during annotation so the web action layer can delete a
+    tracked copy by id — an ``O(1)``, drift-safe reclaim — instead of resolving the
+    id live by basename at delete time (#61). It is per-*part* (never propagated
+    across a stack, since each part is a distinct ``*arr`` file), and stays ``None``
+    when the copy is not tracked or the id could not be pinned unambiguously.
     """
 
     part_id: int
@@ -133,6 +140,7 @@ class MediaCopy:
     media_id: int = 0
     association: str = "unknown"
     arr_tracked: str | None = None
+    arr_file_id: int | None = None
 
 
 @dataclass(frozen=True)

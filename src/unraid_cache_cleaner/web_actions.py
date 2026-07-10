@@ -32,8 +32,11 @@ Fail-closed on every axis:
   ``tracked`` copy is a Radarr/Sonarr ``DELETE`` (so it does not re-download).
 * **Re-validated immediately before the delete (TOCTOU)** — a filesystem target is
   re-``lstat``'d for a matching size and a regular (non-symlink) file under the
-  media root; a tracked target's ``*arr`` file id is resolved live and refused if
-  it is missing or ambiguous.
+  media root; a tracked target's ``*arr`` file id (serialized into the report by the
+  arr layer, #61) is re-validated by a single by-id GET and refused on a 404 or a
+  current basename that no longer matches the report's (``*arr``-side drift) — no
+  full-library fan-out, so a tracked reclaim costs at most one GET + one DELETE per
+  part.
 * **Stacked-safe** — a logical copy's parts are *all* prevalidated before *any* is
   deleted, so a multi-part copy is removed whole or refused whole.
 """
@@ -144,6 +147,12 @@ class _Part:
     part_id: int
     plex_path: Path
     size: int
+    #: The ``*arr`` ``movieFile``/``episodeFile`` id backing this file, serialized
+    #: into the report by the arr layer (#61) so a tracked reclaim deletes by id —
+    #: re-validated with a single by-id GET immediately before the DELETE. ``None``
+    #: on a non-tracked part, or a report predating the field (which refuses the
+    #: tracked reclaim until regenerated, rather than resolving the id live).
+    arr_file_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -264,6 +273,7 @@ def _copy_parts(copy: dict) -> Tuple[_Part, ...]:
                 part_id=_as_int(raw.get("part_id")),
                 plex_path=Path(str(file_value)) if file_value else Path(""),
                 size=_as_int(raw.get("size")),
+                arr_file_id=_as_opt_int(raw.get("arr_file_id")),
             )
         )
     return tuple(parts)
@@ -301,6 +311,22 @@ def _as_int(value: object) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
+
+
+def _as_opt_int(value: object) -> Optional[int]:
+    """Parse a serialized ``*arr`` file id to a *positive* ``int``, or ``None``.
+
+    Distinct from :func:`_as_int` (which returns ``0`` for the ``part_id``/``size``
+    sentinels): a missing, ``null``, malformed, or non-positive ``arr_file_id`` must
+    read as "no id" so the reclaim path refuses/falls through rather than deleting
+    ``*arr`` file ``0``.
+    """
+
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 class ReclaimService:
@@ -378,17 +404,13 @@ class ReclaimService:
             results: List[ReclaimResult] = []
             seen: Set[Tuple[str, int]] = set()
             seen_copies: Set[int] = set()
-            # One *arr file index per backend per request (built lazily), so a
-            # multi-target reclaim resolves every selected basename against a single
-            # fetch instead of one full-library fan-out per part per target.
-            arr_index_cache: Dict[str, Dict[str, List[int]]] = {}
             for target in targets:
                 key = (target.rating_key, target.part_id)
                 if key in seen:  # a duplicate target is a no-op, not a double delete
                     continue
                 seen.add(key)
                 try:
-                    result = self._reclaim_one(target, index, seen_copies, arr_index_cache)
+                    result = self._reclaim_one(target, index, seen_copies)
                 except Exception:  # noqa: BLE001 — one bad target must not crash the request
                     LOGGER.warning("reclaim of %s failed unexpectedly", key, exc_info=True)
                     result = self._refused(target, "", "internal error while processing this target")
@@ -405,7 +427,6 @@ class ReclaimService:
         target: ReclaimTarget,
         index: _ActionIndex,
         seen_copies: Set[int],
-        arr_index_cache: Dict[str, Dict[str, List[int]]],
     ) -> Optional[ReclaimResult]:
         if not target.rating_key or target.part_id == 0:
             return self._refused(target, "", "invalid target id (empty rating_key or zero part_id)")
@@ -449,7 +470,7 @@ class ReclaimService:
         if entry.association == arr.UNTRACKED:
             return self._reclaim_filesystem(target, entry)
         if entry.association == arr.TRACKED:
-            return self._reclaim_arr(target, entry, arr_index_cache)
+            return self._reclaim_arr(target, entry)
         return self._refused(target, "", f"unsupported association {entry.association!r}")
 
     # -- filesystem backend -------------------------------------------------- #
@@ -570,12 +591,7 @@ class ReclaimService:
 
     # -- *arr backend -------------------------------------------------------- #
 
-    def _reclaim_arr(
-        self,
-        target: ReclaimTarget,
-        entry: _CopyEntry,
-        arr_index_cache: Dict[str, Dict[str, List[int]]],
-    ) -> ReclaimResult:
+    def _reclaim_arr(self, target: ReclaimTarget, entry: _CopyEntry) -> ReclaimResult:
         backend = entry.arr_tracked or ""
         client = self._arr_client(backend)
         if client is None:
@@ -583,27 +599,15 @@ class ReclaimService:
                 target, backend, f"{backend or 'arr'} client is not configured for actions"
             )
 
-        # Build the *arr's basename -> file-id index once per request (cached per
-        # backend), then resolve every part against it — a stale/ambiguous id is
-        # refused before any DELETE (TOCTOU: the index is live *arr state).
-        try:
-            file_index = self._arr_file_index(backend, client, arr_index_cache)
-        except ArrClientError as exc:
-            return self._refused(target, backend, f"could not query {backend}: {exc}")
-
-        resolved: List[Tuple[int, Path, int]] = []
-        for part in entry.parts:
-            basename = part.plex_path.name
-            ids = file_index.get(basename, [])
-            if not ids:
-                return self._refused(
-                    target, backend, f"no {backend} file matches {basename} (already removed?)"
-                )
-            if len(ids) > 1:
-                return self._refused(
-                    target, backend, f"ambiguous: {len(ids)} {backend} files match {basename}"
-                )
-            resolved.append((ids[0], part.plex_path, part.size))
+        # Resolve every part to a live, re-validated *arr file id BEFORE any
+        # DELETE, so a stacked copy is removed whole or refused whole. The id is
+        # read from the report (serialized at report time, #61); a single by-id GET
+        # re-validates it — a 404 (already removed) or a current-path basename that
+        # differs from the report's (the id was reused for another file) refuses the
+        # whole copy. No full-library fan-out: at most one GET + one DELETE per part.
+        resolved, error = self._resolve_arr_targets(backend, client, entry)
+        if error is not None or resolved is None:
+            return self._refused(target, backend, error or "arr resolution failed")
 
         total = sum(size for _, _, size in resolved)
         if self.dry_run:
@@ -644,6 +648,49 @@ class ReclaimService:
         self._flush_audit(records)
         return self._deleted(target, backend, deleted_bytes, f"{len(resolved)} file(s) via {backend}")
 
+    def _resolve_arr_targets(
+        self, backend: str, client: object, entry: _CopyEntry
+    ) -> Tuple[Optional[List[Tuple[int, Path, int]]], Optional[str]]:
+        """Re-validate every part's report-serialized ``*arr`` file id by a single
+        by-id GET, returning ``([(file_id, plex_path, size)], None)`` or
+        ``(None, reason)``.
+
+        Fail-closed on every axis: a part with no serialized id (a report predating
+        #61, or an id that could not be pinned) is refused with a regenerate hint; a
+        404 means the id is gone; a current path whose basename differs from the
+        report's is ``*arr``-side drift (the id was reused). Any single failure
+        refuses the whole (possibly stacked) copy, so a multi-part copy is deleted
+        whole or refused whole — never after one DELETE has already committed.
+        """
+
+        resolved: List[Tuple[int, Path, int]] = []
+        for part in entry.parts:
+            file_id = part.arr_file_id
+            if file_id is None:
+                return None, (
+                    f"no {backend} file id recorded for {part.plex_path.name}; "
+                    "regenerate the duplicate report so it can be reclaimed by id"
+                )
+            try:
+                current = self._get_arr_file(client, backend, file_id)
+            except ArrClientError as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    return None, (
+                        f"{backend} file id {file_id} no longer exists "
+                        f"({part.plex_path.name} already removed?)"
+                    )
+                return None, f"could not re-validate {backend} file id {file_id}: {exc}"
+            current_path = current.get("path") or current.get("relativePath") or ""
+            current_name = Path(str(current_path)).name
+            if current_name != part.plex_path.name:
+                return None, (
+                    f"{backend} file id {file_id} now points at "
+                    f"{current_name or 'an unnamed file'}, not {part.plex_path.name} "
+                    "(library drift); refusing"
+                )
+            resolved.append((file_id, part.plex_path, part.size))
+        return resolved, None
+
     def _arr_client(self, backend: str) -> Optional[object]:
         if backend == arr.RADARR:
             return self._radarr
@@ -652,17 +699,13 @@ class ReclaimService:
         return None
 
     @staticmethod
-    def _arr_file_index(
-        backend: str, client: object, cache: Dict[str, Dict[str, List[int]]]
-    ) -> Dict[str, List[int]]:
-        """The backend's basename -> [file id] index, fetched at most once per
-        request. May raise ``ArrClientError`` (fail-closed) on an *arr outage."""
+    def _get_arr_file(client: object, backend: str, file_id: int) -> dict:
+        """One by-id GET of the current ``*arr`` file record (fail-closed: may raise
+        ``ArrClientError``, carrying ``status_code=404`` when the id is gone)."""
 
-        index = cache.get(backend)
-        if index is None:
-            index = client.fetch_file_index()  # type: ignore[attr-defined]
-            cache[backend] = index
-        return index
+        if backend == arr.RADARR:
+            return client.get_movie_file(file_id)  # type: ignore[attr-defined]
+        return client.get_episode_file(file_id)  # type: ignore[attr-defined]
 
     @staticmethod
     def _delete_arr(client: object, backend: str, file_id: int) -> None:
