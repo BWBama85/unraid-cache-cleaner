@@ -159,6 +159,12 @@ class _CopyEntry:
     association: str
     arr_tracked: Optional[str]
     parts: Tuple[_Part, ...]
+    #: The physical file paths the group's keeper occupies. A non-keeper copy whose
+    #: parts overlap this set points at a file the keeper also uses (Plex can report
+    #: one physical file under two Media/Part ids), so deleting it would destroy the
+    #: keeper's file — such a target is refused even though it is not the keeper by
+    #: identity.
+    keeper_paths: frozenset = frozenset()
 
 
 class _ActionIndex:
@@ -202,6 +208,7 @@ def build_action_index(payload: dict) -> _ActionIndex:
         if not isinstance(rating_key, str) or rating_key == "":
             continue
         keeper = group.get("keeper") if isinstance(group.get("keeper"), dict) else None
+        keeper_paths = _keeper_part_paths(keeper)
         classification = str(group.get("classification") or "")
         kind = str(group.get("kind") or "")
         copies = group.get("copies") or []
@@ -219,6 +226,7 @@ def build_action_index(payload: dict) -> _ActionIndex:
                 association=str(copy.get("association") or arr.UNKNOWN),
                 arr_tracked=copy.get("arr_tracked"),
                 parts=_copy_parts(copy),
+                keeper_paths=keeper_paths,
             )
             for part in entry.parts:
                 # A part_id of 0 (Plex omitted the Part id) is unaddressable — it
@@ -259,6 +267,21 @@ def _copy_parts(copy: dict) -> Tuple[_Part, ...]:
             )
         )
     return tuple(parts)
+
+
+def _keeper_part_paths(keeper: Optional[dict]) -> frozenset:
+    """The set of physical file paths the keeper occupies (all of its parts).
+
+    Used to refuse a non-keeper copy that shares any of these paths — the same
+    physical file reported under a different ``media_id``/``part_id`` — so a reclaim
+    can never delete the keeper's file by targeting a path-aliased sibling.
+    """
+
+    if keeper is None:
+        return frozenset()
+    return frozenset(
+        part.plex_path for part in _copy_parts(keeper) if str(part.plex_path) not in ("", ".")
+    )
 
 
 def _is_keeper(copy: dict, keeper: Optional[dict]) -> bool:
@@ -406,6 +429,14 @@ class ReclaimService:
             )
         if entry.is_keeper:
             return self._refused(target, "", "target is the group keeper; never deleted")
+        if any(part.plex_path in entry.keeper_paths for part in entry.parts):
+            # A non-keeper copy that reuses one of the keeper's physical files (Plex
+            # can report one file under two Media/Part ids): deleting it would
+            # destroy the keeper's file, so refuse it even though it is not the
+            # keeper by identity.
+            return self._refused(
+                target, "", "target shares a file with the keeper; never deleted"
+            )
         if entry.association == arr.UNKNOWN:
             return self._refused(
                 target, "", "association is unknown; never auto-deleted (verify by hand)"

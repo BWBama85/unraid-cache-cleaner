@@ -261,6 +261,21 @@ class SafetyRefusalTests(unittest.TestCase):
         self.assertIn("unknown", response.results[0].message)
         self.assertEqual(deleter.calls, [])
 
+    def test_refuses_target_sharing_keeper_file_path(self) -> None:
+        # Plex reports one physical file under two Media/Part ids: a non-keeper
+        # sibling shares the keeper's path. It is not the keeper by identity, but
+        # deleting it would destroy the keeper's file, so it must be refused.
+        keeper = _keeper(file="/lib/same.mkv", size=20 * GiB, media_id=20, part_id=1)
+        sibling = _copy(
+            "/lib/same.mkv", 20 * GiB, media_id=99, association="untracked",
+            parts=[{"part_id": 2, "file": "/lib/same.mkv", "size": 20 * GiB}],
+        )
+        group = _group([keeper, sibling], keeper=keeper)
+        response, deleter = self._run(group, part_id=2)
+        self.assertEqual(response.results[0].status, "refused")
+        self.assertIn("shares a file with the keeper", response.results[0].message)
+        self.assertEqual(deleter.calls, [])
+
     def test_refuses_group_without_keeper(self) -> None:
         group = _group([_copy("/lib/old.mkv", 8, media_id=21, association="untracked")], keeper=None)
         response, deleter = self._run(group)
