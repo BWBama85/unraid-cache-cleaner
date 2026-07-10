@@ -17,6 +17,7 @@ from .plex_report import PlexDuplicateReporter
 from .qbittorrent import QbittorrentClient, QbittorrentClientError
 from .service import CleanerService
 from .state import StateExtractionLedger, StateStore
+from . import web
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         "extract",
         help="Extract RAR archives in the download path so *arr can import them "
         "(opt-in via EXTRACT_ENABLED; honors DRY_RUN).",
+    )
+    subparsers.add_parser(
+        "web",
+        help="Serve the read-only Plex duplicate report as a web page + JSON API "
+        "(reads the existing report; never scans or deletes).",
     )
 
     plex = subparsers.add_parser(
@@ -92,6 +98,7 @@ def configure_logging(level: str) -> None:
 def run_cleaner(config: Config, command: str) -> int:
     """Run the qBittorrent cleanup ``scan`` / ``service`` commands."""
 
+    logger = logging.getLogger(__name__)
     client = QbittorrentClient(
         config.qbittorrent_url,
         config.qbittorrent_username,
@@ -107,7 +114,42 @@ def run_cleaner(config: Config, command: str) -> int:
     if command == "scan":
         service.run_once()
         return 0
+
+    # Opt-in: fold the read-only Plex duplicate viewer into the long-running
+    # service so one container both cleans up and serves the report (#34). It runs
+    # on a daemon thread that reads a file only — no shared qBittorrent client or
+    # SQLite connection — so it needs no coordination with the poll loop and dies
+    # with the process. Off by default, so `service` gains no listener unless asked.
+    if config.web_enabled:
+        server = web.build_server(config)
+        server.start_background()
+        logger.info(
+            "Plex duplicate report viewer listening on http://%s:%s (read-only)",
+            config.web_bind_address,
+            server.port,
+        )
+
     service.serve_forever()
+    return 0
+
+
+def run_web(config: Config) -> int:
+    """Serve the read-only Plex duplicate report web viewer (#34)."""
+
+    logger = logging.getLogger(__name__)
+    server = web.build_server(config)
+    logger.info(
+        "Plex duplicate report viewer listening on http://%s:%s (read-only; serves %s)",
+        config.web_bind_address,
+        server.port,
+        config.plex_duplicate_report_path,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down web viewer")
+    finally:
+        server.shutdown()
     return 0
 
 
@@ -237,6 +279,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return run_plex_duplicates(config, args)
         if command == "extract":
             return run_extract(config)
+        if command == "web":
+            return run_web(config)
         return run_cleaner(config, command)
     except (QbittorrentClientError, PlexClientError, ArrClientError) as exc:
         logger.error(str(exc))

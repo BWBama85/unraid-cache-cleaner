@@ -27,5 +27,10 @@ RUN pip install --no-cache-dir .
 
 VOLUME ["/config", "/data"]
 
+# Read-only Plex duplicate report web viewer (#34). Served by the `web`
+# subcommand, or by `service` when WEB_ENABLED=true. Matches the WEB_PORT default;
+# the port is only bound when the viewer is actually run.
+EXPOSE 8080
+
 ENTRYPOINT ["unraid-cache-cleaner"]
 CMD ["service"]

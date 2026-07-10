@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -54,13 +55,23 @@ def _copy_json(
         "size": copy.size,
         "resolution": copy.resolution,
         "bitrate": copy.bitrate,
+        # The Plex ``Media`` id this copy's parts share (0 = ungrouped). Surfaced
+        # so a consumer can address one logical copy — and, with the per-part
+        # ``part_id`` below, one physical file — as a stable delete target: the
+        # web action layer (#34 Phase 2) routes a reclaim by ``{rating_key,
+        # part_id}`` and must remove *all* parts of a stacked copy together.
+        "media_id": copy.media_id,
         # Each physical file backing this copy with its own true size, so a
         # stacked multi-part copy (cd1/cd2 under one Plex media_id) exposes both
         # paths and their individual sizes instead of hiding the siblings behind
         # the first part's path and the summed size (#17). Always present and a
         # single element for an unstacked copy, so a consumer can read
-        # ``copy["parts"]`` unconditionally.
-        "parts": [{"file": str(part.file), "size": part.size} for part in parts],
+        # ``copy["parts"]`` unconditionally. ``part_id`` is the Plex ``Part`` id —
+        # the precise per-file delete target for #34 Phase 2.
+        "parts": [
+            {"part_id": part.part_id, "file": str(part.file), "size": part.size}
+            for part in parts
+        ],
     }
     # Only serialized when the arr layer ran, so a Plex-only report stays
     # byte-identical to the pre-#8 shape.
@@ -353,12 +364,29 @@ class PlexDuplicateReporter:
         return count
 
     def write_report(self, report: DuplicateReport) -> None:
-        """Write the duplicate report as stable, ``sort_keys`` JSON."""
+        """Write the duplicate report as stable, ``sort_keys`` JSON.
+
+        Written atomically (temp file in the same directory + ``os.replace``) so a
+        concurrent reader — notably the read-only web viewer (#34) polling this
+        file while a scan rewrites it — never observes a truncated or half-written
+        report. ``os.replace`` is atomic within a filesystem, and the temp file is
+        colocated with the target to stay on it.
+        """
 
         payload = self.build_payload(report)
-        self.config.plex_duplicate_report_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True)
-        )
+        target = self.config.plex_duplicate_report_path
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            os.replace(tmp, target)
+        finally:
+            # A crash between write and replace must not leave the scratch file
+            # behind; the successful replace already consumed it, so this is a
+            # best-effort cleanup of the failure path only.
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     def log_report(self, report: DuplicateReport) -> None:
         """Emit one compact summary line mirroring ``service.log_report``.

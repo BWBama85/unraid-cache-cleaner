@@ -212,6 +212,39 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.extract_min_age_seconds, 60)
                 self.assertEqual(config.extract_protect_seconds, 3600)
 
+    def test_web_defaults_are_fail_closed(self) -> None:
+        # #34: the web viewer is opt-in for `service` (web_enabled=False) and
+        # binds to the container's mapped port with a stdlib-friendly default.
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                self.assertFalse(config.web_enabled)
+                self.assertEqual(config.web_bind_address, "0.0.0.0")
+                self.assertEqual(config.web_port, 8080)
+
+    def test_web_env_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+                "WEB_ENABLED": "true",
+                "WEB_BIND_ADDRESS": "127.0.0.1",
+                "WEB_PORT": "9191",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                self.assertTrue(config.web_enabled)
+                self.assertEqual(config.web_bind_address, "127.0.0.1")
+                self.assertEqual(config.web_port, 9191)
+
 
 if __name__ == "__main__":
     unittest.main()

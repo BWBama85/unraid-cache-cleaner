@@ -10,7 +10,7 @@
   <Project>https://github.com/BWBama85/unraid-cache-cleaner</Project>
   <Overview>Polls qBittorrent and safely deletes untracked leftovers from a mounted Unraid cache/download path after a grace period.</Overview>
   <Category>Downloaders:</Category>
-  <WebUI />
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/BWBama85/unraid-cache-cleaner/main/contrib/unraid-cache-cleaner.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/BWBama85/unraid-cache-cleaner/main/docs/icon.svg</Icon>
   <ExtraParams />
@@ -18,6 +18,7 @@
   <CPUset />
   <Config Name="Config" Target="/config" Default="/mnt/user/appdata/unraid-cache-cleaner" Mode="rw" Description="Persistent state and reports" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/unraid-cache-cleaner</Config>
   <Config Name="Downloads" Target="/data" Default="/mnt/cache/downloads" Mode="rw" Description="Mount the same path qBittorrent uses internally" Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/downloads</Config>
+  <Config Name="WebUI Port" Target="8080" Default="8080" Mode="tcp" Description="Host port mapped to the read-only Plex duplicate report web viewer (container port 8080, WEB_PORT). The viewer only listens if you set WEB_ENABLED=true or run the container with the web command; otherwise this mapping is inert." Type="Port" Display="always" Required="false" Mask="false">8080</Config>
   <Config Name="QBITTORRENT_URL" Target="QBITTORRENT_URL" Default="http://qbittorrent:8080" Mode="" Description="qBittorrent WebUI URL. Use the container name on a shared Docker network or your Unraid IP and exposed port." Type="Variable" Display="always" Required="true" Mask="false">http://qbittorrent:8080</Config>
   <Config Name="QBITTORRENT_USERNAME" Target="QBITTORRENT_USERNAME" Default="" Mode="" Description="qBittorrent WebUI username" Type="Variable" Display="always" Required="true" Mask="false" />
   <Config Name="QBITTORRENT_PASSWORD" Target="QBITTORRENT_PASSWORD" Default="" Mode="" Description="qBittorrent WebUI password" Type="Variable" Display="always" Required="true" Mask="true" />
@@ -54,4 +55,7 @@
   <Config Name="SONARR_API_KEY" Target="SONARR_API_KEY" Default="" Mode="" Description="Sonarr API key, sent as X-Api-Key (never in the URL). Required to enable Sonarr tracking." Type="Variable" Display="advanced" Required="false" Mask="true" />
   <Config Name="SONARR_TIMEOUT_SECONDS" Target="SONARR_TIMEOUT_SECONDS" Default="30" Mode="" Description="HTTP timeout when querying Sonarr" Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
   <Config Name="SONARR_VERIFY_TLS" Target="SONARR_VERIFY_TLS" Default="true" Mode="" Description="Disable only if your Sonarr uses a self-signed certificate" Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="WEB_ENABLED" Target="WEB_ENABLED" Default="false" Mode="" Description="Also serve the read-only Plex duplicate report web viewer from the long-running service (opt-in). Set true to light up the WebUI link on this container; leave false if you run a separate container with the web command. Off by default. Read-only: the viewer never scans or deletes." Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+  <Config Name="WEB_BIND_ADDRESS" Target="WEB_BIND_ADDRESS" Default="0.0.0.0" Mode="" Description="Address the web viewer binds inside the container. Keep 0.0.0.0 so the mapped host port is reachable; use 127.0.0.1 only to restrict to loopback." Type="Variable" Display="advanced" Required="false" Mask="false">0.0.0.0</Config>
+  <Config Name="WEB_PORT" Target="WEB_PORT" Default="8080" Mode="" Description="Container port the web viewer listens on. Must match the WebUI Port mapping's container target." Type="Variable" Display="advanced" Required="false" Mask="false">8080</Config>
 </Container>
