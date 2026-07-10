@@ -108,9 +108,10 @@ action-history view (`/actions` + `/api/actions`). The GET path is rigorously
 read-only: it constructs **no** Plex/`*arr`/qBittorrent client and never
 regenerates the report — a page load only reads a file the `plex-duplicates`
 subcommand (or a cron) already wrote, so it can never fan out to Plex. The one GET
-that touches SQLite is the history view, a bounded newest-first SELECT of the
-`web-reclaim:*` audit rows over a short-lived read-only connection that never
-creates or migrates the DB (`state.read_recent_actions`). The
+that touches SQLite is the history view, a bounded, indexed, newest-first SELECT of
+the `web-reclaim:*` audit rows over a long-lived, query-only connection (opened once,
+reused, never creating or migrating the DB) so a page load is a pure SELECT that never
+checkpoints (`state.WebActionHistoryReader`). The
 rendering functions are pure over the report dict, and the report is supplied by
 an injectable provider (the default reads the file; tests inject a fake), so the
 server is unit-tested end-to-end on an ephemeral port without any network

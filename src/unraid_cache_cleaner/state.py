@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import secrets
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -59,56 +60,75 @@ _WEB_RECLAIM_LIKE = "web-reclaim:%"
 _ACTION_HISTORY_MAX = 1000
 
 
-def read_recent_actions(
-    db_path: Path, *, limit: int = 200
-) -> Optional[list[dict]]:
-    """Return the most recent web-reclaim audit rows (newest first), or ``None``.
+class WebActionHistoryReader:
+    """A long-lived, read-only reader for the web-reclaim audit rows (#62).
 
-    This backs the read-only ``/api/actions`` history endpoint (#62). It is a
-    module function — **not** a :class:`StateStore` method — on purpose:
+    Backs the ``/actions`` + ``/api/actions`` history endpoints. Design points, each
+    answering a way the naive per-request read went wrong:
 
-    * It opens its **own** short-lived connection per call, so concurrent HTTP
-      readers never share one ``sqlite3`` connection (SQLite forbids concurrent use
-      of a single connection; the action layer's audit connection is only safe
-      because the reclaim lock serializes it — this read path has no such lock).
-    * It **never creates or migrates** the database: a missing file or a legacy
-      store with no ``actions`` table returns ``None`` (an "unavailable" signal),
-      so a GET can never write to or upgrade the DB.
+    * **One long-lived connection, reused** (opened lazily on first use, guarded by a
+      lock). A *per-request* connection on a WAL DB is a write on GET — opening it
+      creates the ``-wal``/``-shm`` sidecars and closing the last one checkpoints the
+      WAL back into the main file. A single reused connection makes a page load a pure
+      ``SELECT``: it never opens/closes per request, so it never checkpoints. The lock
+      serializes concurrent request threads (SQLite forbids concurrent use of one
+      connection).
+    * **``PRAGMA query_only``** hard-refuses any write on the connection, so the reader
+      can never mutate the audit table even by mistake.
+    * **Never creates the DB**: the connection is opened only once the file exists, so
+      a page load on a fresh install returns ``None`` (unavailable) rather than
+      creating ``state.sqlite3``.
+    * A legacy store with no ``actions`` table, or a corrupt/non-SQLite file, returns
+      ``None`` (unavailable) — never a propagated exception or a page 500.
 
     Only ``web-reclaim:*`` rows are returned (not the cleaner's/extractor's own
-    ``actions`` rows), ordered ``occurred_at DESC, id DESC`` and capped.
+    ``actions`` rows), ordered ``occurred_at DESC, id DESC`` and capped. The
+    ``ix_actions_occurred_at`` index (created by :meth:`StateStore._initialize`) lets
+    that query walk newest-first and stop at the ``LIMIT`` instead of scanning and
+    sorting the whole shared table.
     """
 
-    capped = max(0, min(int(limit), _ACTION_HISTORY_MAX))
-    if capped == 0 or not db_path.exists():
-        return None
-    # Open **read-only** (``mode=ro`` URI): the store runs in WAL, so a read/write
-    # connection would create the ``-wal``/``-shm`` sidecars and checkpoint on close —
-    # a write triggered by a GET. ``mode=ro`` never writes; it can still read a WAL DB
-    # while a writer (the cleaner/audit connection) is live. A path that can't form a
-    # URI, or a DB that needs recovery with no writer present, degrades to unavailable.
-    try:
-        conn = sqlite3.connect(
-            f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_SECONDS
-        )
-    except (sqlite3.OperationalError, ValueError):
-        return None
-    try:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT path, action, status, size, message, occurred_at "
-            "FROM actions WHERE action LIKE ? "
-            "ORDER BY occurred_at DESC, id DESC LIMIT ?",
-            (_WEB_RECLAIM_LIKE, capped),
-        ).fetchall()
-    except sqlite3.DatabaseError:
-        # A legacy store with no ``actions`` table (OperationalError) or a
-        # corrupt/non-SQLite file (DatabaseError, the parent class): unavailable,
-        # not empty — never a propagated exception or a page 500.
-        return None
-    finally:
-        conn.close()
-    return [dict(row) for row in rows]
+    def __init__(self, db_path: Path, *, limit: int = 200) -> None:
+        self._db_path = db_path
+        self._limit = max(0, min(int(limit), _ACTION_HISTORY_MAX))
+        self._lock = threading.Lock()
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def __call__(self) -> Optional[list[dict]]:
+        if self._limit == 0:
+            return None
+        with self._lock:
+            conn = self._ensure_conn()
+            if conn is None:
+                return None
+            try:
+                rows = conn.execute(
+                    "SELECT path, action, status, size, message, occurred_at "
+                    "FROM actions WHERE action LIKE ? "
+                    "ORDER BY occurred_at DESC, id DESC LIMIT ?",
+                    (_WEB_RECLAIM_LIKE, self._limit),
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                # Legacy store (no ``actions`` table → OperationalError) or a corrupt
+                # file (DatabaseError, the parent class): unavailable, not empty.
+                return None
+            return [dict(row) for row in rows]
+
+    def _ensure_conn(self) -> Optional[sqlite3.Connection]:
+        if self._conn is not None:
+            return self._conn
+        if not self._db_path.exists():
+            return None  # never create the DB from a page load
+        try:
+            conn = sqlite3.connect(
+                self._db_path, check_same_thread=False, timeout=_BUSY_TIMEOUT_SECONDS
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+        except sqlite3.DatabaseError:
+            return None
+        self._conn = conn
+        return conn
 
 
 class StateStore:
@@ -190,6 +210,16 @@ class StateStore:
                     occurred_at REAL NOT NULL
                 )
                 """
+            )
+            # Index for the read-only web history query (#62): a plain index on
+            # ``occurred_at`` implicitly carries the rowid (= ``id``), so traversing it
+            # in reverse yields ``occurred_at DESC, id DESC`` directly — the planner
+            # walks newest-first, applies the ``action LIKE 'web-reclaim:%'`` filter,
+            # and stops at the ``LIMIT`` instead of scanning and sorting the whole
+            # (potentially large) shared actions table on every page load. Created
+            # here so an existing store gains it on the next open (additive migration).
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_actions_occurred_at ON actions(occurred_at)"
             )
             # One row per archive that has been claimed/extracted. Replaces the
             # bash tool's flat processed_files.log: `status='claimed'` is an

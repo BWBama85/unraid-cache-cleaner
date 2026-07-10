@@ -27,6 +27,7 @@ from unraid_cache_cleaner.config import Config
 from unraid_cache_cleaner.web import (
     DuplicateReportServer,
     DuplicateReportViewer,
+    build_server,
     render_report_html,
 )
 from unraid_cache_cleaner.web_actions import (
@@ -881,6 +882,35 @@ class CsrfHardeningHttpTests(unittest.TestCase):
                 base + "/api/reclaim", body, {"Content-Type": "application/json", "X-Action-Token": "tok"}
             )
         self.assertEqual(status, 200)
+
+    def test_allowlist_on_loopback_bind_still_requires_browser_origin(self) -> None:
+        # A reverse proxy can forward to a LOOPBACK bind, so configuring an allow-list
+        # must flip on the browser-origin requirement there too — otherwise an
+        # origin-less cross-site form POST slips through before the list is consulted.
+        payload = _untracked_payload()
+        config = _config(
+            web_actions_dry_run=True,
+            web_bind_address="127.0.0.1",  # loopback
+            web_allowed_origins=("https://ext.example",),
+        )
+        service = _service(payload, config=config)
+        server = build_server(config, provider=lambda: payload, reclaim_service=service)
+        server.start_background()
+        try:
+            base = f"http://127.0.0.1:{server.port}"
+            form = f"token=tok&report_generated_at={GEN}&target=900:2".encode()
+            no_origin, _ = _post(
+                base + "/actions/reclaim", form, {"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            listed, _ = _post(
+                base + "/actions/reclaim",
+                form,
+                {"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://ext.example"},
+            )
+        finally:
+            server.shutdown()
+        self.assertEqual(no_origin, 403)  # origin-less form POST refused despite loopback
+        self.assertEqual(listed, 200)     # the allow-listed proxy origin is accepted
 
     def test_malformed_origin_is_clean_403_not_dropped_connection(self) -> None:
         # A hostile bad-port Origin must yield a clean 403, never crash the request

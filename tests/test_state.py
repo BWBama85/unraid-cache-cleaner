@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.extractor import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW
 from unraid_cache_cleaner.models import ActionRecord
-from unraid_cache_cleaner.state import StateStore, read_recent_actions
+from unraid_cache_cleaner.state import StateStore, WebActionHistoryReader
 
 
 class ExtractionLedgerTests(unittest.TestCase):
@@ -380,15 +380,24 @@ class ConcurrencyTests(unittest.TestCase):
             blocker.close()
 
 
-class ReadRecentActionsTests(unittest.TestCase):
+class WebActionHistoryReaderTests(unittest.TestCase):
     """The read-only history reader backing ``/api/actions`` (#62)."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.db = Path(self._tmp.name) / "state.sqlite3"
+        self._readers: list[WebActionHistoryReader] = []
 
     def tearDown(self) -> None:
+        for reader in self._readers:
+            if reader._conn is not None:
+                reader._conn.close()
         self._tmp.cleanup()
+
+    def _reader(self, **kw) -> WebActionHistoryReader:
+        reader = WebActionHistoryReader(self.db, **kw)
+        self._readers.append(reader)
+        return reader
 
     def _write(self, rows, now):
         store = StateStore(self.db)
@@ -396,7 +405,7 @@ class ReadRecentActionsTests(unittest.TestCase):
         store._connection.close()
 
     def test_missing_db_is_unavailable_and_creates_nothing(self) -> None:
-        self.assertIsNone(read_recent_actions(self.db))
+        self.assertIsNone(self._reader()())
         # A read of a missing DB must not create the file (read-only viewer).
         self.assertFalse(self.db.exists())
 
@@ -405,28 +414,40 @@ class ReadRecentActionsTests(unittest.TestCase):
         conn.execute("CREATE TABLE unrelated (id INTEGER)")
         conn.commit()
         conn.close()
-        self.assertIsNone(read_recent_actions(self.db))
+        self.assertIsNone(self._reader()())
 
     def test_empty_but_present_table_is_available_and_empty(self) -> None:
         StateStore(self.db)._connection.close()  # creates the actions table, no rows
-        self.assertEqual(read_recent_actions(self.db), [])
+        self.assertEqual(self._reader()(), [])
 
     def test_corrupt_non_sqlite_file_is_unavailable_not_raise(self) -> None:
         # A non-SQLite file at the path raises sqlite3.DatabaseError (parent of
-        # OperationalError) at execute time; the reader degrades to None, not a crash.
+        # OperationalError); the reader degrades to None, not a crash.
         self.db.write_bytes(b"this is not a database")
-        self.assertIsNone(read_recent_actions(self.db))
+        self.assertIsNone(self._reader()())
 
     def test_read_does_not_write_the_main_db(self) -> None:
-        # The read path opens mode=ro, so a GET never writes the database file — no
-        # checkpoint or migration touches it (the documented no-write-on-GET guarantee).
+        # A reused query-only connection means a page load is a pure SELECT — no
+        # checkpoint or migration touches the main DB file (no-write-on-GET).
         self._write(
             [ActionRecord(path=Path("/lib/a.mkv"), action="web-reclaim:filesystem", status="deleted", size=1)],
             now=100.0,
         )
+        reader = self._reader()
         before = self.db.stat().st_mtime_ns
-        self.assertEqual(len(read_recent_actions(self.db)), 1)
+        self.assertEqual(len(reader()), 1)
+        self.assertEqual(len(reader()), 1)  # a second GET reuses the same connection
         self.assertEqual(self.db.stat().st_mtime_ns, before)
+
+    def test_query_only_connection_refuses_writes(self) -> None:
+        self._write(
+            [ActionRecord(path=Path("/lib/a.mkv"), action="web-reclaim:filesystem", status="deleted", size=1)],
+            now=100.0,
+        )
+        reader = self._reader()
+        reader()  # opens the connection
+        with self.assertRaises(sqlite3.OperationalError):
+            reader._conn.execute("DELETE FROM actions")
 
     def test_returns_only_web_reclaim_rows_newest_first(self) -> None:
         self._write(
@@ -442,7 +463,7 @@ class ReadRecentActionsTests(unittest.TestCase):
             ],
             now=200.0,
         )
-        rows = read_recent_actions(self.db)
+        rows = self._reader()()
         self.assertIsNotNone(rows)
         # The cleaner's own "delete" row is filtered out; only web-reclaim survives.
         actions = [r["action"] for r in rows]
@@ -459,28 +480,30 @@ class ReadRecentActionsTests(unittest.TestCase):
             ],
             now=100.0,
         )
-        self.assertEqual(len(read_recent_actions(self.db, limit=2)), 2)
-        self.assertIsNone(read_recent_actions(self.db, limit=0))
+        self.assertEqual(len(self._reader(limit=2)()), 2)
+        self.assertIsNone(self._reader(limit=0)())
 
     def test_read_is_thread_safe_and_sees_a_concurrent_write(self) -> None:
-        # A history read from a worker thread runs concurrently with an audit write
-        # on another connection (WAL) without sharing a connection or raising.
+        # One reader (a single lock-guarded connection) called from a worker thread
+        # runs concurrently with an audit write on another connection (WAL) without
+        # racing the shared connection or raising.
         self._write(
             [ActionRecord(path=Path("/lib/seed.mkv"), action="web-reclaim:filesystem", status="deleted", size=1)],
             now=50.0,
         )
+        reader = self._reader()
         writer = StateStore(self.db, check_same_thread=False)
         results = []
         errors = []
 
-        def reader():
+        def read_loop():
             try:
                 for _ in range(20):
-                    results.append(read_recent_actions(self.db))
+                    results.append(reader())
             except Exception as exc:  # pragma: no cover - failure path
                 errors.append(exc)
 
-        thread = threading.Thread(target=reader)
+        thread = threading.Thread(target=read_loop)
         thread.start()
         for i in range(20):
             writer.record_actions(
@@ -491,6 +514,14 @@ class ReadRecentActionsTests(unittest.TestCase):
         writer._connection.close()
         self.assertEqual(errors, [])
         self.assertTrue(all(r is not None for r in results))
+
+    def test_index_created_for_history_query(self) -> None:
+        StateStore(self.db)._connection.close()
+        conn = sqlite3.connect(self.db)
+        # PRAGMA index_list columns: (seq, name, unique, origin, partial).
+        names = {row[1] for row in conn.execute("PRAGMA index_list('actions')")}
+        conn.close()
+        self.assertIn("ix_actions_occurred_at", names)
 
 
 if __name__ == "__main__":

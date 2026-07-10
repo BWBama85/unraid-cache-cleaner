@@ -13,9 +13,10 @@ Read path (always on):
   already wrote, so a page load can never fan out to Plex or block on a network
   round-trip.
 * the read-only ``/actions`` + ``/api/actions`` history views (#62) are the *one*
-  GET that touches SQLite: a bounded, newest-first SELECT of the ``web-reclaim:*``
-  audit rows over a short-lived, per-request connection that never creates or
-  migrates the DB (see :func:`~unraid_cache_cleaner.state.read_recent_actions`).
+  GET that touches SQLite: a bounded, indexed, newest-first SELECT of the
+  ``web-reclaim:*`` audit rows over a long-lived, query-only connection (opened once,
+  reused, never creating or migrating the DB) so a page load is a pure ``SELECT`` and
+  never checkpoints (see :class:`~unraid_cache_cleaner.state.WebActionHistoryReader`).
 
 Action path (Phase 2, off unless ``WEB_ENABLE_ACTIONS=true``):
 
@@ -55,7 +56,7 @@ from typing import Callable, List, Optional, Sequence
 from urllib.parse import parse_qsl, urlparse
 
 from .config import Config
-from .state import read_recent_actions
+from .state import WebActionHistoryReader
 from .web_actions import ReclaimResponse, ReclaimService, ReclaimTarget
 
 LOGGER = logging.getLogger(__name__)
@@ -72,7 +73,7 @@ ReportProvider = Callable[[], Optional[dict]]
 
 #: A provider returns the recent web-reclaim audit rows (newest first), or ``None``
 #: when no audit store is available (a missing/legacy DB). Backs the read-only
-#: ``/actions`` history viewer (#62); shaped to accept ``state.read_recent_actions``.
+#: ``/actions`` history viewer (#62); shaped to accept ``state.WebActionHistoryReader``.
 ActionHistoryProvider = Callable[[], Optional[List[dict]]]
 
 #: Rows the ``/actions`` history endpoint requests per load (the reader caps this).
@@ -1274,11 +1275,11 @@ def _normalized_allowed_origins(raw: Sequence[str]) -> tuple:
 
 
 def _default_action_history(config: Config) -> ActionHistoryProvider:
-    """A history provider reading the config's state DB read-only (never creating or
-    migrating it), so ``/actions`` works whether or not actions are enabled."""
+    """A history provider reading the config's state DB read-only (a long-lived,
+    query-only connection that never creates or migrates it), so ``/actions`` works
+    whether or not actions are enabled."""
 
-    db_path = config.state_db_path
-    return lambda: read_recent_actions(db_path, limit=_ACTION_HISTORY_LIMIT)
+    return WebActionHistoryReader(config.state_db_path, limit=_ACTION_HISTORY_LIMIT)
 
 
 def build_server(
@@ -1309,11 +1310,18 @@ def build_server(
     viewer = DuplicateReportViewer(
         provider, actions_enabled=actions_enabled, action_history=action_history
     )
+    allowed_origins = _normalized_allowed_origins(config.web_allowed_origins)
+    # Require a browser form to prove its origin on a non-loopback bind OR whenever an
+    # allow-list is configured: configuring ``WEB_ALLOWED_ORIGINS`` is the signal for a
+    # reverse-proxy deployment, which can forward to a *loopback* bind — leaving
+    # ``require_browser_origin`` off there would accept an origin-less cross-site form
+    # POST through the proxy before the allow-list is ever consulted.
+    require_browser_origin = bool(allowed_origins) or not _is_loopback_bind(config.web_bind_address)
     return DuplicateReportServer(
         config.web_bind_address,
         config.web_port,
         viewer,
         reclaim_service=reclaim_service,
-        require_browser_origin=not _is_loopback_bind(config.web_bind_address),
-        allowed_origins=_normalized_allowed_origins(config.web_allowed_origins),
+        require_browser_origin=require_browser_origin,
+        allowed_origins=allowed_origins,
     )

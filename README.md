@@ -330,7 +330,8 @@ delete". Two **read-only** views surface it:
 - **`GET /api/actions`** — `{"available": bool, "actions": [...]}` for scripting.
 
 These read only the `web-reclaim:*` rows (not the cleaner's own deletes), over a
-short-lived read-only connection that never creates or migrates the database — so
+long-lived, query-only connection (opened once and reused, never creating or
+migrating the database) so a page load is a pure indexed `SELECT` that never writes —
 they work even after you turn actions back off, and a missing/legacy store simply
 reports `available: false`. Dry-run previews and refusals aren't deletes, so they
 are not recorded.
