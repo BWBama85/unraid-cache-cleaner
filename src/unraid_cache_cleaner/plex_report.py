@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import arr, dedupe
@@ -73,8 +75,9 @@ def _copy_json(
             for part in parts
         ],
     }
-    # Only serialized when the arr layer ran, so a Plex-only report stays
-    # byte-identical to the pre-#8 shape.
+    # The arr fields are serialized only when the arr layer ran, so a Plex-only
+    # report omits them (the base keys above, including media_id/part_id, are
+    # always present).
     if include_arr:
         payload["association"] = copy.association
         payload["arr_tracked"] = copy.arr_tracked
@@ -329,8 +332,8 @@ class PlexDuplicateReporter:
             "warnings": report.warnings,
             "errors": report.errors,
         }
-        # Added only when the arr layer ran, so a Plex-only report is byte-identical
-        # to the pre-#8 shape.
+        # The arr totals/flag are added only when the arr layer ran, so a Plex-only
+        # report omits them.
         if include_arr:
             payload["arr_enabled"] = True
             payload["totals"]["arr_tracked_reclaimable_count"] = self._arr_reclaimable_tracked_count(
@@ -366,23 +369,30 @@ class PlexDuplicateReporter:
     def write_report(self, report: DuplicateReport) -> None:
         """Write the duplicate report as stable, ``sort_keys`` JSON.
 
-        Written atomically (temp file in the same directory + ``os.replace``) so a
-        concurrent reader — notably the read-only web viewer (#34) polling this
-        file while a scan rewrites it — never observes a truncated or half-written
-        report. ``os.replace`` is atomic within a filesystem, and the temp file is
-        colocated with the target to stay on it.
+        Written atomically (unique temp file in the same directory + ``os.replace``)
+        so a concurrent reader — notably the read-only web viewer (#34) polling
+        this file while a scan rewrites it — never observes a truncated or
+        half-written report. ``mkstemp`` gives each writer a unique scratch name,
+        so two writers over one ``/config`` volume (even separate containers, each
+        PID 1) can never share a temp path or unlink each other's; ``os.replace``
+        is atomic within a filesystem, and the temp stays colocated with the
+        target to remain on it.
         """
 
         payload = self.build_payload(report)
         target = self.config.plex_duplicate_report_path
-        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        data = json.dumps(payload, indent=2, sort_keys=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=f"{target.name}.", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
         try:
-            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(data)
             os.replace(tmp, target)
         finally:
-            # A crash between write and replace must not leave the scratch file
-            # behind; the successful replace already consumed it, so this is a
-            # best-effort cleanup of the failure path only.
+            # After a successful replace the temp is already consumed; this only
+            # cleans up our own unique scratch on the write/replace failure path.
             try:
                 tmp.unlink()
             except FileNotFoundError:

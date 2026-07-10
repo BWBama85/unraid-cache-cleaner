@@ -205,6 +205,5 @@ class DuplicateReport:
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     # True when the Radarr/Sonarr association layer (#8) ran. Gates whether the
-    # per-copy association fields are serialized, so a Plex-only run stays
-    # byte-identical to the pre-#8 report.
+    # per-copy association fields are serialized, so a Plex-only run omits them.
     arr_enabled: bool = False

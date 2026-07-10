@@ -214,7 +214,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_web_defaults_are_fail_closed(self) -> None:
         # #34: the web viewer is opt-in for `service` (web_enabled=False) and
-        # binds to the container's mapped port with a stdlib-friendly default.
+        # binds to loopback by default (fail-closed); exposing it on the LAN is an
+        # explicit opt-in (the Unraid template sets 0.0.0.0).
         with tempfile.TemporaryDirectory() as tempdir:
             env = {
                 "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
@@ -225,7 +226,7 @@ class ConfigTests(unittest.TestCase):
                 config = Config.from_env()
 
                 self.assertFalse(config.web_enabled)
-                self.assertEqual(config.web_bind_address, "0.0.0.0")
+                self.assertEqual(config.web_bind_address, "127.0.0.1")
                 self.assertEqual(config.web_port, 8080)
 
     def test_web_env_parsed(self) -> None:

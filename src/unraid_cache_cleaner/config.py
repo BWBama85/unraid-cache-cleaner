@@ -131,19 +131,15 @@ class Config:
     # positional Config(...) calls and from_env keep working.
     http_max_attempts: int = 1
     # Web GUI for the Plex duplicate report (#34, Phase 1: read-only viewer). The
-    # `web` subcommand serves the on-disk `plex_duplicate_report_path` snapshot as
-    # a browsable page + JSON API — it never regenerates the report and, in this
-    # phase, exposes no delete/action path (that is the fail-closed Phase 2
-    # follow-up). ``web_enabled`` folds that same read-only viewer into the
-    # long-running ``service`` command on a background thread, so one container can
-    # both clean up and serve the report; it defaults False so ``service`` behavior
-    # is unchanged (no new listener) until an operator opts in. Binds to all
-    # interfaces by default because the deploy target is a container reached via a
-    # mapped port; the served content is read-only and LAN-scoped like the rest of
-    # the stack (qBittorrent/Plex/*arr). Appended with defaults so existing
-    # positional Config(...) calls and from_env keep working.
+    # `web` subcommand serves the on-disk report as a page + JSON API; it never
+    # regenerates the report and exposes no delete/action path (Phase 2 follow-up).
+    # ``web_enabled`` folds that viewer into the long-running ``service`` on a
+    # background thread — default False, so ``service`` gains no listener until an
+    # operator opts in. Binds to loopback by default (fail-closed); the Unraid
+    # template sets 0.0.0.0 so a mapped container port is reachable. Appended with
+    # defaults so existing positional Config(...) calls and from_env keep working.
     web_enabled: bool = False
-    web_bind_address: str = "0.0.0.0"
+    web_bind_address: str = "127.0.0.1"
     web_port: int = 8080
 
     @classmethod
@@ -193,7 +189,7 @@ class Config:
             extract_protect_seconds=_parse_int(os.getenv("EXTRACT_PROTECT_SECONDS"), 86400),
             http_max_attempts=_parse_int(os.getenv("HTTP_MAX_ATTEMPTS"), 1),
             web_enabled=_parse_bool(os.getenv("WEB_ENABLED"), False),
-            web_bind_address=os.getenv("WEB_BIND_ADDRESS", "0.0.0.0"),
+            web_bind_address=os.getenv("WEB_BIND_ADDRESS", "127.0.0.1"),
             web_port=_parse_int(os.getenv("WEB_PORT"), 8080),
         )
         config.ensure_directories()

@@ -63,30 +63,51 @@ def file_report_provider(path: Path) -> ReportProvider:
     is missing, unreadable, not valid JSON (e.g. a reader that raced a
     non-atomic writer, though :meth:`PlexDuplicateReporter.write_report` now
     writes atomically), or not a JSON object.
+
+    Parses lazily: the result is memoized against the file's ``(mtime, size)`` so
+    a page refresh or a polling ``/api/report`` client does not re-read and
+    re-parse an unchanged report (which can be large) on every request; the
+    atomic writer bumps ``mtime`` on publish, so a fresh report is picked up on
+    the next request.
     """
+
+    cache: dict = {}  # {"key": (mtime, size), "value": Optional[dict]}
 
     def provide() -> Optional[dict]:
         try:
-            text = path.read_text(encoding="utf-8")
+            stat = path.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
         except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
             return None
-        try:
-            data = json.loads(text)
-        except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
-            LOGGER.warning(
-                "Plex duplicate report at %s is not valid JSON; showing empty state",
-                path,
-            )
-            return None
-        if not isinstance(data, dict):
-            LOGGER.warning(
-                "Plex duplicate report at %s is not a JSON object; showing empty state",
-                path,
-            )
-            return None
-        return data
+        if cache.get("key") == key:
+            return cache.get("value")
+
+        value = _read_report(path)
+        cache["key"] = key
+        cache["value"] = value
+        return value
 
     return provide
+
+
+def _read_report(path: Path) -> Optional[dict]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        LOGGER.warning(
+            "Plex duplicate report at %s is not valid JSON; showing empty state", path
+        )
+        return None
+    if not isinstance(data, dict):
+        LOGGER.warning(
+            "Plex duplicate report at %s is not a JSON object; showing empty state", path
+        )
+        return None
+    return data
 
 
 class DuplicateReportViewer:
@@ -100,7 +121,20 @@ class DuplicateReportViewer:
         self._provider = provider
 
     def render_html(self) -> str:
-        return render_report_html(self._provider())
+        """Render the current report, degrading a corrupt one to the empty state.
+
+        The provider only guarantees the payload is a JSON object; a report whose
+        *nested* shape is wrong (a hand-edited or schema-drifted file where, say,
+        ``groups`` is not a list of dicts) would raise inside the renderer. Catch
+        that here so the documented "malformed report → empty-state page, never a
+        500" guarantee holds for structural corruption, not just a bad top level.
+        """
+
+        try:
+            return render_report_html(self._provider())
+        except Exception:  # noqa: BLE001 — any structural corruption degrades gracefully
+            LOGGER.warning("rendering the duplicate report failed; showing empty state", exc_info=True)
+            return render_report_html(None)
 
     def report_api(self) -> dict:
         """The JSON API contract: a stable wrapper around the report snapshot.
@@ -108,9 +142,14 @@ class DuplicateReportViewer:
         Wrapping (rather than serving the on-disk bytes verbatim) keeps the API
         contract independent of the on-disk file and lets a polling client read a
         steady ``200`` with ``available: false`` before the first report exists.
+        A provider failure degrades to ``available: false`` rather than raising.
         """
 
-        payload = self._provider()
+        try:
+            payload = self._provider()
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("reading the duplicate report failed; reporting unavailable", exc_info=True)
+            payload = None
         return {"available": payload is not None, "report": payload}
 
     @staticmethod
@@ -217,7 +256,7 @@ def render_report_html(payload: Optional[dict]) -> str:
     reclaimable = [g for g in groups if g.get("classification") != "mismatch"]
     mismatches = [g for g in groups if g.get("classification") == "mismatch"]
 
-    parts.append(_render_reclaimable(reclaimable, arr_enabled))
+    parts.append(_render_reclaimable(reclaimable))
     parts.append(_render_mismatches(mismatches))
     parts.append(_render_arr_tracked(reclaimable, arr_enabled))
     return _page("Plex duplicate report", "".join(parts))
@@ -272,21 +311,55 @@ def _render_messages(messages: Optional[list], css_class: str) -> str:
     return "".join(f'<div class="{css_class}">{_esc(m)}</div>' for m in messages)
 
 
-def _copy_label(copy: dict) -> str:
-    res = copy.get("resolution") or "?"
+def _copy_label(copy: Optional[dict]) -> str:
+    res = (copy or {}).get("resolution") or "?"
     return _esc(res)
+
+
+def _file_li(entry: dict) -> str:
+    """One physical-file list item: escaped path + right-aligned true size."""
+
+    return (
+        f'<li><code>{_esc(entry.get("file", "?"))}</code> '
+        f'<span class="num">{_esc(_fmt_gib(entry.get("size", 0)))}</span></li>'
+    )
 
 
 def _render_parts(copy: dict) -> str:
     """A <ul> of the copy's physical files at their true sizes (#17)."""
 
     files = copy.get("parts") or [{"file": copy.get("file"), "size": copy.get("size")}]
-    items = "".join(
-        f'<li><code>{_esc(p.get("file", "?"))}</code> '
-        f'<span class="num">{_esc(_fmt_gib(p.get("size", 0)))}</span></li>'
-        for p in files
+    return f'<ul class="parts">{"".join(_file_li(p) for p in files)}</ul>'
+
+
+def _is_keeper(copy: dict, keeper: Optional[dict]) -> bool:
+    """Identity match against the report's authoritative ``keeper`` copy.
+
+    A logical copy is uniquely identified by its first-part ``file`` and its Plex
+    ``media_id``; the serialized keeper carries the same two, so this holds even
+    if ``copies`` were ever reordered for display.
+    """
+
+    if keeper is None:
+        return False
+    return copy.get("file") == keeper.get("file") and copy.get("media_id") == keeper.get(
+        "media_id"
     )
-    return f'<ul class="parts">{items}</ul>'
+
+
+def _reclaim_candidates(group: dict) -> List[dict]:
+    """The redundant copies a reclaim would delete: every copy but the keeper.
+
+    Uses the report's explicit ``keeper`` field rather than assuming ``copies`` is
+    keeper-first, so the view can never mislabel the wrong copy as the keeper.
+    Falls back to "all but the first" only when no keeper is serialized.
+    """
+
+    copies = group.get("copies") or []
+    keeper = group.get("keeper")
+    if keeper is None:
+        return copies[1:]
+    return [c for c in copies if not _is_keeper(c, keeper)]
 
 
 def _assoc_tag(copy: dict) -> str:
@@ -299,7 +372,7 @@ def _assoc_tag(copy: dict) -> str:
     return ""
 
 
-def _render_reclaimable(groups: List[dict], arr_enabled: bool) -> str:
+def _render_reclaimable(groups: List[dict]) -> str:
     groups = sorted(groups, key=lambda g: -_as_int(g.get("reclaimable_bytes")))
     total = sum(_as_int(g.get("reclaimable_bytes")) for g in groups)
     header = (
@@ -312,9 +385,8 @@ def _render_reclaimable(groups: List[dict], arr_enabled: bool) -> str:
     rows: List[str] = []
     for group in groups:
         copies = group.get("copies") or []
-        keeper = copies[0] if copies else None
-        candidates = copies[1:] if copies else []
-        keep_res = _copy_label(keeper) if keeper else "?"
+        candidates = _reclaim_candidates(group)
+        keep_res = _copy_label(group.get("keeper"))
         detail = "".join(
             f'<div>{_assoc_tag(c)} {_copy_label(c)}{_render_parts(c)}</div>'
             for c in candidates
@@ -347,11 +419,7 @@ def _render_mismatches(groups: List[dict]) -> str:
     rows: List[str] = []
     for group in sorted(groups, key=lambda g: (g.get("kind", ""), g.get("title", ""))):
         copies = group.get("copies") or []
-        files = "".join(
-            f'<li><code>{_esc(c.get("file", "?"))}</code> '
-            f'<span class="num">{_esc(_fmt_gib(c.get("size", 0)))}</span></li>'
-            for c in copies
-        )
+        files = "".join(_file_li(c) for c in copies)
         rows.append(
             "<tr>"
             f'<td>{_esc(group.get("kind", "?"))}</td>'
@@ -377,10 +445,13 @@ def _render_arr_tracked(groups: List[dict], arr_enabled: bool) -> str:
             "when deleted.</div>"
         )
     rows: List[str] = []
+    unknown_count = 0
     for group in groups:
-        copies = group.get("copies") or []
-        for copy in copies[1:]:  # non-keeper reclaim candidates
-            if copy.get("association") != "tracked":
+        for copy in _reclaim_candidates(group):  # non-keeper reclaim candidates
+            assoc = copy.get("association")
+            if assoc == "unknown":
+                unknown_count += 1
+            if assoc != "tracked":
                 continue
             rows.append(
                 "<tr>"
@@ -391,6 +462,15 @@ def _render_arr_tracked(groups: List[dict], arr_enabled: bool) -> str:
                 "</tr>"
             )
     if not rows:
+        # "safe" is only honest when nothing is unconfirmed: an *arr outage, or a
+        # TV copy whose filename didn't match, leaves reclaim candidates `unknown`,
+        # which must never be presented as safe (mirrors the CLI's caveat).
+        if unknown_count:
+            return header + (
+                f'<div class="empty">No reclaimable copy is *arr-tracked, but '
+                f"{unknown_count} could not be confirmed (<code>unknown</code>) "
+                "&mdash; verify those before deleting.</div>"
+            )
         return header + (
             '<div class="empty">No reclaimable copy is *arr-tracked &mdash; the safe '
             "copies above are not managed by Radarr/Sonarr.</div>"
@@ -417,56 +497,90 @@ def _as_int(value: object) -> int:
 # --------------------------------------------------------------------------- #
 
 class _Handler(BaseHTTPRequestHandler):
-    """Explicit-route handler: only ``GET`` of a known path is served."""
+    """Explicit-route handler: only ``GET``/``HEAD`` of a known path is served.
+
+    Left at the default HTTP/1.0 (no keep-alive) on purpose: every response then
+    closes the connection, so a refused verb's body or a HEAD's absent body can
+    never desync a persistent connection. ``timeout`` drops a slow/idle client so
+    a single connection cannot pin a worker thread indefinitely, and
+    ``sys_version = ""`` keeps the interpreter version out of the ``Server``
+    header.
+    """
 
     server_version = "unraid-cache-cleaner-web"
-    # Silence the default per-request stderr spam; route through the module
-    # logger at debug instead, keeping the one-line-per-run logging convention.
-    protocol_version = "HTTP/1.1"
+    sys_version = ""
+    timeout = 15
 
     @property
     def _viewer(self) -> DuplicateReportViewer:
         return self.server.viewer  # type: ignore[attr-defined]
 
+    def _resolve(self, path: str) -> tuple:
+        """Return ``(status, content_type, body_bytes)`` for a route.
+
+        A last-resort guard: even if a renderer raises on some unforeseen input,
+        the client gets a clean error response instead of a dropped connection.
+        (Malformed reports are already degraded to the empty state by the viewer.)
+        """
+
+        try:
+            if path in ("/", "/index.html"):
+                return (
+                    HTTPStatus.OK,
+                    "text/html; charset=utf-8",
+                    self._viewer.render_html().encode("utf-8"),
+                )
+            if path == "/api/report":
+                body = json.dumps(self._viewer.report_api(), sort_keys=True).encode("utf-8")
+                return HTTPStatus.OK, "application/json; charset=utf-8", body
+            if path == "/healthz":
+                return HTTPStatus.OK, "text/plain; charset=utf-8", b"ok\n"
+            return (
+                HTTPStatus.NOT_FOUND,
+                "text/html; charset=utf-8",
+                self._viewer.render_not_found().encode("utf-8"),
+            )
+        except Exception:  # noqa: BLE001 — never drop the connection with no reply
+            LOGGER.exception("web handler failed for %s", path)
+            return (
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "text/html; charset=utf-8",
+                _page("Error", "<h1>500</h1><p>The report could not be rendered.</p>").encode("utf-8"),
+            )
+
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler dispatch name)
-        path = urlparse(self.path).path
-        if path in ("/", "/index.html"):
-            self._send_html(HTTPStatus.OK, self._viewer.render_html())
-        elif path == "/api/report":
-            body = json.dumps(self._viewer.report_api(), sort_keys=True).encode("utf-8")
-            self._send_bytes(HTTPStatus.OK, body, "application/json; charset=utf-8")
-        elif path == "/healthz":
-            self._send_bytes(HTTPStatus.OK, b"ok\n", "text/plain; charset=utf-8")
-        else:
-            self._send_html(HTTPStatus.NOT_FOUND, self._viewer.render_not_found())
+        status, content_type, body = self._resolve(urlparse(self.path).path)
+        self._respond(status, content_type, len(body))
+        self.wfile.write(body)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        # Same headers as the equivalent GET, but no body (RFC 9110) — so a health
+        # check or proxy can probe any GET route with a cheap HEAD.
+        status, content_type, body = self._resolve(urlparse(self.path).path)
+        self._respond(status, content_type, len(body))
 
     def _method_not_allowed(self) -> None:
         body = json.dumps(
             {"error": "method not allowed", "detail": "this viewer is read-only (GET only)"}
         ).encode("utf-8")
         self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
-        self.send_header("Allow", "GET")
+        self.send_header("Allow", "GET, HEAD")
         self._common_headers(len(body), "application/json; charset=utf-8")
         self.end_headers()
         self.wfile.write(body)
 
     # Every mutating verb is refused — the action layer is Phase 2 and does not
-    # live in this module. HEAD/OPTIONS are refused too, keeping the surface tiny.
+    # live in this module.
     do_POST = _method_not_allowed
     do_PUT = _method_not_allowed
     do_DELETE = _method_not_allowed
     do_PATCH = _method_not_allowed
-    do_HEAD = _method_not_allowed
     do_OPTIONS = _method_not_allowed
 
-    def _send_html(self, status: HTTPStatus, html_text: str) -> None:
-        self._send_bytes(status, html_text.encode("utf-8"), "text/html; charset=utf-8")
-
-    def _send_bytes(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+    def _respond(self, status: HTTPStatus, content_type: str, length: int) -> None:
         self.send_response(status)
-        self._common_headers(len(body), content_type)
+        self._common_headers(length, content_type)
         self.end_headers()
-        self.wfile.write(body)
 
     def _common_headers(self, length: int, content_type: str) -> None:
         self.send_header("Content-Type", content_type)
@@ -492,6 +606,7 @@ class DuplicateReportServer:
         self._httpd = ThreadingHTTPServer((bind_address, port), _Handler)
         self._httpd.daemon_threads = True
         self._httpd.viewer = viewer  # type: ignore[attr-defined]
+        self._started = False
 
     @property
     def bind_address(self) -> str:
@@ -504,11 +619,13 @@ class DuplicateReportServer:
     def serve_forever(self) -> None:
         """Block, serving requests until :meth:`shutdown` (or KeyboardInterrupt)."""
 
+        self._started = True
         self._httpd.serve_forever()
 
     def start_background(self) -> threading.Thread:
         """Serve on a daemon thread and return it (for folding into ``service``)."""
 
+        self._started = True
         thread = threading.Thread(
             target=self._httpd.serve_forever, name="web-viewer", daemon=True
         )
@@ -516,7 +633,11 @@ class DuplicateReportServer:
         return thread
 
     def shutdown(self) -> None:
-        self._httpd.shutdown()
+        # ``BaseServer.shutdown`` blocks on an event that only ``serve_forever``
+        # sets, so calling it on a server that never started serving would hang
+        # forever. Guard on the started flag and always release the socket.
+        if self._started:
+            self._httpd.shutdown()
         self._httpd.server_close()
 
 

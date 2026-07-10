@@ -115,19 +115,25 @@ def run_cleaner(config: Config, command: str) -> int:
         service.run_once()
         return 0
 
-    # Opt-in: fold the read-only Plex duplicate viewer into the long-running
-    # service so one container both cleans up and serves the report (#34). It runs
-    # on a daemon thread that reads a file only — no shared qBittorrent client or
-    # SQLite connection — so it needs no coordination with the poll loop and dies
-    # with the process. Off by default, so `service` gains no listener unless asked.
+    # Opt-in: fold the read-only viewer into the service on a daemon thread that
+    # only reads a file (#34). A bind failure must NOT take down the core cleanup
+    # loop — the viewer is an optional convenience — so it is logged and skipped.
     if config.web_enabled:
-        server = web.build_server(config)
-        server.start_background()
-        logger.info(
-            "Plex duplicate report viewer listening on http://%s:%s (read-only)",
-            config.web_bind_address,
-            server.port,
-        )
+        try:
+            server = web.build_server(config)
+            server.start_background()
+            logger.info(
+                "Plex duplicate report viewer listening on http://%s:%s (read-only)",
+                config.web_bind_address,
+                server.port,
+            )
+        except (OSError, OverflowError, ValueError) as exc:
+            logger.error(
+                "Web viewer failed to start on %s:%s (%s); continuing cleanup without it",
+                config.web_bind_address,
+                config.web_port,
+                exc,
+            )
 
     service.serve_forever()
     return 0
@@ -137,7 +143,18 @@ def run_web(config: Config) -> int:
     """Serve the read-only Plex duplicate report web viewer (#34)."""
 
     logger = logging.getLogger(__name__)
-    server = web.build_server(config)
+    try:
+        server = web.build_server(config)
+    except (OSError, OverflowError, ValueError) as exc:
+        # A bad bind address or an in-use/out-of-range port must fail with a clear
+        # message, not a raw socket traceback (fail-closed, CLAUDE.md).
+        logger.error(
+            "Web viewer failed to bind %s:%s: %s",
+            config.web_bind_address,
+            config.web_port,
+            exc,
+        )
+        return 3
     logger.info(
         "Plex duplicate report viewer listening on http://%s:%s (read-only; serves %s)",
         config.web_bind_address,
