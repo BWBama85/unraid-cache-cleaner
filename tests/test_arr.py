@@ -555,5 +555,84 @@ class AnnotateEpisodeTests(unittest.TestCase):
         self.assertIs(out, group)
 
 
+# --------------------------------------------------------------------------- #
+# Mutation / resolve methods (#34 Phase 2)                                     #
+# --------------------------------------------------------------------------- #
+
+class ArrMutationTests(unittest.TestCase):
+    def test_radarr_resolve_returns_matching_file_ids(self) -> None:
+        movies = [
+            {"tmdbId": 1, "movieFile": {"id": 10, "path": "/movies/A/old.1080.mkv"}},
+            {"tmdbId": 2, "movieFile": {"id": 20, "path": "/movies/B/keep.4k.mkv"}},
+        ]
+        client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
+        self.assertEqual(client.resolve_movie_file_ids("old.1080.mkv"), [10])
+        self.assertEqual(client.resolve_movie_file_ids("missing.mkv"), [])
+
+    def test_radarr_resolve_reports_ambiguous_basename(self) -> None:
+        # Two movies with the same basename -> both ids, so the caller refuses.
+        movies = [
+            {"tmdbId": 1, "movieFile": {"id": 10, "path": "/movies/A/dup.mkv"}},
+            {"tmdbId": 2, "movieFile": {"id": 11, "path": "/movies/B/dup.mkv"}},
+        ]
+        client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
+        self.assertEqual(sorted(client.resolve_movie_file_ids("dup.mkv")), [10, 11])
+
+    def test_radarr_delete_issues_delete_verb_at_moviefile_path(self) -> None:
+        opener = _RecordingOpener(lambda req: b"{}")
+        client = _radarr(opener)
+        client.delete_movie_file(42)
+        request = opener.requests[-1]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(urlparse(request.full_url).path, "/api/v3/moviefile/42")
+
+    def test_radarr_delete_maps_http_error_to_arrclienterror(self) -> None:
+        client = _radarr(_RecordingOpener(_raiser(_http_error(404, b"gone"))))
+        with self.assertRaises(ArrClientError) as ctx:
+            client.delete_movie_file(7)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_sonarr_resolve_returns_matching_file_ids(self) -> None:
+        series = [{"id": 1}, {"id": 2}]
+        files = {
+            "1": [{"id": 100, "path": "/tv/A/S01/target.mkv"}],
+            "2": [{"id": 200, "path": "/tv/B/S01/other.mkv"}],
+        }
+
+        def responder(req) -> bytes:
+            parsed = urlparse(req.full_url)
+            if parsed.path == "/api/v3/series":
+                return json.dumps(series).encode("utf-8")
+            sid = parse_qs(parsed.query)["seriesId"][0]
+            return json.dumps(files[sid]).encode("utf-8")
+
+        client = _sonarr(_RecordingOpener(responder))
+        self.assertEqual(client.resolve_episode_file_ids("target.mkv"), [100])
+        self.assertEqual(client.resolve_episode_file_ids("nope.mkv"), [])
+
+    def test_sonarr_delete_issues_delete_verb_at_episodefile_path(self) -> None:
+        opener = _RecordingOpener(lambda req: b"{}")
+        client = _sonarr(opener)
+        client.delete_episode_file(99)
+        request = opener.requests[-1]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(urlparse(request.full_url).path, "/api/v3/episodefile/99")
+
+    def test_delete_is_not_retried(self) -> None:
+        # A DELETE that times out must NOT be replayed (ambiguous outcome), even
+        # with retries configured for idempotent reads.
+        calls = {"n": 0}
+
+        def responder(_req):
+            calls["n"] += 1
+            raise urllib.error.URLError("timed out")
+
+        client = RadarrClient("http://radarr:7878", "K", max_attempts=3)
+        client._opener = _RecordingOpener(responder)
+        with self.assertRaises(ArrClientError):
+            client.delete_movie_file(1)
+        self.assertEqual(calls["n"], 1)  # single attempt, no retry
+
+
 if __name__ == "__main__":
     unittest.main()

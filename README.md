@@ -119,9 +119,13 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `SONARR_API_KEY` | empty | Sonarr API key (sent as `X-Api-Key`, never in the URL) |
 | `SONARR_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Sonarr |
 | `SONARR_VERIFY_TLS` | `true` | Verify TLS certificates for Sonarr |
-| `WEB_ENABLED` | `false` | Also serve the [read-only web viewer](#web-gui-for-the-duplicate-report) from the long-running `service` command (opt-in). The standalone `web` subcommand ignores this |
-| `WEB_BIND_ADDRESS` | `0.0.0.0` | Address the web viewer binds to. `0.0.0.0` so a mapped container port is reachable; set `127.0.0.1` to restrict to loopback |
-| `WEB_PORT` | `8080` | TCP port the web viewer listens on |
+| `WEB_ENABLED` | `false` | Also serve the [web UI](#web-gui-for-the-duplicate-report) from the long-running `service` command (opt-in). The standalone `web` subcommand ignores this |
+| `WEB_BIND_ADDRESS` | `0.0.0.0` | Address the web UI binds to. `0.0.0.0` so a mapped container port is reachable; set `127.0.0.1` to restrict to loopback |
+| `WEB_PORT` | `8080` | TCP port the web UI listens on |
+| `WEB_ENABLE_ACTIONS` | `false` | Enable the [action layer](#reclaiming-duplicates-from-the-browser-phase-2) so an operator can delete redundant copies from the browser. Off by default; the viewer is read-only until you set this |
+| `WEB_ACTIONS_DRY_RUN` | `true` | When actions are on, report what a reclaim *would* delete and touch nothing (mirrors `DRY_RUN`). Set `false` only after reviewing a dry run |
+| `WEB_ACTION_TOKEN` | empty | Shared secret every reclaim must present (`X-Action-Token` header or the form field). **Required** to actually delete: with actions enabled but no token, every reclaim is refused |
+| `WEB_MEDIA_PATH_MAP` | empty | Comma-separated `plex_prefix:container_prefix` pairs mapping Plex-reported paths to this container's mounts, e.g. `/mnt/user/Media:/media`. Needed for a filesystem delete of an *untracked* copy; an unmapped path is refused |
 
 > **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup. The optional `RADARR_*`/`SONARR_*` variables add [`*arr`-tracking annotations](#radarrsonarr-tracking-optional) to that report; each is inert unless both its URL and API key are set.
 
@@ -223,12 +227,12 @@ which it can't from filenames alone.
 ### Web GUI for the duplicate report
 
 The `web` subcommand serves the duplicate report in a browser instead of the
-terminal. It is a **read-only viewer**: it reads the on-disk report at
+terminal. By default it is a **read-only viewer**: it reads the on-disk report at
 `PLEX_DUPLICATE_REPORT_PATH` and renders the same three sections the table shows
-(reclaimable, mismatch review, `*arr`-tracked), plus a JSON API. **It never runs
-a scan and never deletes, moves, or unmonitors anything** — acting on duplicates
-from the browser is a planned, fail-closed follow-up ([#34](https://github.com/BWBama85/unraid-cache-cleaner/issues/34)
-Phase 2), deliberately not part of this viewer.
+(reclaimable, mismatch review, `*arr`-tracked), plus a JSON API. It never runs a
+scan. An opt-in [action layer](#reclaiming-duplicates-from-the-browser-phase-2)
+(off unless `WEB_ENABLE_ACTIONS=true`) adds the ability to reclaim selected
+redundant copies from the browser.
 
 ```bash
 # Generate (or refresh) the report first — the viewer only displays it:
@@ -242,24 +246,64 @@ PLEX_DUPLICATE_REPORT_PATH=/config/plex-duplicates.json \
 
 Open `http://<host>:8080/`. Routes:
 
-| Route | Serves |
-| --- | --- |
-| `/` | The HTML report (totals, reclaimable, mismatch review, `*arr`-tracked) |
-| `/api/report` | `{"available": bool, "report": <report JSON or null>}` |
-| `/healthz` | `ok` (liveness) |
+| Route | Method | Serves |
+| --- | --- | --- |
+| `/` | GET | The HTML report (totals, reclaimable, mismatch review, `*arr`-tracked) |
+| `/api/report` | GET | `{"available": bool, "report": <report JSON or null>}` |
+| `/healthz` | GET | `ok` (liveness) |
+| `/api/reclaim` | POST | Reclaim endpoint (JSON) — only when actions are enabled; `405` otherwise |
+| `/actions/reclaim` | POST | Browser-form reclaim — only when actions are enabled |
 
-- **Read-only and fail-closed.** No mutation endpoint exists; every non-`GET`
-  verb returns `405`. All Plex-supplied strings (titles, paths, warnings) are
-  HTML-escaped, the page ships no external assets under a strict
-  `Content-Security-Policy`, and a missing/truncated/malformed report renders an
-  empty state rather than a `500`.
+- **Read-only by default, fail-closed.** Until `WEB_ENABLE_ACTIONS=true` no
+  mutation endpoint exists and every non-`GET` verb returns `405`. All
+  Plex-supplied strings (titles, paths, warnings) are HTML-escaped, the page ships
+  no external assets under a strict `Content-Security-Policy`, and a
+  missing/truncated/malformed report renders an empty state rather than a `500`.
 - **Runs standalone or beside cleanup.** Run it as its own container/command
   (`web`), or set `WEB_ENABLED=true` so the long-running `service` also serves the
-  viewer on a background thread — one container that both cleans up and shows the
+  web UI on a background thread — one container that both cleans up and shows the
   report. It is off by default, so `service` gains no listener unless you opt in.
-- **LAN-scoped.** Like qBittorrent/Plex/`*arr`, the viewer assumes a trusted LAN
-  and has no authentication; it binds `0.0.0.0` by default so a mapped container
-  port is reachable. Set `WEB_BIND_ADDRESS=127.0.0.1` to restrict it to loopback.
+- **LAN-scoped.** Like qBittorrent/Plex/`*arr`, the UI assumes a trusted LAN and
+  has no user accounts; it binds `0.0.0.0` by default so a mapped container port is
+  reachable. Set `WEB_BIND_ADDRESS=127.0.0.1` to restrict it to loopback. The
+  action layer adds a shared-token gate on top (see below).
+
+#### Reclaiming duplicates from the browser (Phase 2)
+
+Setting `WEB_ENABLE_ACTIONS=true` lights up a reclaim path so you can select
+redundant copies in the browser and delete them. This is the project's first
+outside-triggered deletion of *library* media, so it is fail-closed on every axis:
+
+- **Disabled and dry-run by default.** Actions are off until you opt in, and even
+  then `WEB_ACTIONS_DRY_RUN=true` (the default) reports what *would* be deleted and
+  touches nothing. Set `WEB_ACTIONS_DRY_RUN=false` only after reviewing a dry run.
+- **Token-gated.** Every reclaim must present `WEB_ACTION_TOKEN` (via the
+  `X-Action-Token` header or the form's token field). Enabling actions **without**
+  a token refuses every request — there is never an unauthenticated delete endpoint.
+  A cross-origin POST is also rejected.
+- **Honors the report's safety signals.** The keeper is never deleted, a `mismatch`
+  group (Plex merged different titles) is never reclaimed, and an `unknown`
+  association is never auto-deleted. Targets are resolved against a *fresh*
+  server-side report snapshot — a page built on a stale report is refused (`409`) —
+  and a copy's size/path are re-validated immediately before deletion (TOCTOU).
+- **Routed by association.** An `untracked` copy is a filesystem delete, which
+  requires `WEB_MEDIA_PATH_MAP` to map the Plex path to a *mounted* container path
+  (unmapped → refused, because the Plex library is not mounted by default). A
+  `tracked` copy is deleted via Radarr/Sonarr (so it does not immediately
+  re-download); its `*arr` file id is resolved live and refused if missing or
+  ambiguous.
+- **Audited.** Every real delete (and any partial failure) is written to the
+  SQLite state store's `actions` table, so you can answer "what did the GUI delete".
+
+```bash
+# Reclaim via the JSON API (dry run shown; echo the report's generated_at):
+curl -X POST http://<host>:8080/api/reclaim \
+  -H 'Content-Type: application/json' -H "X-Action-Token: $WEB_ACTION_TOKEN" \
+  -d '{"report_generated_at": 1720000000.0, "targets": [{"rating_key": "900", "part_id": 2}]}'
+```
+
+Because it deletes media, keep it bound to a trusted LAN, keep a token set, and
+prefer routing tracked copies through Radarr/Sonarr over raw filesystem deletes.
 
 ## RAR extraction
 

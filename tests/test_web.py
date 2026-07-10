@@ -441,6 +441,7 @@ class BindFailureTests(unittest.TestCase):
             web_bind_address = "127.0.0.1"
             web_port = 9
             plex_duplicate_report_path = Path("/nonexistent/report.json")
+            web_actions_enabled = False  # actions off → no reclaim service is built
 
         with mock.patch.object(cli.web, "build_server", side_effect=OSError("in use")):
             self.assertEqual(cli.run_web(_Cfg()), 3)

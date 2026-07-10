@@ -27,9 +27,12 @@ RUN pip install --no-cache-dir .
 
 VOLUME ["/config", "/data"]
 
-# Read-only Plex duplicate report web viewer (#34). Served by the `web`
+# Plex duplicate report web UI (#34): read-only viewer by default, plus an opt-in
+# action layer (WEB_ENABLE_ACTIONS=true) to reclaim duplicates. Served by the `web`
 # subcommand, or by `service` when WEB_ENABLED=true. Matches the WEB_PORT default;
-# the port is only bound when the viewer is actually run.
+# the port is only bound when the UI is actually run. A filesystem delete of an
+# untracked copy also needs the Plex media volume mounted (WEB_MEDIA_PATH_MAP);
+# that mount is operator-configured, so no fixed media VOLUME is declared here.
 EXPOSE 8080
 
 ENTRYPOINT ["unraid-cache-cleaner"]

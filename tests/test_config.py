@@ -259,6 +259,68 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.web_bind_address, "127.0.0.1")
                 self.assertEqual(config.web_port, 9191)
 
+    def test_web_action_defaults_are_fail_closed(self) -> None:
+        # With nothing set, the Phase 2 action layer is off and dry-run-on: no
+        # token, no path map. (#34)
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, base, clear=True):
+                config = Config.from_env()
+                self.assertFalse(config.web_actions_enabled)
+                self.assertTrue(config.web_actions_dry_run)
+                self.assertEqual(config.web_action_token, "")
+                self.assertEqual(config.web_media_path_map, ())
+
+    def test_web_action_env_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+                "WEB_ENABLE_ACTIONS": "true",
+                "WEB_ACTIONS_DRY_RUN": "false",
+                "WEB_ACTION_TOKEN": "s3cr3t",
+                "WEB_MEDIA_PATH_MAP": "/mnt/user/Media:/media, /mnt/user/TV:/tv",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+                self.assertTrue(config.web_actions_enabled)
+                self.assertFalse(config.web_actions_dry_run)
+                self.assertEqual(config.web_action_token, "s3cr3t")
+                self.assertEqual(
+                    config.web_media_path_map,
+                    ((Path("/mnt/user/Media"), Path("/media")), (Path("/mnt/user/TV"), Path("/tv"))),
+                )
+
+    def test_web_media_path_map_skips_malformed_entries(self) -> None:
+        # An entry without a colon (or a blank side) can't map anything, so it is
+        # dropped rather than raising — an unmapped path is later refused.
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+                "WEB_MEDIA_PATH_MAP": "no-colon-here,/plex:/ok,:blank,/other:",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+                self.assertEqual(config.web_media_path_map, ((Path("/plex"), Path("/ok")),))
+
+    def test_positional_config_still_constructs_without_action_fields(self) -> None:
+        # The new fields are appended-with-defaults, so a positional Config(...)
+        # that omits them still builds (CLAUDE.md contract).
+        config = Config(
+            "http://qbt:8080", "u", "p", 15, True, (Path("/data"),), 300, 0, 0,
+            False, True, True, (), Path("/tmp/s.sqlite3"), Path("/tmp/r.json"), "INFO",
+        )
+        self.assertFalse(config.web_actions_enabled)
+        self.assertTrue(config.web_actions_dry_run)
+        self.assertEqual(config.web_media_path_map, ())
+
 
 if __name__ == "__main__":
     unittest.main()

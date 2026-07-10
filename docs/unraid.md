@@ -113,11 +113,12 @@ A starter XML template is included at [contrib/unraid-cache-cleaner.xml](../cont
 - the correct host paths
 - any `EXCLUDED_GLOBS` needed to keep non-torrent files under the watch root
 
-## Web GUI (read-only Plex duplicate report)
+## Web GUI (Plex duplicate report)
 
 The container can serve the Plex duplicate report as a web page (see the README's
-[Web GUI](../README.md#web-gui-for-the-duplicate-report) section). It is a
-**read-only** viewer — it displays an existing report and never scans or deletes.
+[Web GUI](../README.md#web-gui-for-the-duplicate-report) section). By default it is
+a **read-only** viewer — it displays an existing report and never scans or deletes.
+An opt-in action layer (below) can additionally reclaim duplicates from the browser.
 
 To reach it from this Unraid container:
 
@@ -136,9 +137,32 @@ To reach it from this Unraid container:
 3. The template maps host port → container `8080` (**WebUI Port**). Open the
    container's WebUI, or `http://<unraid-ip>:<mapped-port>/`.
 
-The viewer has no authentication — like qBittorrent/Plex/`*arr`, it assumes a
-trusted LAN. It is read-only, so there is no delete button to misfire; acting on
-duplicates from the browser is a planned, fail-closed follow-up.
+The viewer has no user accounts — like qBittorrent/Plex/`*arr`, it assumes a
+trusted LAN. By default it is read-only, so there is no delete button to misfire.
+
+### Reclaiming duplicates from the browser (opt-in)
+
+Setting `WEB_ENABLE_ACTIONS=true` adds a reclaim path so you can delete redundant
+copies from the web UI. This deletes real library media, so it is fail-closed —
+see the README's [action-layer](../README.md#reclaiming-duplicates-from-the-browser-phase-2)
+section for the full contract. On Unraid specifically:
+
+1. **Set a token.** `WEB_ACTION_TOKEN` is required; with actions enabled but no
+   token, every reclaim is refused. The template masks this field.
+2. **Keep the dry run first.** `WEB_ACTIONS_DRY_RUN=true` (default) shows what a
+   reclaim *would* delete and touches nothing. Flip it to `false` only after you
+   trust the output.
+3. **Tracked copies need no extra mounts.** A copy Radarr/Sonarr tracks is deleted
+   through the `*arr` (so it doesn't re-download); wire `RADARR_*`/`SONARR_*` as for
+   the report.
+4. **Filesystem (untracked) deletes need the media mounted + mapped.** This
+   container mounts only `/config` and `/data` — not your Plex library. To let it
+   delete an *untracked* copy on disk, add a **read-write Path** mapping for the
+   media share (e.g. host `/mnt/user/Media` → container `/media`) and set
+   `WEB_MEDIA_PATH_MAP=/mnt/user/Media:/media` so the container can translate the
+   Plex-reported path. An unmapped path is refused, never guessed.
+5. **Audit trail.** Every real delete is recorded in the SQLite state DB under
+   `/config`, so you can review what the UI removed.
 
 ## Common Misconfiguration
 

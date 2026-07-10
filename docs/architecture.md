@@ -97,13 +97,13 @@ An optional Radarr/Sonarr association layer that enriches the report with whethe
 
 The join differs by kind, because the two id joins are not equally reliable. **Movies** are *id-anchored*: Plex's `tmdb://` guid is the same TMDB id Radarr keys on, so within a group whose id Radarr tracks, the basename-matching copy is `tracked` and the other redundant copies are `untracked` (safe); if the id is absent, not in Radarr, or no basename matches, every copy is `unknown`. **Episodes** match by *basename only*: Plex's episode `Guid`s are episode-level, not the series TVDB id Sonarr keys on, so a copy whose basename Sonarr tracks is `tracked` and any other copy is `unknown` — never falsely `untracked`. The reporter constructs a client only when both its URL and API key are set; an unconfigured layer leaves the report byte-identical to a Plex-only run, and a configured-but-unreachable `*arr` logs a warning and degrades that kind to `unknown` rather than failing the report.
 
-### `web.py` (read-only viewer)
+### `web.py` (viewer + HTTP wiring)
 
 The project's **first inbound listener** — every other surface is an outbound
 client. A stdlib `ThreadingHTTPServer` + `BaseHTTPRequestHandler` (no
 Flask/FastAPI, per the stdlib-only rule) that serves the on-disk
 `plex_duplicate_report_path` snapshot as a browsable HTML page (`/`) and a JSON
-API (`/api/report`), plus a `/healthz` liveness route. It is rigorously
+API (`/api/report`), plus a `/healthz` liveness route. The GET path is rigorously
 read-only: it constructs **no** Plex/`*arr`/qBittorrent/SQLite client and never
 regenerates the report — a page load only reads a file the `plex-duplicates`
 subcommand (or a cron) already wrote, so it can never fan out to Plex. The
@@ -112,14 +112,36 @@ an injectable provider (the default reads the file; tests inject a fake), so the
 server is unit-tested end-to-end on an ephemeral port without any network
 service. Safety envelope: every Plex-supplied string is HTML-escaped, routes are
 explicit (no directory serving/CORS/external assets) under a strict
-`Content-Security-Policy`, every non-`GET` verb is `405`, and a
-missing/truncated/malformed report degrades to an empty-state page rather than a
-`500`. It exposes **no** mutation path — reclaiming duplicates from the browser
-is a separate, fail-closed follow-up (#34 Phase 2). Run it standalone with the
-`web` subcommand, or fold it into the `service` loop on a daemon thread with
-`WEB_ENABLED=true`. To keep concurrent reads safe, `write_report` now publishes
-the report atomically (temp file + `os.replace`), so the viewer never observes a
+`Content-Security-Policy`, and a missing/truncated/malformed report degrades to an
+empty-state page rather than a `500`. When no action layer is attached (the
+default), every non-`GET` verb is `405`. Run it standalone with the `web`
+subcommand, or fold it into the `service` loop on a daemon thread with
+`WEB_ENABLED=true`. To keep concurrent reads safe, `write_report` publishes the
+report atomically (temp file + `os.replace`), so the viewer never observes a
 half-written file.
+
+### `web_actions.py` (action layer, opt-in)
+
+The **first outside-triggered mutation of media**, off unless
+`WEB_ENABLE_ACTIONS=true`. `web.py` parses the reclaim request (`POST /api/reclaim`
+JSON, or the no-JS `POST /actions/reclaim` browser form) into
+`{rating_key, part_id}` targets and hands them to `ReclaimService`, which owns the
+entire safety envelope and is constructed with injected collaborators (report
+provider, filesystem deleter, Radarr/Sonarr clients, audit sink, clock) so every
+path is fake-tested without a real socket or disk write. Fail-closed on every
+axis: disabled + dry-run by default; a shared `WEB_ACTION_TOKEN` is required
+(enabling actions without one refuses every request) and a cross-origin POST is
+rejected; targets are resolved only against a *fresh* server-side report snapshot
+(client-supplied path/association/size/backend are never trusted) and a stale
+`generated_at` is a `409`; the keeper, `mismatch` groups, and `unknown`
+associations are refused; one lock serializes snapshot → validate → delete →
+audit. Routing is by association — an `untracked` copy is a filesystem delete
+(only when `WEB_MEDIA_PATH_MAP` resolves the Plex path to a *mounted* container
+file, re-`lstat`'d for a matching size and a regular non-symlink file under the
+media root — TOCTOU), a `tracked` copy is a Radarr/Sonarr `DELETE` whose file id
+is resolved live and refused if missing or ambiguous. A stacked copy's parts are
+all prevalidated before any is deleted, and every real delete (or partial failure)
+is persisted via `ActionRecord` in the SQLite `actions` table.
 
 ## Failure Model
 
@@ -132,10 +154,11 @@ The service fails closed:
 
 ## Current Scope
 
-This version focuses on safe orphan cleanup for qBittorrent download/cache paths. It ships a **read-only** web viewer for the Plex duplicate report (`web.py`), but does not yet:
+This version focuses on safe orphan cleanup for qBittorrent download/cache paths. It ships a web viewer for the Plex duplicate report (`web.py`) and an opt-in, fail-closed action layer to reclaim duplicates from the browser (`web_actions.py`, `WEB_ENABLE_ACTIONS=true`), but does not yet:
 
 - subscribe to qBittorrent push events
-- let you act on (delete) duplicates from the web UI — the viewer is read-only; the action layer is #34 Phase 2
+- regenerate the report or trigger a Plex rescan from the web UI (it serves the on-disk snapshot)
+- offer an undo/quarantine or action-history UI (deletes are audited to the `actions` table)
 - publish metrics
 
 ### Opt-in RAR extraction

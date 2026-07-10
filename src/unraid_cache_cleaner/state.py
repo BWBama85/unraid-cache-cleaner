@@ -57,9 +57,19 @@ class StateStore:
         db_path: Path,
         *,
         busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS,
+        check_same_thread: bool = True,
     ) -> None:
+        # ``check_same_thread=False`` lets the web action layer (#34 Phase 2) record
+        # an audit row from a request worker thread while the store was opened on
+        # the main thread. It is only safe because every reclaim serializes all
+        # store access behind the ReclaimService lock — SQLite forbids *concurrent*
+        # use of one connection, which that lock prevents; it does not forbid use
+        # from another thread once the original is quiescent. The default stays
+        # True so the single-threaded cleaner/extractor keep the built-in guard.
         self.db_path = db_path
-        self._connection = sqlite3.connect(self.db_path, timeout=busy_timeout_seconds)
+        self._connection = sqlite3.connect(
+            self.db_path, timeout=busy_timeout_seconds, check_same_thread=check_same_thread
+        )
         self._connection.row_factory = sqlite3.Row
         self._enable_wal()
         self._initialize()

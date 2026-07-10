@@ -18,6 +18,7 @@ from .qbittorrent import QbittorrentClient, QbittorrentClientError
 from .service import CleanerService
 from .state import StateExtractionLedger, StateStore
 from . import web
+from .web_actions import ReclaimService
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -115,21 +116,24 @@ def run_cleaner(config: Config, command: str) -> int:
         service.run_once()
         return 0
 
-    # Opt-in: fold the read-only viewer into the service on a daemon thread that
-    # only reads a file (#34). A bind failure must NOT take down the core cleanup
-    # loop — the viewer is an optional convenience — so it is logged and skipped.
+    # Opt-in: fold the web viewer into the service on a daemon thread (#34). A GET
+    # only reads a file; the optional action layer (Phase 2) serializes its own
+    # mutations. A bind failure must NOT take down the core cleanup loop — the web
+    # UI is an optional convenience — so it is logged and skipped.
     if config.web_enabled:
         try:
-            server = web.build_server(config)
+            server = _build_web_server(config)
             server.start_background()
+            _log_web_mode(config, logger)
             logger.info(
-                "Plex duplicate report viewer listening on http://%s:%s (read-only)",
+                "Plex duplicate report web UI listening on http://%s:%s (%s)",
                 config.web_bind_address,
                 server.port,
+                "actions enabled" if config.web_actions_enabled else "read-only",
             )
         except (OSError, OverflowError, ValueError) as exc:
             logger.error(
-                "Web viewer failed to start on %s:%s (%s); continuing cleanup without it",
+                "Web UI failed to start on %s:%s (%s); continuing cleanup without it",
                 config.web_bind_address,
                 config.web_port,
                 exc,
@@ -140,34 +144,95 @@ def run_cleaner(config: Config, command: str) -> int:
 
 
 def run_web(config: Config) -> int:
-    """Serve the read-only Plex duplicate report web viewer (#34)."""
+    """Serve the Plex duplicate report web UI (#34) — read-only by default, with the
+    fail-closed action layer only when ``WEB_ENABLE_ACTIONS=true``."""
 
     logger = logging.getLogger(__name__)
     try:
-        server = web.build_server(config)
+        server = _build_web_server(config)
     except (OSError, OverflowError, ValueError) as exc:
         # A bad bind address or an in-use/out-of-range port must fail with a clear
         # message, not a raw socket traceback (fail-closed, CLAUDE.md).
         logger.error(
-            "Web viewer failed to bind %s:%s: %s",
+            "Web UI failed to bind %s:%s: %s",
             config.web_bind_address,
             config.web_port,
             exc,
         )
         return 3
+    _log_web_mode(config, logger)
     logger.info(
-        "Plex duplicate report viewer listening on http://%s:%s (read-only; serves %s)",
+        "Plex duplicate report web UI listening on http://%s:%s (%s; serves %s)",
         config.web_bind_address,
         server.port,
+        "actions enabled" if config.web_actions_enabled else "read-only",
         config.plex_duplicate_report_path,
     )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Shutting down web viewer")
+        logger.info("Shutting down web UI")
     finally:
         server.shutdown()
     return 0
+
+
+def _build_web_server(config: Config) -> "web.DuplicateReportServer":
+    """Assemble the web server, wiring the action layer only when actions are on.
+
+    The reclaim service owns the ``*arr`` clients and the audit store, so it is
+    built here (where those constructors live) and injected into ``build_server``;
+    when actions are disabled ``None`` is passed and the server is the read-only
+    viewer."""
+
+    provider = web.file_report_provider(config.plex_duplicate_report_path)
+    reclaim_service = _build_reclaim_service(config, provider)
+    return web.build_server(config, provider=provider, reclaim_service=reclaim_service)
+
+
+def _build_reclaim_service(
+    config: Config, provider: "web.ReportProvider"
+) -> Optional[ReclaimService]:
+    """Build the fail-closed reclaim service, or ``None`` when actions are disabled.
+
+    The audit store is a *separate* SQLite connection opened
+    ``check_same_thread=False`` (WAL lets it coexist with the cleaner's connection)
+    because reclaim audit rows are written from HTTP worker threads; the reclaim
+    lock serializes those writes."""
+
+    if not config.web_actions_enabled:
+        return None
+    audit_store = StateStore(config.state_db_path, check_same_thread=False)
+    return ReclaimService(
+        config,
+        provider,
+        radarr=_build_radarr(config),
+        sonarr=_build_sonarr(config),
+        audit=audit_store.record_actions,
+    )
+
+
+def _log_web_mode(config: Config, logger: logging.Logger) -> None:
+    """Log a prominent warning when the destructive action layer is enabled."""
+
+    if not config.web_actions_enabled:
+        return
+    logger.warning(
+        "Web ACTION layer ENABLED (dry_run=%s): a reclaim deletes library media, routed "
+        "by association (filesystem for untracked, Radarr/Sonarr for tracked) and gated "
+        "by WEB_ACTION_TOKEN.",
+        config.web_actions_dry_run,
+    )
+    if not config.web_action_token:
+        logger.warning(
+            "WEB_ENABLE_ACTIONS is set but WEB_ACTION_TOKEN is empty; every reclaim is "
+            "refused until you set a token."
+        )
+    if not config.web_media_path_map:
+        logger.info(
+            "No WEB_MEDIA_PATH_MAP set: filesystem deletes of untracked copies are refused "
+            "(tracked copies still reclaim via Radarr/Sonarr)."
+        )
 
 
 def _resolve_extract_roots(config: Config) -> Tuple[Path, ...]:
