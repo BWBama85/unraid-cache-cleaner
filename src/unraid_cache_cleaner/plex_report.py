@@ -93,10 +93,9 @@ class PlexDuplicateReporter:
         self.radarr_client = radarr_client
         self.sonarr_client = sonarr_client
         self.clock = clock
-        # Per-render memo of each group's best-first ranking (see _ranked_pairs).
-        self._rank_cache: Dict[
-            int, Tuple[DuplicateGroup, List[Tuple[MediaCopy, List[MediaCopy]]]]
-        ] = {}
+        # Per-render memo of each group's best-first ranking (see _ranked_pairs),
+        # keyed by the group's unique Plex rating_key.
+        self._rank_cache: Dict[str, List[Tuple[MediaCopy, List[MediaCopy]]]] = {}
 
     @property
     def _arr_enabled(self) -> bool:
@@ -231,24 +230,16 @@ class PlexDuplicateReporter:
         The JSON body, the reclaimable rows (count + #48 part sub-rows), the arr
         tag, the arr-tracked rows, and the arr-tracked count each need a group's
         best-first ranking; without memoization one group is stack-merged and
-        sorted five-plus times per render (#19). The cache is keyed by object
-        identity — ``DuplicateGroup`` carries an unhashable ``external_ids`` dict,
-        so it cannot key a dict directly — and re-validated against the stored
-        group so a recycled ``id`` can never hand back another group's ranking.
+        sorted five-plus times per render (#19). Keyed by the group's unique Plex
+        ``rating_key`` (also the uniqueness tiebreak in ``_group_sort_key``).
         """
 
-        cached = self._rank_cache.get(id(group))
-        if cached is not None and cached[0] is group:
-            return cached[1]
+        cached = self._rank_cache.get(group.rating_key)
+        if cached is not None:
+            return cached
         pairs = dedupe.rank_copies_with_parts(group)
-        self._rank_cache[id(group)] = (group, pairs)
+        self._rank_cache[group.rating_key] = pairs
         return pairs
-
-    def _ranked_logical(self, group: DuplicateGroup) -> List[MediaCopy]:
-        """The group's logical copies, best-first — identical to
-        ``dedupe.rank_copies(group)`` but served from the per-render memo."""
-
-        return [logical for logical, _ in self._ranked_pairs(group)]
 
     def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
         pairs = self._ranked_pairs(group)
@@ -323,7 +314,7 @@ class PlexDuplicateReporter:
     def _reclaim_candidates(self, group: DuplicateGroup) -> List[MediaCopy]:
         """The copies a reclaim would delete: every logical copy but the keeper."""
 
-        return self._ranked_logical(group)[1:]
+        return [logical for logical, _ in self._ranked_pairs(group)][1:]
 
     def _reclaim_candidates_with_parts(
         self, group: DuplicateGroup

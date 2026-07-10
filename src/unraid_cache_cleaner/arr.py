@@ -186,10 +186,14 @@ class SonarrClient(_ArrClient):
                     basenames |= future.result()
                     if done % _SONARR_PROGRESS_EVERY == 0 or done == total:
                         LOGGER.info("Sonarr: indexed %s/%s series", done, total)
-            except ArrClientError:
+            finally:
+                # Any worker failure voids the whole index, so drop the requests
+                # that have not started rather than fanning out the rest (already
+                # running ones still finish under the pool's shutdown). A no-op on
+                # the success path, where every future is already done — and robust
+                # to a worker raising something other than ArrClientError.
                 for pending in futures:
-                    pending.cancel()  # don't fan out the rest once the index is void
-                raise
+                    pending.cancel()
         return basenames
 
     def _episode_file_basenames(self, series_id: object) -> Set[str]:
