@@ -95,7 +95,7 @@ def file_report_provider(path: Path) -> ReportProvider:
     the next request.
     """
 
-    cache: dict = {}  # {"key": (mtime, size), "value": Optional[dict]}
+    cache: dict = {}  # {"entry": ((mtime, size), Optional[dict])}
 
     def provide() -> Optional[dict]:
         try:
@@ -103,12 +103,16 @@ def file_report_provider(path: Path) -> ReportProvider:
             key = (stat.st_mtime_ns, stat.st_size)
         except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
             return None
-        if cache.get("key") == key:
-            return cache.get("value")
+        # The (key, value) pair is stored and read as ONE tuple assignment, so a
+        # reader that races the writer (the viewer and the action layer share this
+        # provider across threads) can never observe a new key paired with the old
+        # value — it sees either the whole old snapshot or the whole new one.
+        entry = cache.get("entry")
+        if entry is not None and entry[0] == key:
+            return entry[1]
 
         value = _read_report(path)
-        cache["key"] = key
-        cache["value"] = value
+        cache["entry"] = (key, value)
         return value
 
     return provide
@@ -747,8 +751,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._method_not_allowed()
 
     def _method_not_allowed(self) -> None:
+        # Accurate whether actions are on or off: the reclaim POST routes are
+        # matched before this fires, so a request reaching here is a verb/route this
+        # server does not serve (every GET route is GET/HEAD only).
         body = json.dumps(
-            {"error": "method not allowed", "detail": "this viewer is read-only (GET only)"}
+            {"error": "method not allowed", "detail": "no such method for this route"}
         ).encode("utf-8")
         self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
         self.send_header("Allow", "GET, HEAD")

@@ -51,6 +51,16 @@ RADARR = "radarr"
 SONARR = "sonarr"
 
 
+def _as_int(value: object) -> Optional[int]:
+    """Coerce an ``*arr`` file id to ``int``, or ``None`` if it is not numeric — so
+    a malformed id is skipped rather than raising inside the action layer."""
+
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 class ArrClientError(RuntimeError):
     """Raised when a Radarr/Sonarr instance cannot be queried safely."""
 
@@ -150,29 +160,30 @@ class RadarrClient(_ArrClient):
             index.setdefault(str(tmdb_id), set()).add(Path(str(path)).name)
         return index
 
-    def resolve_movie_file_ids(self, basename: str) -> List[int]:
-        """Return the Radarr ``movieFile`` id(s) whose file basename == ``basename``.
+    def fetch_file_index(self) -> Dict[str, List[int]]:
+        """Map each tracked movie-file basename to its ``movieFile`` id(s), from one
+        ``GET /api/v3/movie`` (#34 Phase 2).
 
-        Resolved live at delete time (#34 Phase 2) — never trusted from the report
-        — so the id and its path are re-validated against Radarr's *current* state
-        immediately before the DELETE (TOCTOU). The list length is the safety
-        signal the caller routes on: ``0`` → nothing tracks this basename now
-        (already removed?), ``1`` → the unambiguous delete target, ``>1`` → two
-        movies share the basename, so the caller refuses rather than guess which to
-        delete.
+        The web action layer builds this once per reclaim request and resolves every
+        selected basename against it — never one request per basename. Resolved live
+        (not from the report), so the id is current Radarr state at delete time. A
+        basename mapping to more than one id (two movies share a filename) is the
+        ambiguity signal the caller refuses on; a basename absent from the index is
+        no longer tracked. A non-integer id is skipped rather than raising, so one
+        malformed record cannot void the whole index.
         """
 
         movies = self._get_json("/api/v3/movie")
-        ids: List[int] = []
+        index: Dict[str, List[int]] = {}
         for movie in movies or []:
             if not isinstance(movie, dict):
                 continue
             movie_file = movie.get("movieFile") or {}
             path = movie_file.get("path") or movie_file.get("relativePath")
-            file_id = movie_file.get("id")
-            if path and file_id is not None and Path(str(path)).name == basename:
-                ids.append(int(file_id))
-        return ids
+            file_id = _as_int(movie_file.get("id"))
+            if path and file_id is not None:
+                index.setdefault(Path(str(path)).name, []).append(file_id)
+        return index
 
     def delete_movie_file(self, file_id: int) -> None:
         """Delete one Radarr-tracked movie file by its ``movieFile`` id.
@@ -268,19 +279,17 @@ class SonarrClient(_ArrClient):
                 names.add(Path(str(path)).name)
         return names
 
-    def resolve_episode_file_ids(self, basename: str) -> List[int]:
-        """Return the Sonarr ``episodeFile`` id(s) whose file basename == ``basename``.
+    def fetch_file_index(self) -> Dict[str, List[int]]:
+        """Map each tracked episode-file basename to its ``episodeFile`` id(s), via
+        the same bounded per-series fan-out the tracked-basename index uses (#34
+        Phase 2).
 
-        Sonarr has no bulk episode-file endpoint, so this fans one
-        ``/api/v3/episodefile`` GET out per series through the same bounded pool
-        the tracked index uses, then keeps the id(s) of any file matching
-        ``basename``. Resolved live at delete time (#34 Phase 2), so the id is
-        re-validated against Sonarr's current state right before the DELETE. As
-        with Radarr the length is the routing signal: ``0`` → gone, ``1`` → the
-        target, ``>1`` → the basename is shared across series and the caller
-        refuses rather than delete the wrong episode. A single worker failure
-        aborts the resolution (the ``ArrClientError`` propagates) rather than
-        returning a partial, misleading set that could hide an ambiguity.
+        The web action layer builds this once per reclaim request, so selecting N
+        tracked episodes costs one library fan-out, not N. As with Radarr, a
+        basename mapping to more than one id (shared across series) is the ambiguity
+        signal the caller refuses on, and an absent basename is no longer tracked. A
+        single worker failure aborts the whole index (the ``ArrClientError``
+        propagates) rather than returning a partial set that could hide an ambiguity.
         """
 
         series_list = self._get_json("/api/v3/series")
@@ -290,37 +299,38 @@ class SonarrClient(_ArrClient):
             if isinstance(series, dict) and series.get("id") is not None
         ]
         if not series_ids:
-            return []
+            return {}
 
-        ids: List[int] = []
+        index: Dict[str, List[int]] = {}
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(_SONARR_MAX_WORKERS, len(series_ids))
         ) as pool:
             futures = [
-                pool.submit(self._episode_file_ids, series_id, basename)
+                pool.submit(self._episode_file_index, series_id)
                 for series_id in series_ids
             ]
             try:
                 for future in concurrent.futures.as_completed(futures):
-                    ids.extend(future.result())
+                    for basename, file_id in future.result():
+                        index.setdefault(basename, []).append(file_id)
             finally:
                 for pending in futures:
                     pending.cancel()
-        return ids
+        return index
 
-    def _episode_file_ids(self, series_id: object, basename: str) -> List[int]:
-        """``episodeFile`` id(s) matching ``basename`` for one series (one GET)."""
+    def _episode_file_index(self, series_id: object) -> List[Tuple[str, int]]:
+        """``(basename, episodeFile id)`` pairs for one series (one GET)."""
 
         files = self._get_json("/api/v3/episodefile", {"seriesId": str(series_id)})
-        ids: List[int] = []
+        pairs: List[Tuple[str, int]] = []
         for episode_file in files or []:
             if not isinstance(episode_file, dict):
                 continue
             path = episode_file.get("path")
-            file_id = episode_file.get("id")
-            if path and file_id is not None and Path(str(path)).name == basename:
-                ids.append(int(file_id))
-        return ids
+            file_id = _as_int(episode_file.get("id"))
+            if path and file_id is not None:
+                pairs.append((Path(str(path)).name, file_id))
+        return pairs
 
     def delete_episode_file(self, file_id: int) -> None:
         """Delete one Sonarr-tracked episode file by its ``episodeFile`` id.

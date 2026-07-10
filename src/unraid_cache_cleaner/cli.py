@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -131,7 +132,7 @@ def run_cleaner(config: Config, command: str) -> int:
                 server.port,
                 "actions enabled" if config.web_actions_enabled else "read-only",
             )
-        except (OSError, OverflowError, ValueError) as exc:
+        except (OSError, OverflowError, ValueError, sqlite3.Error) as exc:
             logger.error(
                 "Web UI failed to start on %s:%s (%s); continuing cleanup without it",
                 config.web_bind_address,
@@ -150,11 +151,12 @@ def run_web(config: Config) -> int:
     logger = logging.getLogger(__name__)
     try:
         server = _build_web_server(config)
-    except (OSError, OverflowError, ValueError) as exc:
-        # A bad bind address or an in-use/out-of-range port must fail with a clear
-        # message, not a raw socket traceback (fail-closed, CLAUDE.md).
+    except (OSError, OverflowError, ValueError, sqlite3.Error) as exc:
+        # A bad bind address, an in-use/out-of-range port, or an unwritable audit
+        # DB must fail with a clear message, not a raw traceback (fail-closed,
+        # CLAUDE.md).
         logger.error(
-            "Web UI failed to bind %s:%s: %s",
+            "Web UI failed to start on %s:%s: %s",
             config.web_bind_address,
             config.web_port,
             exc,

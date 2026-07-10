@@ -82,17 +82,24 @@ class _FakeDeleter:
 
 
 class _FakeArr:
-    """A fake Radarr/Sonarr client recording resolve/delete calls."""
+    """A fake Radarr/Sonarr client recording index/delete calls.
 
-    def __init__(self, ids=None, *, fail_delete=False) -> None:
+    ``ids`` is the basename -> [file id] index; ``index_calls`` proves the action
+    layer builds the index at most once per request rather than per target.
+    """
+
+    def __init__(self, ids=None, *, fail_delete=False, fail_index=False) -> None:
         self._ids = ids or {}
         self._fail_delete = fail_delete
+        self._fail_index = fail_index
         self.deleted: list[int] = []
+        self.index_calls = 0
 
-    def resolve_movie_file_ids(self, basename: str):
-        return list(self._ids.get(basename, []))
-
-    resolve_episode_file_ids = resolve_movie_file_ids
+    def fetch_file_index(self):
+        self.index_calls += 1
+        if self._fail_index:
+            raise ArrClientError("arr index fetch failed")
+        return {name: list(ids) for name, ids in self._ids.items()}
 
     def delete_movie_file(self, file_id: int) -> None:
         if self._fail_delete:
@@ -583,6 +590,59 @@ class ArrRoutingTests(unittest.TestCase):
         self.assertEqual(response.results[0].status, "error")
         self.assertEqual(len(audit.records), 1)
         self.assertEqual(audit.records[0].status, "error")
+
+    def test_arr_index_built_once_for_multiple_targets(self) -> None:
+        # Two tracked copies in one request must share a single index fetch, not
+        # one full-library fan-out per target.
+        keeper = _keeper()
+        g = _group(
+            [
+                keeper,
+                _copy("/lib/a.mkv", 8, media_id=21, association="tracked", arr_tracked="radarr",
+                      parts=[{"part_id": 2, "file": "/lib/a.mkv", "size": 8}]),
+                _copy("/lib/b.mkv", 8, media_id=22, association="tracked", arr_tracked="radarr",
+                      parts=[{"part_id": 3, "file": "/lib/b.mkv", "size": 8}]),
+            ],
+            keeper=keeper,
+        )
+        radarr = _FakeArr({"a.mkv": [1], "b.mkv": [2]})
+        service = _service(_report([g]), radarr=radarr)
+        response = service.reclaim(
+            [ReclaimTarget("900", 2), ReclaimTarget("900", 3)], token="tok", report_generated_at=GEN
+        )
+        self.assertEqual([r.status for r in response.results], ["deleted", "deleted"])
+        self.assertEqual(sorted(radarr.deleted), [1, 2])
+        self.assertEqual(radarr.index_calls, 1)  # one fetch, not one per target
+
+    def test_arr_index_fetch_failure_refused(self) -> None:
+        radarr = _FakeArr({"old.mkv": [55]}, fail_index=True)
+        service = _service(_report([self._tracked_group("radarr")]), radarr=radarr)
+        response = _reclaim(service)
+        self.assertEqual(response.results[0].status, "refused")
+        self.assertEqual(radarr.deleted, [])
+
+    def test_non_numeric_token_is_refused_not_crash(self) -> None:
+        # A hostile non-ASCII token must refuse (403), never raise TypeError.
+        service = _service(_report([]))
+        response = _reclaim(service, token="café")
+        self.assertEqual(response.status_code, 403)
+
+    def test_sibling_stacked_parts_deduped_to_one_result(self) -> None:
+        # Selecting two parts of ONE stacked copy collapses to a single result,
+        # so a dry-run preview never double-counts the copy's bytes.
+        keeper = _keeper()
+        stacked = _copy(
+            "/lib/cd1.mkv", 8, media_id=21, association="unknown",  # unknown -> refused, but deduped first
+            parts=[
+                {"part_id": 2, "file": "/lib/cd1.mkv", "size": 5},
+                {"part_id": 3, "file": "/lib/cd2.mkv", "size": 3},
+            ],
+        )
+        service = _service(_report([_group([keeper, stacked], keeper=keeper)]))
+        response = service.reclaim(
+            [ReclaimTarget("900", 2), ReclaimTarget("900", 3)], token="tok", report_generated_at=GEN
+        )
+        self.assertEqual(len(response.results), 1)  # one copy, one result
 
 
 # --------------------------------------------------------------------------- #

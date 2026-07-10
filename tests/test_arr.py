@@ -560,23 +560,28 @@ class AnnotateEpisodeTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 class ArrMutationTests(unittest.TestCase):
-    def test_radarr_resolve_returns_matching_file_ids(self) -> None:
+    def test_radarr_file_index_maps_basename_to_ids(self) -> None:
         movies = [
             {"tmdbId": 1, "movieFile": {"id": 10, "path": "/movies/A/old.1080.mkv"}},
-            {"tmdbId": 2, "movieFile": {"id": 20, "path": "/movies/B/keep.4k.mkv"}},
+            {"tmdbId": 2, "movieFile": {"relativePath": "keep.4k.mkv", "id": 20}},  # path fallback
         ]
         client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
-        self.assertEqual(client.resolve_movie_file_ids("old.1080.mkv"), [10])
-        self.assertEqual(client.resolve_movie_file_ids("missing.mkv"), [])
+        self.assertEqual(client.fetch_file_index(), {"old.1080.mkv": [10], "keep.4k.mkv": [20]})
 
-    def test_radarr_resolve_reports_ambiguous_basename(self) -> None:
+    def test_radarr_file_index_flags_ambiguous_basename(self) -> None:
         # Two movies with the same basename -> both ids, so the caller refuses.
         movies = [
             {"tmdbId": 1, "movieFile": {"id": 10, "path": "/movies/A/dup.mkv"}},
             {"tmdbId": 2, "movieFile": {"id": 11, "path": "/movies/B/dup.mkv"}},
         ]
         client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
-        self.assertEqual(sorted(client.resolve_movie_file_ids("dup.mkv")), [10, 11])
+        self.assertEqual(sorted(client.fetch_file_index()["dup.mkv"]), [10, 11])
+
+    def test_radarr_file_index_skips_non_numeric_id(self) -> None:
+        # A malformed id is skipped, not raised, so one bad record can't void the index.
+        movies = [{"tmdbId": 1, "movieFile": {"id": "not-a-number", "path": "/m/x.mkv"}}]
+        client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
+        self.assertEqual(client.fetch_file_index(), {})
 
     def test_radarr_delete_issues_delete_verb_at_moviefile_path(self) -> None:
         opener = _RecordingOpener(lambda req: b"{}")
@@ -592,7 +597,7 @@ class ArrMutationTests(unittest.TestCase):
             client.delete_movie_file(7)
         self.assertEqual(ctx.exception.status_code, 404)
 
-    def test_sonarr_resolve_returns_matching_file_ids(self) -> None:
+    def test_sonarr_file_index_maps_basename_to_ids(self) -> None:
         series = [{"id": 1}, {"id": 2}]
         files = {
             "1": [{"id": 100, "path": "/tv/A/S01/target.mkv"}],
@@ -607,8 +612,7 @@ class ArrMutationTests(unittest.TestCase):
             return json.dumps(files[sid]).encode("utf-8")
 
         client = _sonarr(_RecordingOpener(responder))
-        self.assertEqual(client.resolve_episode_file_ids("target.mkv"), [100])
-        self.assertEqual(client.resolve_episode_file_ids("nope.mkv"), [])
+        self.assertEqual(client.fetch_file_index(), {"target.mkv": [100], "other.mkv": [200]})
 
     def test_sonarr_delete_issues_delete_verb_at_episodefile_path(self) -> None:
         opener = _RecordingOpener(lambda req: b"{}")

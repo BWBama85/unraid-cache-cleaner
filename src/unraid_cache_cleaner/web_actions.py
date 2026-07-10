@@ -354,25 +354,49 @@ class ReclaimService:
             index = build_action_index(payload)
             results: List[ReclaimResult] = []
             seen: Set[Tuple[str, int]] = set()
+            seen_copies: Set[int] = set()
+            # One *arr file index per backend per request (built lazily), so a
+            # multi-target reclaim resolves every selected basename against a single
+            # fetch instead of one full-library fan-out per part per target.
+            arr_index_cache: Dict[str, Dict[str, List[int]]] = {}
             for target in targets:
                 key = (target.rating_key, target.part_id)
                 if key in seen:  # a duplicate target is a no-op, not a double delete
                     continue
                 seen.add(key)
-                results.append(self._reclaim_one(target, index))
+                try:
+                    result = self._reclaim_one(target, index, seen_copies, arr_index_cache)
+                except Exception:  # noqa: BLE001 — one bad target must not crash the request
+                    LOGGER.warning("reclaim of %s failed unexpectedly", key, exc_info=True)
+                    result = self._refused(target, "", "internal error while processing this target")
+                if result is not None:
+                    results.append(result)
 
         self._log_summary(results)
         return ReclaimResponse(200, True, self.dry_run, "", results)
 
     # -- per-target ---------------------------------------------------------- #
 
-    def _reclaim_one(self, target: ReclaimTarget, index: _ActionIndex) -> ReclaimResult:
+    def _reclaim_one(
+        self,
+        target: ReclaimTarget,
+        index: _ActionIndex,
+        seen_copies: Set[int],
+        arr_index_cache: Dict[str, Dict[str, List[int]]],
+    ) -> Optional[ReclaimResult]:
         if not target.rating_key or target.part_id == 0:
             return self._refused(target, "", "invalid target id (empty rating_key or zero part_id)")
 
         entry, error = index.lookup(target)
         if error is not None or entry is None:
             return self._refused(target, "", error or "target not found")
+
+        # A logical copy shares one entry object across its parts. If an earlier
+        # target already reclaimed this copy (a different part of the same stacked
+        # copy), skip the sibling rather than re-deleting or double-counting it.
+        if id(entry) in seen_copies:
+            return None
+        seen_copies.add(id(entry))
 
         if not entry.group_has_keeper:
             return self._refused(target, "", "group has no authoritative keeper; not reclaimable")
@@ -394,7 +418,7 @@ class ReclaimService:
         if entry.association == arr.UNTRACKED:
             return self._reclaim_filesystem(target, entry)
         if entry.association == arr.TRACKED:
-            return self._reclaim_arr(target, entry)
+            return self._reclaim_arr(target, entry, arr_index_cache)
         return self._refused(target, "", f"unsupported association {entry.association!r}")
 
     # -- filesystem backend -------------------------------------------------- #
@@ -515,7 +539,12 @@ class ReclaimService:
 
     # -- *arr backend -------------------------------------------------------- #
 
-    def _reclaim_arr(self, target: ReclaimTarget, entry: _CopyEntry) -> ReclaimResult:
+    def _reclaim_arr(
+        self,
+        target: ReclaimTarget,
+        entry: _CopyEntry,
+        arr_index_cache: Dict[str, Dict[str, List[int]]],
+    ) -> ReclaimResult:
         backend = entry.arr_tracked or ""
         client = self._arr_client(backend)
         if client is None:
@@ -523,15 +552,18 @@ class ReclaimService:
                 target, backend, f"{backend or 'arr'} client is not configured for actions"
             )
 
-        # Prevalidate: resolve each part's file id live (TOCTOU) and require exactly
-        # one match, so a stale/ambiguous id is refused before any DELETE.
+        # Build the *arr's basename -> file-id index once per request (cached per
+        # backend), then resolve every part against it — a stale/ambiguous id is
+        # refused before any DELETE (TOCTOU: the index is live *arr state).
+        try:
+            file_index = self._arr_file_index(backend, client, arr_index_cache)
+        except ArrClientError as exc:
+            return self._refused(target, backend, f"could not query {backend}: {exc}")
+
         resolved: List[Tuple[int, Path, int]] = []
         for part in entry.parts:
             basename = part.plex_path.name
-            try:
-                ids = self._resolve_arr_ids(client, backend, basename)
-            except ArrClientError as exc:
-                return self._refused(target, backend, f"could not resolve {basename} in {backend}: {exc}")
+            ids = file_index.get(basename, [])
             if not ids:
                 return self._refused(
                     target, backend, f"no {backend} file matches {basename} (already removed?)"
@@ -589,10 +621,17 @@ class ReclaimService:
         return None
 
     @staticmethod
-    def _resolve_arr_ids(client: object, backend: str, basename: str) -> List[int]:
-        if backend == arr.RADARR:
-            return list(client.resolve_movie_file_ids(basename))  # type: ignore[attr-defined]
-        return list(client.resolve_episode_file_ids(basename))  # type: ignore[attr-defined]
+    def _arr_file_index(
+        backend: str, client: object, cache: Dict[str, Dict[str, List[int]]]
+    ) -> Dict[str, List[int]]:
+        """The backend's basename -> [file id] index, fetched at most once per
+        request. May raise ``ArrClientError`` (fail-closed) on an *arr outage."""
+
+        index = cache.get(backend)
+        if index is None:
+            index = client.fetch_file_index()  # type: ignore[attr-defined]
+            cache[backend] = index
+        return index
 
     @staticmethod
     def _delete_arr(client: object, backend: str, file_id: int) -> None:
@@ -665,9 +704,17 @@ class ReclaimService:
 
 
 def _token_ok(supplied: Optional[str], configured: str) -> bool:
-    """Constant-time token comparison (never leaks length via early exit)."""
+    """Constant-time token comparison (never leaks length via early exit).
 
-    return bool(supplied) and hmac.compare_digest(str(supplied), configured)
+    Compares UTF-8 bytes, not ``str``: ``hmac.compare_digest`` raises ``TypeError``
+    on a ``str`` containing non-ASCII, which — since a client controls the token —
+    would otherwise crash the request thread on a hostile token rather than simply
+    refuse it.
+    """
+
+    if not supplied:
+        return False
+    return hmac.compare_digest(str(supplied).encode("utf-8"), configured.encode("utf-8"))
 
 
 def _generation_matches(client_value: Optional[object], report_value: object) -> bool:
