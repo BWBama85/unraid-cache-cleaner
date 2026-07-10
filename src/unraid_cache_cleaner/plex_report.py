@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -389,6 +390,15 @@ class PlexDuplicateReporter:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(data)
+            # mkstemp creates the temp 0600 (owner-only); publishing that would
+            # make the report unreadable to a separate web-container/host reader.
+            # Preserve the existing report's mode, or fall back to a readable
+            # default for the first write.
+            try:
+                mode = stat.S_IMODE(target.stat().st_mode)
+            except FileNotFoundError:
+                mode = 0o644
+            os.chmod(tmp, mode)
             os.replace(tmp, target)
         finally:
             # After a successful replace the temp is already consumed; this only

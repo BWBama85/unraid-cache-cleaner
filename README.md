@@ -354,10 +354,13 @@ docker run --rm ghcr.io/bwbama85/unraid-cache-cleaner:latest scan
 
 To serve the [read-only duplicate-report viewer](#web-gui-for-the-duplicate-report),
 run the `web` command and publish the port (the report must already exist under
-`/config`):
+`/config`). Set `WEB_BIND_ADDRESS=0.0.0.0` so the server listens on the
+container's published interface — the default is loopback-only, which a mapped
+host port cannot reach:
 
 ```bash
 docker run --rm -p 8080:8080 \
+  -e WEB_BIND_ADDRESS=0.0.0.0 \
   -v /mnt/user/appdata/unraid-cache-cleaner:/config \
   ghcr.io/bwbama85/unraid-cache-cleaner:latest web
 ```

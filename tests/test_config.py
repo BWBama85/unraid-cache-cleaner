@@ -229,6 +229,19 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.web_bind_address, "127.0.0.1")
                 self.assertEqual(config.web_port, 8080)
 
+    def test_web_bind_blank_falls_back_to_loopback(self) -> None:
+        # A present-but-blank WEB_BIND_ADDRESS (env-file `WEB_BIND_ADDRESS=`) must
+        # not become "" (which binds all interfaces); it falls back to loopback.
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            for blank in ("", "   "):
+                with mock.patch.dict(os.environ, {**base, "WEB_BIND_ADDRESS": blank}, clear=True):
+                    self.assertEqual(Config.from_env().web_bind_address, "127.0.0.1")
+
     def test_web_env_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             env = {

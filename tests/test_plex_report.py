@@ -388,6 +388,25 @@ class ReporterTests(unittest.TestCase):
             leftovers = list(target.parent.glob(f"{target.name}.*.tmp"))
             self.assertEqual(leftovers, [])
 
+    def test_write_report_publishes_readable_mode(self) -> None:
+        # The atomic writer uses mkstemp (0600); the published report must be
+        # readable (not owner-only) so a separate web-container/host reader can
+        # consume it, and must preserve an operator's existing mode on rewrite.
+        import stat as _stat
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._full_client())
+            target = reporter.config.plex_duplicate_report_path
+
+            reporter.write_report(reporter.generate())  # first write, no prior file
+            first_mode = _stat.S_IMODE(target.stat().st_mode)
+            self.assertTrue(first_mode & 0o044, oct(first_mode))  # group/other readable
+
+            target.chmod(0o640)  # operator narrows the mode
+            reporter.write_report(reporter.generate())  # rewrite must preserve it
+            self.assertEqual(_stat.S_IMODE(target.stat().st_mode), 0o640)
+
     def test_table_has_three_section_headers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

@@ -189,7 +189,10 @@ class Config:
             extract_protect_seconds=_parse_int(os.getenv("EXTRACT_PROTECT_SECONDS"), 86400),
             http_max_attempts=_parse_int(os.getenv("HTTP_MAX_ATTEMPTS"), 1),
             web_enabled=_parse_bool(os.getenv("WEB_ENABLED"), False),
-            web_bind_address=os.getenv("WEB_BIND_ADDRESS", "127.0.0.1"),
+            # A blank value (WEB_BIND_ADDRESS= in an env file) must fall back to
+            # loopback, not "" — ThreadingHTTPServer(("", port)) binds all
+            # interfaces, which would silently defeat the fail-closed default.
+            web_bind_address=(os.getenv("WEB_BIND_ADDRESS") or "").strip() or "127.0.0.1",
             web_port=_parse_int(os.getenv("WEB_PORT"), 8080),
         )
         config.ensure_directories()
