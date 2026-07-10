@@ -63,6 +63,29 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(config.report_path.parent.exists())
                 self.assertTrue(config.plex_duplicate_report_path.parent.exists())
 
+    def test_http_max_attempts_defaults_to_single_attempt(self) -> None:
+        # Retries are opt-in: unset ⇒ 1 attempt, preserving the historical
+        # single-try behavior for every service client.
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(Config.from_env().http_max_attempts, 1)
+
+    def test_http_max_attempts_parsed_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+                "HTTP_MAX_ATTEMPTS": "3",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(Config.from_env().http_max_attempts, 3)
+
     def test_plex_defaults_when_unset(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             env = {

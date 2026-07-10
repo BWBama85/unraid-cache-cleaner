@@ -92,6 +92,56 @@ class RedirectSafetyTests(unittest.TestCase):
         self.assertEqual(followed.get_header("Referer"), "http://qbt:8080")
 
 
+class RetryTests(unittest.TestCase):
+    """Inherited JsonHttpClient retry, exercised through the real qBittorrent flow."""
+
+    @staticmethod
+    def _client(responder, *, max_attempts):
+        client = QbittorrentClient(
+            "http://qbt:8080", "admin", "secret", max_attempts=max_attempts
+        )
+        client.backoff_seconds = 0  # no real waiting in tests
+        client._slept = []
+        client._sleep = client._slept.append
+        fake = _FakeHTTPHandler(responder)
+        client._opener.add_handler(fake)
+        return client
+
+    def test_login_post_is_never_retried(self) -> None:
+        # A 5xx on the login POST must not be replayed even with retries enabled —
+        # re-POSTing a credential is not idempotent.
+        posts = {"n": 0}
+
+        def responder(req):
+            if req.get_method() == "POST":
+                posts["n"] += 1
+                return _FakeHTTPResponse(503, "", b"busy")
+            return _FakeHTTPResponse(200, "Content-Type: application/json\n", b"[]")
+
+        client = self._client(responder, max_attempts=3)
+        with self.assertRaises(QbittorrentClientError) as ctx:
+            client.fetch_torrents()  # calls login() first
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(posts["n"], 1)  # login attempted exactly once
+        self.assertEqual(client._slept, [])  # no backoff for a POST
+
+    def test_get_torrents_retries_5xx_then_succeeds(self) -> None:
+        state = {"info": 0}
+
+        def responder(req):
+            if req.get_method() == "POST":
+                return _FakeHTTPResponse(200, _LOGIN_HEADERS, b"Ok.")
+            state["info"] += 1
+            if state["info"] == 1:
+                return _FakeHTTPResponse(503, "", b"busy")
+            return _FakeHTTPResponse(200, "Content-Type: application/json\n", b"[]")
+
+        client = self._client(responder, max_attempts=3)
+        self.assertEqual(client.fetch_torrents(), [])
+        self.assertEqual(state["info"], 2)  # the GET was retried once
+        self.assertEqual(client._slept, [0])
+
+
 class LoginTests(unittest.TestCase):
     def _client(self) -> QbittorrentClient:
         return QbittorrentClient("http://qbt:8080", "admin", "secret")

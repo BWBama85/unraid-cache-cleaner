@@ -84,6 +84,16 @@ class Config:
     state_db_path: Path
     report_path: Path
     log_level: str
+    # Bounded retry-with-backoff shared by every read-oriented service HTTP client
+    # (qBittorrent/Plex/Radarr/Sonarr) via the JsonHttpClient base. This is the
+    # total number of attempts per idempotent (GET/HEAD) request: 1 = single
+    # attempt / retries off (the historical default, so behavior is unchanged
+    # until an operator opts in). Raise it (e.g. 3) so a transient 5xx or
+    # connection blip on a LAN call is retried instead of failing the whole
+    # read-only report on the first hiccup. A non-idempotent POST (qBittorrent's
+    # login) is never retried. Appended with a default so existing Config(...)
+    # calls and from_env keep working.
+    http_max_attempts: int = 1
     # Plex duplicate report (in progress, #4). Inert until the plex-duplicates
     # subcommand (#7) consumes them; appended with defaults so existing
     # Config(...) calls and from_env keep working.
@@ -145,6 +155,7 @@ class Config:
             state_db_path=Path(os.getenv("STATE_DB_PATH", "/config/state.sqlite3")),
             report_path=Path(os.getenv("REPORT_PATH", "/config/last-run.json")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            http_max_attempts=_parse_int(os.getenv("HTTP_MAX_ATTEMPTS"), 1),
             plex_url=os.getenv("PLEX_URL", ""),
             plex_token=os.getenv("PLEX_TOKEN", ""),
             plex_sections=_parse_str_list(os.getenv("PLEX_SECTIONS")),

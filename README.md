@@ -96,9 +96,10 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `DELETE_EMPTY_DIRS` | `true` | Remove empty directories after file deletion |
 | `PROTECT_SINGLE_FILE_PARENT_DIRS` | `true` | Protect dedicated subdirs that contain tracked single-file torrents |
 | `EXCLUDED_GLOBS` | _(adds to defaults)_ | Extra basename or full-path glob patterns to skip, merged with the built-in defaults |
-| `STATE_DB_PATH` | `/config/state.sqlite3` | SQLite state database |
+| `STATE_DB_PATH` | `/config/state.sqlite3` | SQLite state database (WAL mode; also creates `-wal`/`-shm` sidecar files alongside it) |
 | `REPORT_PATH` | `/config/last-run.json` | JSON summary of the last run |
 | `LOG_LEVEL` | `INFO` | Python log level |
+| `HTTP_MAX_ATTEMPTS` | `1` | Attempts per idempotent (GET/HEAD) request to qBittorrent/Plex/Radarr/Sonarr. `1` = no retry (default); raise it (e.g. `3`) to retry a transient 5xx / connection blip with exponential backoff instead of failing the read on the first hiccup. A non-idempotent POST (qBittorrent login) is never retried |
 | `EXTRACT_ENABLED` | `false` | Enable [RAR extraction](#rar-extraction) in the `scan`/`service` cycle and the `extract` subcommand (opt-in; extraction mutates) |
 | `EXTRACT_TOOL` | `unar` | Archive binary name or full path (`lsar` is derived from it for the integrity test) |
 | `EXTRACT_OWNER` | empty | Numeric `uid:gid` for a best-effort chown of extracted files (Unraid = `99:100`); empty skips chown |

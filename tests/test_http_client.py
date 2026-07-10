@@ -13,6 +13,7 @@ import socket
 import sys
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -76,6 +77,22 @@ class _RecordingOpener:
         return _FakeResponse(self._responder(request))
 
 
+class _SequenceOpener:
+    """Yields a scripted outcome per ``open`` call: raise an ``Exception`` or
+    return ``bytes``. Lets a test script "fail twice then succeed"."""
+
+    def __init__(self, outcomes) -> None:
+        self._outcomes = list(outcomes)
+        self.calls = 0
+
+    def open(self, request, timeout=None):
+        self.calls += 1
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return _FakeResponse(outcome)
+
+
 def _http_error(code: int, body: bytes = b"") -> urllib.error.HTTPError:
     return urllib.error.HTTPError("http://demo:9000", code, "err", {}, io.BytesIO(body))
 
@@ -91,6 +108,21 @@ def _client(opener) -> _DemoClient:
     client = _DemoClient("http://demo:9000", "SECRET-TOKEN")
     client._opener = opener
     return client
+
+
+def _retry_client(opener, *, max_attempts):
+    """A ``_DemoClient`` with retries enabled and a recording, no-wait sleeper."""
+
+    slept: list = []
+    client = _DemoClient(
+        "http://demo:9000",
+        "SECRET-TOKEN",
+        max_attempts=max_attempts,
+        backoff_seconds=0.5,
+        sleep=slept.append,
+    )
+    client._opener = opener
+    return client, slept
 
 
 class OpenerConstructionTests(unittest.TestCase):
@@ -172,6 +204,85 @@ class SecretSafetyTests(unittest.TestCase):
         self.assertEqual([urlparse(r.full_url).hostname for r in fake.requests], ["demo"])
         for req in fake.requests:
             self.assertNotIn("evil.example", req.full_url)
+
+
+class RetryTests(unittest.TestCase):
+    _BODY = json.dumps({"ok": True}).encode("utf-8")
+
+    def test_retries_5xx_then_succeeds(self) -> None:
+        opener = _SequenceOpener([_http_error(503, b"busy"), self._BODY])
+        client, slept = _retry_client(opener, max_attempts=3)
+        self.assertEqual(client.get_json("/thing"), {"ok": True})
+        self.assertEqual(opener.calls, 2)
+        self.assertEqual(slept, [0.5])  # one backoff before the successful retry
+
+    def test_retries_connection_error_then_succeeds(self) -> None:
+        opener = _SequenceOpener([urllib.error.URLError("refused"), self._BODY])
+        client, slept = _retry_client(opener, max_attempts=3)
+        self.assertEqual(client.get_json("/thing"), {"ok": True})
+        self.assertEqual(opener.calls, 2)
+
+    def test_retries_read_timeout_then_succeeds(self) -> None:
+        opener = _SequenceOpener([socket.timeout("timed out"), self._BODY])
+        client, slept = _retry_client(opener, max_attempts=3)
+        self.assertEqual(client.get_json("/thing"), {"ok": True})
+        self.assertEqual(opener.calls, 2)
+
+    def test_exhausts_attempts_and_raises_the_final_error(self) -> None:
+        opener = _SequenceOpener(
+            [_http_error(500, b"a"), _http_error(500, b"b"), _http_error(500, b"c")]
+        )
+        client, slept = _retry_client(opener, max_attempts=3)
+        with self.assertRaises(_DemoError) as ctx:
+            client.get_json("/thing")
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertEqual(opener.calls, 3)
+        # Exponential backoff between the three attempts: 0.5, then 1.0.
+        self.assertEqual(slept, [0.5, 1.0])
+
+    def test_does_not_retry_4xx(self) -> None:
+        opener = _SequenceOpener([_http_error(404, b"nope"), self._BODY])
+        client, slept = _retry_client(opener, max_attempts=3)
+        with self.assertRaises(_DemoError) as ctx:
+            client.get_json("/thing")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(opener.calls, 1)  # a 4xx is deterministic — never retried
+        self.assertEqual(slept, [])
+
+    def test_does_not_retry_a_non_idempotent_post(self) -> None:
+        # A POST could be double-applied, so it stays single-attempt even with a
+        # retryable 5xx and max_attempts > 1 (this is what keeps qBittorrent's
+        # login POST safe).
+        opener = _SequenceOpener([_http_error(503, b"busy"), self._BODY])
+        client, slept = _retry_client(opener, max_attempts=3)
+        request = urllib.request.Request("http://demo:9000/login", method="POST")
+        with self.assertRaises(_DemoError):
+            client._read_text(request)
+        self.assertEqual(opener.calls, 1)
+        self.assertEqual(slept, [])
+
+    def test_default_client_makes_a_single_attempt(self) -> None:
+        # max_attempts defaults to 1: retries are opt-in, so a transient failure
+        # surfaces immediately (the historical behavior).
+        opener = _SequenceOpener([urllib.error.URLError("refused"), self._BODY])
+        client = _client(opener)
+        with self.assertRaises(_DemoError):
+            client.get_json("/thing")
+        self.assertEqual(opener.calls, 1)
+
+
+class EnsureJsonObjectTests(unittest.TestCase):
+    def test_returns_a_dict_unchanged(self) -> None:
+        client = _DemoClient("http://demo:9000", "t")
+        payload = {"MediaContainer": {}}
+        self.assertIs(client._ensure_json_object(payload, "/x"), payload)
+
+    def test_non_object_becomes_error_class_naming_the_path(self) -> None:
+        client = _DemoClient("http://demo:9000", "t")
+        for payload in ([1, 2, 3], "text", 5):
+            with self.assertRaises(_DemoError) as ctx:
+                client._ensure_json_object(payload, "/library/sections")
+            self.assertIn("non-object JSON body from /library/sections", str(ctx.exception))
 
 
 if __name__ == "__main__":

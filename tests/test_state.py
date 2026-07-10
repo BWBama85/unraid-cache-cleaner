@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.extractor import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW
-from unraid_cache_cleaner.state import StateStore
+from unraid_cache_cleaner.state import _LOCK_RETRY_ATTEMPTS, StateStore
 
 
 class ExtractionLedgerTests(unittest.TestCase):
@@ -278,6 +278,100 @@ class ExtractionLedgerTests(unittest.TestCase):
 
         remaining = self.store.get_protected_extracted_paths(6000.0, protect_seconds=10_000)
         self.assertEqual(remaining, {fresh})
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """WAL journaling + busy-timeout + lock-retry hardening (#45)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _journal_mode(self, store: StateStore) -> str:
+        return store._connection.execute("PRAGMA journal_mode").fetchone()[0].lower()
+
+    def test_wal_enabled_on_a_fresh_db(self) -> None:
+        store = StateStore(Path(self._tmp.name) / "fresh.sqlite3")
+        self.assertEqual(self._journal_mode(store), "wal")
+
+    def test_wal_enabled_on_an_existing_legacy_db(self) -> None:
+        db = Path(self._tmp.name) / "legacy.sqlite3"
+        legacy = sqlite3.connect(db)
+        legacy.execute(
+            """
+            CREATE TABLE extractions (
+                archive_path TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                claimed_at REAL NOT NULL,
+                extracted_at REAL
+            )
+            """
+        )
+        legacy.commit()
+        legacy.close()
+        store = StateStore(db)
+        self.assertEqual(self._journal_mode(store), "wal")
+
+    def test_claim_retries_through_a_lock_held_by_a_concurrent_writer(self) -> None:
+        # #45: a claim racing a slow complete (which holds the write lock) must
+        # wait/retry and win rather than surfacing a spurious 'failed'.
+        db = Path(self._tmp.name) / "contended.sqlite3"
+        bootstrap = StateStore(db)  # create schema + WAL, then drop the connection
+        bootstrap._connection.close()
+
+        released: list = []
+
+        def releasing_sleep(_delay: float) -> None:
+            # Model the slow complete finishing: free the write lock on the first
+            # retry so the replayed claim transaction can win.
+            if not released:
+                blocker.rollback()
+                released.append(True)
+
+        # busy_timeout=0 → the held lock raises 'database is locked' immediately
+        # instead of blocking, so the retry path is exercised deterministically.
+        store = StateStore(db, busy_timeout_seconds=0, sleep=releasing_sleep)
+
+        blocker = sqlite3.connect(db, timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute(
+            "INSERT INTO extractions (archive_path, status, claimed_at) VALUES (?, 'claimed', ?)",
+            ("/data/other.rar", 1.0),
+        )
+
+        result = store.claim_extraction(Path("/data/movie.rar"), 1.0, size=1, mtime=1.0)
+        self.assertEqual(result.decision, CLAIM_NEW)
+        self.assertTrue(released)  # a retry actually happened
+        blocker.close()
+
+    def test_retry_on_locked_reraises_after_exhausting_attempts(self) -> None:
+        store = StateStore(Path(self._tmp.name) / "s.sqlite3")
+        slept: list = []
+        store._sleep = slept.append
+
+        def always_locked() -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            store._retry_on_locked(always_locked)
+        # One backoff between each of the bounded attempts, none after the last.
+        self.assertEqual(len(slept), _LOCK_RETRY_ATTEMPTS - 1)
+
+    def test_retry_on_locked_does_not_retry_a_non_lock_error(self) -> None:
+        # A real programming error (bad SQL) must surface immediately, not be
+        # retried into a delay/hang.
+        store = StateStore(Path(self._tmp.name) / "s.sqlite3")
+        slept: list = []
+        store._sleep = slept.append
+
+        def bad_sql() -> None:
+            raise sqlite3.OperationalError("no such table: bogus")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            store._retry_on_locked(bad_sql)
+        self.assertEqual(slept, [])
 
 
 if __name__ == "__main__":

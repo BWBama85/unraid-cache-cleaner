@@ -24,14 +24,28 @@ Stdlib-only and 3.9-compatible, matching the rest of the package.
 from __future__ import annotations
 
 import json
+import logging
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Optional, Sequence, Tuple, Type
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 from . import USER_AGENT
 from .http_redirect import build_handler
+
+LOGGER = logging.getLogger(__name__)
+
+#: HTTP methods a transient-failure retry is allowed to replay. Only idempotent
+#: reads qualify: replaying a mutating call (qBittorrent's form-POST login) could
+#: double-apply it, so a POST is always single-attempt regardless of
+#: ``max_attempts``.
+_RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
+
+#: Base backoff between retries; the delay grows exponentially per attempt
+#: (``base``, ``base*2``, ...). Kept small since the target is a LAN service.
+_DEFAULT_BACKOFF_SECONDS = 0.5
 
 
 class JsonHttpError(RuntimeError):
@@ -73,10 +87,19 @@ class JsonHttpClient:
         *,
         timeout_seconds: int,
         verify_tls: bool,
+        max_attempts: int = 1,
+        backoff_seconds: float = _DEFAULT_BACKOFF_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.verify_tls = verify_tls
+        # ``max_attempts`` is the total tries per idempotent request (1 = the
+        # historical single-attempt behavior, i.e. retries off). Clamped to >= 1
+        # so a misconfigured 0/negative never disables the request entirely.
+        self.max_attempts = max(1, max_attempts)
+        self.backoff_seconds = backoff_seconds
+        self._sleep = sleep
         self._opener = self._build_opener()
 
     # -- subclass hooks ----------------------------------------------------- #
@@ -161,17 +184,48 @@ class JsonHttpClient:
         Every transport failure is normalized onto ``error_class`` via the
         ``_on_*_error`` hooks. ``HTTPError`` is a subclass of ``URLError`` which
         is a subclass of ``OSError``, so the ``except`` order is significant.
+
+        A transient transport failure — a 5xx response, a connect-phase
+        ``URLError``, or a read-phase ``OSError`` (timeout / dropped connection) —
+        is retried up to :attr:`max_attempts` times with exponential backoff, but
+        *only* for an idempotent method (:data:`_RETRYABLE_METHODS`): replaying a
+        POST could double-apply it, so qBittorrent's login stays single-attempt.
+        A 4xx is never retried (it is deterministic and, for qBittorrent's 403,
+        drives the one-shot reauth). When the attempts are exhausted the mapped
+        ``error_class`` from the final failure propagates unchanged.
         """
 
-        try:
-            with self._opener.open(request, timeout=self.timeout_seconds) as response:
-                return response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raise self._on_http_error(exc) from exc
-        except urllib.error.URLError as exc:
-            raise self._on_url_error(exc) from exc
-        except OSError as exc:
-            raise self._on_os_error(exc) from exc
+        idempotent = request.get_method() in _RETRYABLE_METHODS
+        attempt = 1
+        while True:
+            try:
+                with self._opener.open(request, timeout=self.timeout_seconds) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                mapped, cause = self._on_http_error(exc), exc
+                retryable = idempotent and exc.code >= 500
+            except urllib.error.URLError as exc:
+                mapped, cause = self._on_url_error(exc), exc
+                retryable = idempotent
+            except OSError as exc:
+                mapped, cause = self._on_os_error(exc), exc
+                retryable = idempotent
+
+            if retryable and attempt < self.max_attempts:
+                delay = self.backoff_seconds * (2 ** (attempt - 1))
+                LOGGER.debug(
+                    "%s request to %s failed (attempt %s/%s), retrying in %.2fs: %s",
+                    self.service_name,
+                    request.get_full_url(),
+                    attempt,
+                    self.max_attempts,
+                    delay,
+                    cause,
+                )
+                self._sleep(delay)
+                attempt += 1
+                continue
+            raise mapped from cause
 
     def _get_json(
         self,
@@ -198,3 +252,22 @@ class JsonHttpClient:
             raise self.error_class(
                 f"{self.service_name} returned invalid JSON from {api_path}: {exc}"
             ) from exc
+
+    def _ensure_json_object(self, payload: object, api_path: str) -> dict:
+        """Assert a decoded JSON body is an object, else raise ``error_class``.
+
+        :meth:`_get_json` returns whatever the endpoint sent — an object *or* a
+        top-level array. Callers that require an object (Plex, whose responses are
+        all ``{"MediaContainer": ...}``) route the decoded value through here so a
+        non-object body surfaces as the client's ``*ClientError`` naming
+        ``api_path``, rather than an ``AttributeError`` on a later ``.get(...)``.
+        ``arr`` endpoints, which legitimately return top-level lists, keep calling
+        :meth:`_get_json` directly and are unaffected.
+        """
+
+        if not isinstance(payload, dict):
+            raise self.error_class(
+                f"{self.service_name} returned a non-object JSON body from {api_path} "
+                f"(expected an object, got {type(payload).__name__})"
+            )
+        return payload

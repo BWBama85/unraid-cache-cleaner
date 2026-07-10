@@ -41,12 +41,18 @@ class QbittorrentClient(JsonHttpClient):
         *,
         timeout_seconds: int = 15,
         verify_tls: bool = True,
+        max_attempts: int = 1,
     ) -> None:
         self.username = username
         self.password = password
         self._cookie_jar = CookieJar()
         self._authenticated = False
-        super().__init__(base_url, timeout_seconds=timeout_seconds, verify_tls=verify_tls)
+        super().__init__(
+            base_url,
+            timeout_seconds=timeout_seconds,
+            verify_tls=verify_tls,
+            max_attempts=max_attempts,
+        )
 
     def _extra_handlers(self) -> Sequence[urllib.request.BaseHandler]:
         return (urllib.request.HTTPCookieProcessor(self._cookie_jar),)

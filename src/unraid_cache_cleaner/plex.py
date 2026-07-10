@@ -43,11 +43,17 @@ class PlexClient(JsonHttpClient):
         *,
         timeout_seconds: int = 30,
         verify_tls: bool = True,
+        max_attempts: int = 1,
     ) -> None:
         if not base_url or not token:
             raise PlexClientError("PLEX_URL and PLEX_TOKEN are required")
         self.token = token
-        super().__init__(base_url, timeout_seconds=timeout_seconds, verify_tls=verify_tls)
+        super().__init__(
+            base_url,
+            timeout_seconds=timeout_seconds,
+            verify_tls=verify_tls,
+            max_attempts=max_attempts,
+        )
 
     def _auth_headers(self) -> Sequence[Tuple[str, str]]:
         return (("X-Plex-Token", self.token), ("Accept", "application/json"))
@@ -74,7 +80,13 @@ class PlexClient(JsonHttpClient):
         if container_size is not None:
             extra_headers["X-Plex-Container-Size"] = str(container_size)
 
-        return super()._get_json(api_path, params, extra_headers=extra_headers)
+        # Every Plex endpoint returns a ``{"MediaContainer": ...}`` object; a
+        # top-level array (or other non-object) would make the callers'
+        # ``.get("MediaContainer", {})`` raise a bare AttributeError that the 404
+        # handler in fetch_duplicates would not catch. Enforce the object shape
+        # here so it surfaces as PlexClientError naming the endpoint instead.
+        payload = super()._get_json(api_path, params, extra_headers=extra_headers)
+        return self._ensure_json_object(payload, api_path)
 
     def fetch_sections(self) -> List[PlexSection]:
         """Return the Plex library sections."""
