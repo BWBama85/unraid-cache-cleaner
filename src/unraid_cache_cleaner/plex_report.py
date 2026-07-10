@@ -93,6 +93,14 @@ class PlexDuplicateReporter:
         self.radarr_client = radarr_client
         self.sonarr_client = sonarr_client
         self.clock = clock
+        # Per-report memo of each group's best-first ranking (see _ranked_pairs),
+        # keyed by object identity and scoped to one report (via _begin_render) so
+        # the JSON, log, and table outputs of a single command share one ranking
+        # per group instead of re-ranking in each.
+        self._rank_cache: Dict[
+            int, Tuple[DuplicateGroup, List[Tuple[MediaCopy, List[MediaCopy]]]]
+        ] = {}
+        self._rank_cache_report: Optional[DuplicateReport] = None
 
     @property
     def _arr_enabled(self) -> bool:
@@ -212,8 +220,45 @@ class PlexDuplicateReporter:
         # serialize byte-identically.
         return (-group.reclaimable_bytes, group.kind, group.rating_key)
 
-    def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
+    def _begin_render(self, report: DuplicateReport) -> None:
+        """Point the ranking memo at ``report``, clearing it only when the report
+        changes.
+
+        A single command renders one report three times — ``write_report`` ->
+        ``build_payload``, then ``log_report``, then ``render_table`` — so scoping
+        the memo to the report object (not resetting it per output method) ranks
+        every group exactly once across all three outputs (#19). A later,
+        different report starts fresh, so no stale ranking is ever reused."""
+
+        if self._rank_cache_report is not report:
+            self._rank_cache = {}
+            self._rank_cache_report = report
+
+    def _ranked_pairs(
+        self, group: DuplicateGroup
+    ) -> List[Tuple[MediaCopy, List[MediaCopy]]]:
+        """``dedupe.rank_copies_with_parts(group)``, memoized per report.
+
+        The JSON body, the reclaimable rows (count + #48 part sub-rows), the arr
+        tag, the arr-tracked rows, and the arr-tracked count each need a group's
+        best-first ranking; without memoization one group is stack-merged and
+        sorted five-plus times per render, and re-ranked again by each of the
+        three command outputs (#19). Keyed by object identity — ``DuplicateGroup``
+        carries an unhashable ``external_ids`` dict *and* a Plex ``rating_key``
+        that is ``""`` when the item omits it (so it can't key uniquely) — with a
+        strong reference held so a live entry's ``id()`` can never be recycled by
+        another group, re-validated against the stored group for defence in depth.
+        """
+
+        cached = self._rank_cache.get(id(group))
+        if cached is not None and cached[0] is group:
+            return cached[1]
         pairs = dedupe.rank_copies_with_parts(group)
+        self._rank_cache[id(group)] = (group, pairs)
+        return pairs
+
+    def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
+        pairs = self._ranked_pairs(group)
 
         if group.classification == dedupe.MISMATCH:
             # A mismatch group's copies are the *physical* files (stacks NOT
@@ -251,6 +296,7 @@ class PlexDuplicateReporter:
     def build_payload(self, report: DuplicateReport) -> dict:
         """Return the stable JSON payload for ``report`` (also used by tests)."""
 
+        self._begin_render(report)
         summary = self._summary(report)
         include_arr = report.arr_enabled
         payload: dict = {
@@ -281,20 +327,18 @@ class PlexDuplicateReporter:
             )
         return payload
 
-    @staticmethod
-    def _reclaim_candidates(group: DuplicateGroup) -> List[MediaCopy]:
+    def _reclaim_candidates(self, group: DuplicateGroup) -> List[MediaCopy]:
         """The copies a reclaim would delete: every logical copy but the keeper."""
 
-        return dedupe.rank_copies(group)[1:]
+        return [logical for logical, _ in self._ranked_pairs(group)][1:]
 
-    @staticmethod
     def _reclaim_candidates_with_parts(
-        group: DuplicateGroup,
+        self, group: DuplicateGroup
     ) -> List[Tuple[MediaCopy, List[MediaCopy]]]:
         """Reclaim candidates paired with their physical parts, so a stacked
         tracked copy can be listed as each of its part files (#17)."""
 
-        return dedupe.rank_copies_with_parts(group)[1:]
+        return self._ranked_pairs(group)[1:]
 
     def _arr_reclaimable_tracked_count(self, report: DuplicateReport) -> int:
         """Count reclaim-candidate copies an *arr tracks (delete ⇒ re-download)."""
@@ -323,6 +367,7 @@ class PlexDuplicateReporter:
         surface even when the scan finds no duplicates and returns early.
         """
 
+        self._begin_render(report)
         for warning in report.warnings:
             LOGGER.warning("%s", warning)
         summary = self._summary(report)
@@ -347,6 +392,7 @@ class PlexDuplicateReporter:
     ) -> str:
         """Render the human-readable, reclaimable-sorted table (pure)."""
 
+        self._begin_render(report)
         summary = self._summary(report)
         scanned = ", ".join(
             f"{section.title} (#{section.key})" for section in report.sections
@@ -426,15 +472,42 @@ class PlexDuplicateReporter:
         shown = groups if limit is None else groups[:limit]
         rows: List[str] = []
         for group in shown:
+            pairs = self._ranked_pairs(group)
             keeper_res = (group.keeper.resolution or "?") if group.keeper else "?"
-            copies = len(dedupe.rank_copies(group))
             tag = self._group_arr_tag(group) if arr_enabled else ""
             rows.append(
                 f"  {_fmt_gib(group.reclaimable_bytes):>10}  "
                 f"{group.classification:<9} {group.kind:<7} "
-                f"keep={keeper_res:<5} copies={copies}  {group.title}{tag}"
+                f"keep={keeper_res:<5} copies={len(pairs)}  {group.title}{tag}"
             )
+            if not arr_enabled:
+                rows.extend(self._reclaimable_part_rows(pairs))
         rows.extend(self._truncation_note(len(groups), len(shown)))
+        return rows
+
+    @staticmethod
+    def _reclaimable_part_rows(
+        pairs: List[Tuple[MediaCopy, List[MediaCopy]]]
+    ) -> List[str]:
+        """Indented part sub-rows for each *stacked* reclaim candidate (#48).
+
+        The compact reclaimable summary hides which physical files a stacked
+        reclaim candidate is made of; this lists each part at its true size so a
+        Plex-only (non-``*arr``) operator sees the same file->size fidelity the
+        JSON already provides. Only non-keeper copies (``pairs[1:]``) with more
+        than one part get sub-rows, so the common single-file case is unchanged.
+        The ``*arr``-enabled run keeps the compact summary — tracked parts already
+        appear in the arr-tracked section — so this runs only when arr is off.
+        """
+
+        rows: List[str] = []
+        for logical, parts in pairs[1:]:
+            if len(parts) > 1:
+                for part in parts:
+                    rows.append(
+                        f"      {_fmt_gib(part.size):>10}  "
+                        f"{(logical.resolution or '?'):<6} {part.file}"
+                    )
         return rows
 
     def _render_arr_rows(

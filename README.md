@@ -151,7 +151,10 @@ writes a JSON report to `PLEX_DUPLICATE_REPORT_PATH` (default
 `/config/plex-duplicates.json`) and prints a reclaimable-sorted table with three
 sections:
 
-- **Reclaimable (safe)** — duplicate/upgrade copies you can safely remove.
+- **Reclaimable (safe)** — duplicate/upgrade copies you can safely remove. On a
+  Plex-only run (no `RADARR_*`/`SONARR_*`), a reclaimable copy that is a
+  **stacked** multi-part release lists each part file at its true size as
+  indented sub-rows; a single-file copy stays a one-line summary.
 - **Review — possible mismatches (not counted)** — items Plex merged from
   *different* titles (e.g. the 1990 and 2014 *TMNT*). These are **never** counted
   as reclaimable; check them by hand. A mis-stacked pair (two different titles
@@ -168,7 +171,8 @@ also lists every part file with its own true size. In the JSON each copy carries
 a `parts` array (`[{file, size}, …]`), always present and single-element for an
 unstacked copy, so an operator auditing the report sees an accurate file→size
 mapping for every physical file rather than only the first part at the summed
-size.
+size. In the printed table the per-part breakdown appears in the mismatch review,
+the arr-tracked section, and — on a Plex-only run — the Reclaimable (safe) section.
 
 Flags:
 
