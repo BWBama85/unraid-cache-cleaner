@@ -130,6 +130,17 @@ class Config:
     # login) is never retried. Appended last, with a default, so existing
     # positional Config(...) calls and from_env keep working.
     http_max_attempts: int = 1
+    # Web GUI for the Plex duplicate report (#34, Phase 1: read-only viewer). The
+    # `web` subcommand serves the on-disk report as a page + JSON API; it never
+    # regenerates the report and exposes no delete/action path (Phase 2 follow-up).
+    # ``web_enabled`` folds that viewer into the long-running ``service`` on a
+    # background thread — default False, so ``service`` gains no listener until an
+    # operator opts in. Binds to loopback by default (fail-closed); the Unraid
+    # template sets 0.0.0.0 so a mapped container port is reachable. Appended with
+    # defaults so existing positional Config(...) calls and from_env keep working.
+    web_enabled: bool = False
+    web_bind_address: str = "127.0.0.1"
+    web_port: int = 8080
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -177,6 +188,12 @@ class Config:
             extract_min_age_seconds=_parse_int(os.getenv("EXTRACT_MIN_AGE_SECONDS"), 300),
             extract_protect_seconds=_parse_int(os.getenv("EXTRACT_PROTECT_SECONDS"), 86400),
             http_max_attempts=_parse_int(os.getenv("HTTP_MAX_ATTEMPTS"), 1),
+            web_enabled=_parse_bool(os.getenv("WEB_ENABLED"), False),
+            # A blank value (WEB_BIND_ADDRESS= in an env file) must fall back to
+            # loopback, not "" — ThreadingHTTPServer(("", port)) binds all
+            # interfaces, which would silently defeat the fail-closed default.
+            web_bind_address=(os.getenv("WEB_BIND_ADDRESS") or "").strip() or "127.0.0.1",
+            web_port=_parse_int(os.getenv("WEB_PORT"), 8080),
         )
         config.ensure_directories()
         return config

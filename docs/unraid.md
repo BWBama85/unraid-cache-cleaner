@@ -113,6 +113,33 @@ A starter XML template is included at [contrib/unraid-cache-cleaner.xml](../cont
 - the correct host paths
 - any `EXCLUDED_GLOBS` needed to keep non-torrent files under the watch root
 
+## Web GUI (read-only Plex duplicate report)
+
+The container can serve the Plex duplicate report as a web page (see the README's
+[Web GUI](../README.md#web-gui-for-the-duplicate-report) section). It is a
+**read-only** viewer — it displays an existing report and never scans or deletes.
+
+To reach it from this Unraid container:
+
+1. Generate a report first (it only *displays* one): run the `plex-duplicates`
+   subcommand — e.g. as a User Scripts cron, or by temporarily setting the
+   container's command to `plex-duplicates` — with `PLEX_URL` + `PLEX_TOKEN` set.
+   The report is written to `PLEX_DUPLICATE_REPORT_PATH` (default
+   `/config/plex-duplicates.json`).
+2. Light up the viewer one of two ways:
+   - **Same container:** set `WEB_ENABLED=true`. The long-running `service` then
+     also serves the viewer on `WEB_PORT` (default `8080`). The template's
+     **WebUI** link points at the mapped port.
+   - **Separate container:** add a second copy of this image with its
+     **Post Arguments** / command set to `web`. Mount the same `/config` so it
+     reads the report the first container wrote.
+3. The template maps host port → container `8080` (**WebUI Port**). Open the
+   container's WebUI, or `http://<unraid-ip>:<mapped-port>/`.
+
+The viewer has no authentication — like qBittorrent/Plex/`*arr`, it assumes a
+trusted LAN. It is read-only, so there is no delete button to misfire; acting on
+duplicates from the browser is a planned, fail-closed follow-up.
+
 ## Common Misconfiguration
 
 ### qBittorrent uses `/data`, cleaner uses `/downloads`

@@ -17,6 +17,7 @@ from .plex_report import PlexDuplicateReporter
 from .qbittorrent import QbittorrentClient, QbittorrentClientError
 from .service import CleanerService
 from .state import StateExtractionLedger, StateStore
+from . import web
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         "extract",
         help="Extract RAR archives in the download path so *arr can import them "
         "(opt-in via EXTRACT_ENABLED; honors DRY_RUN).",
+    )
+    subparsers.add_parser(
+        "web",
+        help="Serve the read-only Plex duplicate report as a web page + JSON API "
+        "(reads the existing report; never scans or deletes).",
     )
 
     plex = subparsers.add_parser(
@@ -92,6 +98,7 @@ def configure_logging(level: str) -> None:
 def run_cleaner(config: Config, command: str) -> int:
     """Run the qBittorrent cleanup ``scan`` / ``service`` commands."""
 
+    logger = logging.getLogger(__name__)
     client = QbittorrentClient(
         config.qbittorrent_url,
         config.qbittorrent_username,
@@ -107,7 +114,59 @@ def run_cleaner(config: Config, command: str) -> int:
     if command == "scan":
         service.run_once()
         return 0
+
+    # Opt-in: fold the read-only viewer into the service on a daemon thread that
+    # only reads a file (#34). A bind failure must NOT take down the core cleanup
+    # loop — the viewer is an optional convenience — so it is logged and skipped.
+    if config.web_enabled:
+        try:
+            server = web.build_server(config)
+            server.start_background()
+            logger.info(
+                "Plex duplicate report viewer listening on http://%s:%s (read-only)",
+                config.web_bind_address,
+                server.port,
+            )
+        except (OSError, OverflowError, ValueError) as exc:
+            logger.error(
+                "Web viewer failed to start on %s:%s (%s); continuing cleanup without it",
+                config.web_bind_address,
+                config.web_port,
+                exc,
+            )
+
     service.serve_forever()
+    return 0
+
+
+def run_web(config: Config) -> int:
+    """Serve the read-only Plex duplicate report web viewer (#34)."""
+
+    logger = logging.getLogger(__name__)
+    try:
+        server = web.build_server(config)
+    except (OSError, OverflowError, ValueError) as exc:
+        # A bad bind address or an in-use/out-of-range port must fail with a clear
+        # message, not a raw socket traceback (fail-closed, CLAUDE.md).
+        logger.error(
+            "Web viewer failed to bind %s:%s: %s",
+            config.web_bind_address,
+            config.web_port,
+            exc,
+        )
+        return 3
+    logger.info(
+        "Plex duplicate report viewer listening on http://%s:%s (read-only; serves %s)",
+        config.web_bind_address,
+        server.port,
+        config.plex_duplicate_report_path,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down web viewer")
+    finally:
+        server.shutdown()
     return 0
 
 
@@ -237,6 +296,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return run_plex_duplicates(config, args)
         if command == "extract":
             return run_extract(config)
+        if command == "web":
+            return run_web(config)
         return run_cleaner(config, command)
     except (QbittorrentClientError, PlexClientError, ArrClientError) as exc:
         logger.error(str(exc))

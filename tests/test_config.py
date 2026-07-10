@@ -212,6 +212,53 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.extract_min_age_seconds, 60)
                 self.assertEqual(config.extract_protect_seconds, 3600)
 
+    def test_web_defaults_are_fail_closed(self) -> None:
+        # #34: the web viewer is opt-in for `service` (web_enabled=False) and
+        # binds to loopback by default (fail-closed); exposing it on the LAN is an
+        # explicit opt-in (the Unraid template sets 0.0.0.0).
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                self.assertFalse(config.web_enabled)
+                self.assertEqual(config.web_bind_address, "127.0.0.1")
+                self.assertEqual(config.web_port, 8080)
+
+    def test_web_bind_blank_falls_back_to_loopback(self) -> None:
+        # A present-but-blank WEB_BIND_ADDRESS (env-file `WEB_BIND_ADDRESS=`) must
+        # not become "" (which binds all interfaces); it falls back to loopback.
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            for blank in ("", "   "):
+                with mock.patch.dict(os.environ, {**base, "WEB_BIND_ADDRESS": blank}, clear=True):
+                    self.assertEqual(Config.from_env().web_bind_address, "127.0.0.1")
+
+    def test_web_env_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+                "WEB_ENABLED": "true",
+                "WEB_BIND_ADDRESS": "127.0.0.1",
+                "WEB_PORT": "9191",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = Config.from_env()
+
+                self.assertTrue(config.web_enabled)
+                self.assertEqual(config.web_bind_address, "127.0.0.1")
+                self.assertEqual(config.web_port, 9191)
+
 
 if __name__ == "__main__":
     unittest.main()

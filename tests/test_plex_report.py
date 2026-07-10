@@ -374,6 +374,39 @@ class ReporterTests(unittest.TestCase):
             # video sections queried with the right Plex item types
             self.assertEqual(client.duplicate_calls, [("1", 1), ("2", 4)])
 
+    def test_write_report_is_atomic(self) -> None:
+        # #34: the report is written via a temp file + os.replace so the web
+        # viewer never reads a truncated file. After a write the target is valid
+        # JSON and no scratch .tmp sibling is left behind.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._full_client())
+            reporter.write_report(reporter.generate())
+
+            target = reporter.config.plex_duplicate_report_path
+            json.loads(target.read_text())  # parses cleanly
+            leftovers = list(target.parent.glob(f"{target.name}.*.tmp"))
+            self.assertEqual(leftovers, [])
+
+    def test_write_report_publishes_readable_mode(self) -> None:
+        # The atomic writer uses mkstemp (0600); the published report must be
+        # readable (not owner-only) so a separate web-container/host reader can
+        # consume it, and must preserve an operator's existing mode on rewrite.
+        import stat as _stat
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._full_client())
+            target = reporter.config.plex_duplicate_report_path
+
+            reporter.write_report(reporter.generate())  # first write, no prior file
+            first_mode = _stat.S_IMODE(target.stat().st_mode)
+            self.assertTrue(first_mode & 0o044, oct(first_mode))  # group/other readable
+
+            target.chmod(0o640)  # operator narrows the mode
+            reporter.write_report(reporter.generate())  # rewrite must preserve it
+            self.assertEqual(_stat.S_IMODE(target.stat().st_mode), 0o640)
+
     def test_table_has_three_section_headers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -635,11 +668,15 @@ class ArrAssociationTests(unittest.TestCase):
             self.assertNotIn("arr_tracked_reclaimable_count", payload["totals"])
             for group in payload["groups"]:
                 for copy in group["copies"]:
-                    # `parts` (the per-file breakdown, #17) is always present; a
-                    # Plex-only run must still carry no arr fields.
+                    # `parts` (the per-file breakdown, #17) and the `media_id` /
+                    # per-part `part_id` delete-target keys (#34) are always
+                    # present; a Plex-only run must still carry no arr fields.
                     self.assertEqual(
-                        set(copy), {"file", "size", "resolution", "bitrate", "parts"}
+                        set(copy),
+                        {"file", "size", "resolution", "bitrate", "media_id", "parts"},
                     )
+                    for part in copy["parts"]:
+                        self.assertEqual(set(part), {"part_id", "file", "size"})
             # table shows the not-configured hint, not a stale placeholder
             table = reporter.render_table(reporter.generate())
             self.assertIn("Not configured", table)
@@ -770,6 +807,27 @@ class StackedRepresentationTests(unittest.TestCase):
             self.assertEqual(
                 {Path(p["file"]).name for p in keeper["parts"]}, {"cd1.mkv", "cd2.mkv"}
             )
+
+    def test_delete_target_keys_surfaced(self) -> None:
+        # #34 Phase 1 prep: each copy carries its Plex `media_id`, and each part
+        # its `part_id`, so the web action layer (Phase 2) has a stable
+        # {rating_key, part_id} delete target — including every part of a stack.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reporter = _reporter(tmp, self._client(_MOVIE_STACKED))
+            group = reporter.build_payload(reporter.generate())["groups"][0]
+
+            self.assertEqual(group["rating_key"], "900")
+            stack = next(c for c in group["copies"] if c["file"].endswith("cd1.mkv"))
+            self.assertEqual(stack["media_id"], 20)
+            self.assertEqual(
+                {p["part_id"]: Path(p["file"]).name for p in stack["parts"]},
+                {201: "cd1.mkv", 202: "cd2.mkv"},
+            )
+
+            single = next(c for c in group["copies"] if c["file"].endswith("single.720.mkv"))
+            self.assertEqual(single["media_id"], 21)
+            self.assertEqual([p["part_id"] for p in single["parts"]], [211])
 
     def test_stacked_json_is_byte_identical_across_runs(self) -> None:
         # #17 acceptance: the richer per-part shape stays deterministic.

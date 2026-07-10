@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
+import tempfile
 import time
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import arr, dedupe
@@ -54,16 +58,27 @@ def _copy_json(
         "size": copy.size,
         "resolution": copy.resolution,
         "bitrate": copy.bitrate,
+        # The Plex ``Media`` id this copy's parts share (0 = ungrouped). Surfaced
+        # so a consumer can address one logical copy — and, with the per-part
+        # ``part_id`` below, one physical file — as a stable delete target: the
+        # web action layer (#34 Phase 2) routes a reclaim by ``{rating_key,
+        # part_id}`` and must remove *all* parts of a stacked copy together.
+        "media_id": copy.media_id,
         # Each physical file backing this copy with its own true size, so a
         # stacked multi-part copy (cd1/cd2 under one Plex media_id) exposes both
         # paths and their individual sizes instead of hiding the siblings behind
         # the first part's path and the summed size (#17). Always present and a
         # single element for an unstacked copy, so a consumer can read
-        # ``copy["parts"]`` unconditionally.
-        "parts": [{"file": str(part.file), "size": part.size} for part in parts],
+        # ``copy["parts"]`` unconditionally. ``part_id`` is the Plex ``Part`` id —
+        # the precise per-file delete target for #34 Phase 2.
+        "parts": [
+            {"part_id": part.part_id, "file": str(part.file), "size": part.size}
+            for part in parts
+        ],
     }
-    # Only serialized when the arr layer ran, so a Plex-only report stays
-    # byte-identical to the pre-#8 shape.
+    # The arr fields are serialized only when the arr layer ran, so a Plex-only
+    # report omits them (the base keys above, including media_id/part_id, are
+    # always present).
     if include_arr:
         payload["association"] = copy.association
         payload["arr_tracked"] = copy.arr_tracked
@@ -318,8 +333,8 @@ class PlexDuplicateReporter:
             "warnings": report.warnings,
             "errors": report.errors,
         }
-        # Added only when the arr layer ran, so a Plex-only report is byte-identical
-        # to the pre-#8 shape.
+        # The arr totals/flag are added only when the arr layer ran, so a Plex-only
+        # report omits them.
         if include_arr:
             payload["arr_enabled"] = True
             payload["totals"]["arr_tracked_reclaimable_count"] = self._arr_reclaimable_tracked_count(
@@ -353,12 +368,45 @@ class PlexDuplicateReporter:
         return count
 
     def write_report(self, report: DuplicateReport) -> None:
-        """Write the duplicate report as stable, ``sort_keys`` JSON."""
+        """Write the duplicate report as stable, ``sort_keys`` JSON.
+
+        Written atomically (unique temp file in the same directory + ``os.replace``)
+        so a concurrent reader — notably the read-only web viewer (#34) polling
+        this file while a scan rewrites it — never observes a truncated or
+        half-written report. ``mkstemp`` gives each writer a unique scratch name,
+        so two writers over one ``/config`` volume (even separate containers, each
+        PID 1) can never share a temp path or unlink each other's; ``os.replace``
+        is atomic within a filesystem, and the temp stays colocated with the
+        target to remain on it.
+        """
 
         payload = self.build_payload(report)
-        self.config.plex_duplicate_report_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True)
+        target = self.config.plex_duplicate_report_path
+        data = json.dumps(payload, indent=2, sort_keys=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=f"{target.name}.", suffix=".tmp"
         )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(data)
+            # mkstemp creates the temp 0600 (owner-only); publishing that would
+            # make the report unreadable to a separate web-container/host reader.
+            # Preserve the existing report's mode, or fall back to a readable
+            # default for the first write.
+            try:
+                mode = stat.S_IMODE(target.stat().st_mode)
+            except FileNotFoundError:
+                mode = 0o644
+            os.chmod(tmp, mode)
+            os.replace(tmp, target)
+        finally:
+            # After a successful replace the temp is already consumed; this only
+            # cleans up our own unique scratch on the write/replace failure path.
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     def log_report(self, report: DuplicateReport) -> None:
         """Emit one compact summary line mirroring ``service.log_report``.

@@ -97,6 +97,30 @@ An optional Radarr/Sonarr association layer that enriches the report with whethe
 
 The join differs by kind, because the two id joins are not equally reliable. **Movies** are *id-anchored*: Plex's `tmdb://` guid is the same TMDB id Radarr keys on, so within a group whose id Radarr tracks, the basename-matching copy is `tracked` and the other redundant copies are `untracked` (safe); if the id is absent, not in Radarr, or no basename matches, every copy is `unknown`. **Episodes** match by *basename only*: Plex's episode `Guid`s are episode-level, not the series TVDB id Sonarr keys on, so a copy whose basename Sonarr tracks is `tracked` and any other copy is `unknown` — never falsely `untracked`. The reporter constructs a client only when both its URL and API key are set; an unconfigured layer leaves the report byte-identical to a Plex-only run, and a configured-but-unreachable `*arr` logs a warning and degrades that kind to `unknown` rather than failing the report.
 
+### `web.py` (read-only viewer)
+
+The project's **first inbound listener** — every other surface is an outbound
+client. A stdlib `ThreadingHTTPServer` + `BaseHTTPRequestHandler` (no
+Flask/FastAPI, per the stdlib-only rule) that serves the on-disk
+`plex_duplicate_report_path` snapshot as a browsable HTML page (`/`) and a JSON
+API (`/api/report`), plus a `/healthz` liveness route. It is rigorously
+read-only: it constructs **no** Plex/`*arr`/qBittorrent/SQLite client and never
+regenerates the report — a page load only reads a file the `plex-duplicates`
+subcommand (or a cron) already wrote, so it can never fan out to Plex. The
+rendering functions are pure over the report dict, and the report is supplied by
+an injectable provider (the default reads the file; tests inject a fake), so the
+server is unit-tested end-to-end on an ephemeral port without any network
+service. Safety envelope: every Plex-supplied string is HTML-escaped, routes are
+explicit (no directory serving/CORS/external assets) under a strict
+`Content-Security-Policy`, every non-`GET` verb is `405`, and a
+missing/truncated/malformed report degrades to an empty-state page rather than a
+`500`. It exposes **no** mutation path — reclaiming duplicates from the browser
+is a separate, fail-closed follow-up (#34 Phase 2). Run it standalone with the
+`web` subcommand, or fold it into the `service` loop on a daemon thread with
+`WEB_ENABLED=true`. To keep concurrent reads safe, `write_report` now publishes
+the report atomically (temp file + `os.replace`), so the viewer never observes a
+half-written file.
+
 ## Failure Model
 
 The service fails closed:
@@ -108,10 +132,10 @@ The service fails closed:
 
 ## Current Scope
 
-This version focuses on safe orphan cleanup for qBittorrent download/cache paths. It does not yet:
+This version focuses on safe orphan cleanup for qBittorrent download/cache paths. It ships a **read-only** web viewer for the Plex duplicate report (`web.py`), but does not yet:
 
 - subscribe to qBittorrent push events
-- expose a web UI
+- let you act on (delete) duplicates from the web UI — the viewer is read-only; the action layer is #34 Phase 2
 - publish metrics
 
 ### Opt-in RAR extraction
