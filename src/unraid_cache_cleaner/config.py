@@ -50,6 +50,35 @@ def _parse_str_list(value: Optional[str]) -> tuple[str, ...]:
     return tuple(part for part in parts if part)
 
 
+def _parse_path_map(value: Optional[str]) -> tuple[tuple[Path, Path], ...]:
+    """Parse ``WEB_MEDIA_PATH_MAP`` into ordered ``(plex_prefix, container_prefix)`` pairs.
+
+    Syntax: comma-separated ``plex_prefix:container_prefix`` entries, e.g.
+    ``/mnt/user/Media:/media,/mnt/user/TV:/tv``. Each entry is split on its FIRST
+    ``:`` so a container path may itself contain none (Linux paths do not use
+    ``:``; this is a Linux-container-only feature). An entry missing either side is
+    skipped rather than raising — a partial map simply leaves the unmatched Plex
+    paths unmapped, and an unmapped filesystem delete is *refused* (fail-closed),
+    never guessed. Order is preserved so a caller can apply longest-prefix
+    precedence deterministically.
+    """
+
+    if value is None or value.strip() == "":
+        return ()
+    pairs: list[tuple[Path, Path]] = []
+    for entry in value.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        plex_prefix, container_prefix = entry.split(":", 1)
+        plex_prefix = plex_prefix.strip()
+        container_prefix = container_prefix.strip()
+        if not plex_prefix or not container_prefix:
+            continue
+        pairs.append((Path(plex_prefix), Path(container_prefix)))
+    return tuple(pairs)
+
+
 def _parse_glob_list(value: Optional[str]) -> tuple[str, ...]:
     user_globs = []
     if value is not None:
@@ -141,6 +170,23 @@ class Config:
     web_enabled: bool = False
     web_bind_address: str = "127.0.0.1"
     web_port: int = 8080
+    # Web action layer (#34, Phase 2): the first *outside-triggered* mutation of
+    # media in this project, so it is fail-closed on every axis. ``web_actions_enabled``
+    # gates the reclaim endpoint entirely (default False → the server stays the
+    # Phase 1 read-only viewer). ``web_actions_dry_run`` reports the would-delete
+    # set and touches nothing (default True, mirroring DRY_RUN). ``web_action_token``
+    # is a shared secret every reclaim request must present (via ``X-Action-Token``
+    # or the form field); enabling actions WITHOUT a token is refused at request
+    # time, so an unauthenticated mutation surface can never be exposed on 0.0.0.0.
+    # ``web_media_path_map`` maps Plex-reported paths to this container's mounts so
+    # a filesystem delete of an *untracked* copy can resolve to a real file — an
+    # unmapped path is refused (the Plex media library is not mounted by default).
+    # Appended with defaults so existing positional Config(...) calls and from_env
+    # keep working.
+    web_actions_enabled: bool = False
+    web_actions_dry_run: bool = True
+    web_action_token: str = ""
+    web_media_path_map: tuple[tuple[Path, Path], ...] = ()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -194,6 +240,10 @@ class Config:
             # interfaces, which would silently defeat the fail-closed default.
             web_bind_address=(os.getenv("WEB_BIND_ADDRESS") or "").strip() or "127.0.0.1",
             web_port=_parse_int(os.getenv("WEB_PORT"), 8080),
+            web_actions_enabled=_parse_bool(os.getenv("WEB_ENABLE_ACTIONS"), False),
+            web_actions_dry_run=_parse_bool(os.getenv("WEB_ACTIONS_DRY_RUN"), True),
+            web_action_token=os.getenv("WEB_ACTION_TOKEN", ""),
+            web_media_path_map=_parse_path_map(os.getenv("WEB_MEDIA_PATH_MAP")),
         )
         config.ensure_directories()
         return config

@@ -32,6 +32,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import urllib.error
+import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -48,6 +49,16 @@ UNKNOWN = "unknown"
 
 RADARR = "radarr"
 SONARR = "sonarr"
+
+
+def _as_int(value: object) -> Optional[int]:
+    """Coerce an ``*arr`` file id to ``int``, or ``None`` if it is not numeric — so
+    a malformed id is skipped rather than raising inside the action layer."""
+
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 class ArrClientError(RuntimeError):
@@ -102,6 +113,25 @@ class _ArrClient(JsonHttpClient):
             )
         return super()._on_http_error(exc)
 
+    def _delete(self, api_path: str) -> None:
+        """Issue a ``DELETE`` against ``api_path`` (the *only* mutation this client
+        makes; used by the web action layer, #34 Phase 2, to reclaim a tracked
+        copy).
+
+        Goes through the same fail-closed opener as every read — so the API key
+        travels as the ``X-Api-Key`` header (never in the URL) and the host-bound
+        redirect guard still refuses a cross-host/TLS-downgrading redirect. The
+        shared base retries only idempotent GET/HEAD (see ``_RETRYABLE_METHODS``),
+        so a timed-out DELETE is *never* auto-replayed: its outcome is ambiguous
+        and the caller audits it as such rather than risking a double delete. A
+        non-2xx response is mapped to :class:`ArrClientError` (carrying its status
+        code, so a 404 for an already-gone file is distinguishable). The success
+        body (an ``*arr`` returns ``{}`` or empty) is read and discarded.
+        """
+
+        request = urllib.request.Request(self._build_url(api_path), method="DELETE")
+        self._read_text(request)
+
 
 class RadarrClient(_ArrClient):
     """Radarr v3 client: TMDB id -> tracked movie-file basenames."""
@@ -129,6 +159,40 @@ class RadarrClient(_ArrClient):
                 continue
             index.setdefault(str(tmdb_id), set()).add(Path(str(path)).name)
         return index
+
+    def fetch_file_index(self) -> Dict[str, List[int]]:
+        """Map each tracked movie-file basename to its ``movieFile`` id(s), from one
+        ``GET /api/v3/movie`` (#34 Phase 2).
+
+        The web action layer builds this once per reclaim request and resolves every
+        selected basename against it — never one request per basename. Resolved live
+        (not from the report), so the id is current Radarr state at delete time. A
+        basename mapping to more than one id (two movies share a filename) is the
+        ambiguity signal the caller refuses on; a basename absent from the index is
+        no longer tracked. A non-integer id is skipped rather than raising, so one
+        malformed record cannot void the whole index.
+        """
+
+        movies = self._get_json("/api/v3/movie")
+        index: Dict[str, List[int]] = {}
+        for movie in movies or []:
+            if not isinstance(movie, dict):
+                continue
+            movie_file = movie.get("movieFile") or {}
+            path = movie_file.get("path") or movie_file.get("relativePath")
+            file_id = _as_int(movie_file.get("id"))
+            if path and file_id is not None:
+                index.setdefault(Path(str(path)).name, []).append(file_id)
+        return index
+
+    def delete_movie_file(self, file_id: int) -> None:
+        """Delete one Radarr-tracked movie file by its ``movieFile`` id.
+
+        This removes the file from disk AND unlinks it in Radarr, so the redundant
+        copy does not immediately re-download (a plain filesystem ``rm`` would).
+        """
+
+        self._delete(f"/api/v3/moviefile/{int(file_id)}")
 
 
 #: Sonarr exposes episode files only per series — ``GET /api/v3/episodefile``
@@ -214,6 +278,68 @@ class SonarrClient(_ArrClient):
             if path:
                 names.add(Path(str(path)).name)
         return names
+
+    def fetch_file_index(self) -> Dict[str, List[int]]:
+        """Map each tracked episode-file basename to its ``episodeFile`` id(s), via
+        the same bounded per-series fan-out the tracked-basename index uses (#34
+        Phase 2).
+
+        The web action layer builds this once per reclaim request, so selecting N
+        tracked episodes costs one library fan-out, not N. As with Radarr, a
+        basename mapping to more than one id (shared across series) is the ambiguity
+        signal the caller refuses on, and an absent basename is no longer tracked. A
+        single worker failure aborts the whole index (the ``ArrClientError``
+        propagates) rather than returning a partial set that could hide an ambiguity.
+        """
+
+        series_list = self._get_json("/api/v3/series")
+        series_ids = [
+            series["id"]
+            for series in series_list or []
+            if isinstance(series, dict) and series.get("id") is not None
+        ]
+        if not series_ids:
+            return {}
+
+        index: Dict[str, List[int]] = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_SONARR_MAX_WORKERS, len(series_ids))
+        ) as pool:
+            futures = [
+                pool.submit(self._episode_file_index, series_id)
+                for series_id in series_ids
+            ]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    for basename, file_id in future.result():
+                        index.setdefault(basename, []).append(file_id)
+            finally:
+                for pending in futures:
+                    pending.cancel()
+        return index
+
+    def _episode_file_index(self, series_id: object) -> List[Tuple[str, int]]:
+        """``(basename, episodeFile id)`` pairs for one series (one GET)."""
+
+        files = self._get_json("/api/v3/episodefile", {"seriesId": str(series_id)})
+        pairs: List[Tuple[str, int]] = []
+        for episode_file in files or []:
+            if not isinstance(episode_file, dict):
+                continue
+            path = episode_file.get("path")
+            file_id = _as_int(episode_file.get("id"))
+            if path and file_id is not None:
+                pairs.append((Path(str(path)).name, file_id))
+        return pairs
+
+    def delete_episode_file(self, file_id: int) -> None:
+        """Delete one Sonarr-tracked episode file by its ``episodeFile`` id.
+
+        Removes the file from disk AND unlinks it in Sonarr, so the redundant copy
+        does not immediately re-download.
+        """
+
+        self._delete(f"/api/v3/episodefile/{int(file_id)}")
 
 
 def _refresh(group: DuplicateGroup, copies: tuple[MediaCopy, ...]) -> DuplicateGroup:
