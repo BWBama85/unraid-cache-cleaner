@@ -206,7 +206,8 @@ class FakeArrClient:
         self.calls += 1
         if self._raises is not None:
             raise self._raises
-        # dict for Radarr, set for Sonarr — copy so callers can't mutate ours
+        # {tmdbId: {basename: id}} for Radarr, {basename: [ids]} for Sonarr (#61) —
+        # copy so callers can't mutate ours
         return type(self._index)(self._index)
 
 
@@ -622,7 +623,7 @@ class ArrAssociationTests(unittest.TestCase):
     def test_json_carries_association_and_keeper_tracked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            radarr = FakeArrClient({"700": {"arr.4k.mkv"}})
+            radarr = FakeArrClient({"700": {"arr.4k.mkv": 704}})
             reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
 
             payload = reporter.build_payload(reporter.generate())
@@ -635,6 +636,15 @@ class ArrAssociationTests(unittest.TestCase):
             self.assertEqual(copies["arr.4k.mkv"]["arr_tracked"], "radarr")
             self.assertEqual(copies["arr.1080.mkv"]["association"], "untracked")
             self.assertIsNone(copies["arr.1080.mkv"]["arr_tracked"])
+            # each part carries its *arr file id (#61) on an arr-enabled report: the
+            # tracked file's movieFile id, null for the untracked sibling.
+            self.assertEqual(copies["arr.4k.mkv"]["parts"][0]["arr_file_id"], 704)
+            self.assertIsNone(copies["arr.1080.mkv"]["parts"][0]["arr_file_id"])
+            self.assertEqual(group["keeper"]["parts"][0]["arr_file_id"], 704)
+            # arr-enabled part shape: exactly the base keys plus arr_file_id
+            for copy in group["copies"]:
+                for part in copy["parts"]:
+                    self.assertEqual(set(part), {"part_id", "file", "size", "arr_file_id"})
             # the keeper (best copy) is the tracked 4k one
             self.assertEqual(group["keeper"]["association"], "tracked")
             # reclaim candidate (1080) is untracked -> nothing at re-download risk
@@ -644,7 +654,7 @@ class ArrAssociationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             # Radarr tracks the worse (1080) copy — the one a reclaim would delete.
-            radarr = FakeArrClient({"700": {"arr.1080.mkv"}})
+            radarr = FakeArrClient({"700": {"arr.1080.mkv": 710}})
             reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
 
             report = reporter.generate()
@@ -705,7 +715,7 @@ class ArrAssociationTests(unittest.TestCase):
                 {("2", 4): [_EPISODE_IDENTICAL]},
             )
             # _EPISODE_IDENTICAL copies are /tv/Some Show/S02/a.mkv and b.mkv
-            sonarr = FakeArrClient({"a.mkv"})
+            sonarr = FakeArrClient({"a.mkv": [900]})
             reporter = _arr_reporter(tmp, client, sonarr=sonarr)
 
             payload = reporter.build_payload(reporter.generate())
@@ -733,7 +743,7 @@ class ArrAssociationTests(unittest.TestCase):
             client = FakePlexClient(
                 [PlexSection(key="1", type="movie", title="Movies")], {("1", 1): [mismatch]}
             )
-            radarr = FakeArrClient({"111": {"a.mkv"}})
+            radarr = FakeArrClient({"111": {"a.mkv": 111}})
             reporter = _arr_reporter(tmp, client, radarr=radarr)
 
             payload = reporter.build_payload(reporter.generate())
@@ -748,7 +758,7 @@ class ArrAssociationTests(unittest.TestCase):
     def test_no_tracked_reclaim_reports_all_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            radarr = FakeArrClient({"700": {"arr.4k.mkv"}})
+            radarr = FakeArrClient({"700": {"arr.4k.mkv": 704}})
             reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
 
             table = reporter.render_table(reporter.generate())
@@ -758,7 +768,7 @@ class ArrAssociationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             # tmdb 700 isn't in the index -> every copy unknown, none tracked.
-            radarr = FakeArrClient({"999": {"other.mkv"}})
+            radarr = FakeArrClient({"999": {"other.mkv": 999}})
             reporter = _arr_reporter(tmp, self._movie_client(), radarr=radarr)
 
             table = reporter.render_table(reporter.generate())
@@ -880,7 +890,7 @@ class StackedRepresentationTests(unittest.TestCase):
         # per-copy association survives the richer serialization.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            radarr = FakeArrClient({"970": {"cd1.1080.mkv"}})
+            radarr = FakeArrClient({"970": {"cd1.1080.mkv": 970}})
             reporter = _arr_reporter(tmp, self._client(_MOVIE_ARR_STACKED), radarr=radarr)
             report = reporter.generate()
             payload = reporter.build_payload(report)
@@ -939,13 +949,14 @@ class StackedRepresentationTests(unittest.TestCase):
             self.assertNotIn("big.1080.mkv", safe)  # no per-part sub-row
             self.assertNotIn("/movies/Big Movie", safe)
 
-    def test_arr_enabled_reclaimable_section_omits_part_subrows(self) -> None:
-        # #48 is scoped to Plex-only runs: with the *arr layer on, the reclaimable
-        # summary stays compact — a stacked tracked candidate's parts appear in the
-        # arr-tracked section, not duplicated into Reclaimable (safe).
+    def test_arr_enabled_tracked_stacked_candidate_omits_reclaimable_subrows(self) -> None:
+        # #56: a *tracked* stacked candidate stays out of Reclaimable (safe) — its
+        # parts already appear (with the same fidelity) in the arr-tracked section,
+        # so listing them again would double-print the copy. Radarr tracks cd1, so
+        # the stacked reclaim candidate is tracked.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            radarr = FakeArrClient({"970": {"cd1.1080.mkv"}})
+            radarr = FakeArrClient({"970": {"cd1.1080.mkv": 970}})
             reporter = _arr_reporter(tmp, self._client(_MOVIE_ARR_STACKED), radarr=radarr)
             table = reporter.render_table(reporter.generate())
             safe = _reclaimable_section(table)
@@ -955,6 +966,55 @@ class StackedRepresentationTests(unittest.TestCase):
             self.assertNotIn("cd2.1080.mkv", safe)
             # they still appear elsewhere (the arr-tracked section)
             self.assertIn("cd1.1080.mkv", table)
+
+    def test_arr_enabled_untracked_stacked_candidate_lists_reclaimable_subrows(self) -> None:
+        # #56: with *arr on, an UNTRACKED stacked reclaim candidate must still show
+        # its physical parts (path + true per-file size) in Reclaimable (safe), so
+        # enabling *arr no longer strips the breakdown for copies it does not track.
+        # Radarr tracks the KEEPER (best.4k.mkv), so the cd1/cd2 candidate is untracked.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({"970": {"best.4k.mkv": 704}})
+            reporter = _arr_reporter(tmp, self._client(_MOVIE_ARR_STACKED), radarr=radarr)
+            report = reporter.generate()
+            table = reporter.render_table(report)
+            safe = _reclaimable_section(table)
+
+            # the untracked candidate's parts now appear in the safe section
+            self.assertIn("cd1.1080.mkv", safe)
+            self.assertIn("cd2.1080.mkv", safe)
+            self.assertIn("4.0 GiB", safe)  # cd1 at its true size
+            self.assertIn("5.0 GiB", safe)  # cd2 at its true size
+            # the keeper's file is never listed as a reclaimable part
+            self.assertNotIn("best.4k.mkv", safe)
+            table.encode("ascii")  # stays ASCII
+
+    def test_arr_enabled_unknown_stacked_candidate_lists_reclaimable_subrows(self) -> None:
+        # #56: an *unknown* stacked candidate (here the group's tmdb id is not in
+        # Radarr, so every copy falls back to unknown) is also not tracked, so its
+        # parts belong in Reclaimable (safe) too — only tracked copies are withheld.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({})  # tmdb 970 absent -> all copies unknown
+            reporter = _arr_reporter(tmp, self._client(_MOVIE_ARR_STACKED), radarr=radarr)
+            report = reporter.generate()
+            table = reporter.render_table(report)
+            safe = _reclaimable_section(table)
+
+            self.assertIn("cd1.1080.mkv", safe)
+            self.assertIn("cd2.1080.mkv", safe)
+
+    def test_arr_enabled_single_file_reclaimable_rows_unchanged(self) -> None:
+        # #56 only adds sub-rows for STACKED candidates; a single-file untracked
+        # reclaim candidate stays one summary line (no indented path) on an *arr run.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            radarr = FakeArrClient({"700": {"arr.4k.mkv": 704}})  # keeper tracked
+            reporter = _arr_reporter(tmp, self._client(_MOVIE_ARR), radarr=radarr)
+            safe = _reclaimable_section(reporter.render_table(reporter.generate()))
+
+            self.assertIn("Arr Movie", safe)  # summary line present
+            self.assertNotIn("arr.1080.mkv", safe)  # untracked single-file: no sub-row
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,7 +1074,7 @@ class RankOnceTests(unittest.TestCase):
         # the arr-tracked rows — across three output methods. Still once each.
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            radarr = FakeArrClient({"970": {"cd1.1080.mkv"}})
+            radarr = FakeArrClient({"970": {"cd1.1080.mkv": 970}})
             reporter = _arr_reporter(
                 tmp, self._client(_MOVIE_ARR_STACKED, _MOVIE_UPGRADE), radarr=radarr
             )

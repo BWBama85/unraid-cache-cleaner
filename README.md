@@ -160,10 +160,12 @@ writes a JSON report to `PLEX_DUPLICATE_REPORT_PATH` (default
 `/config/plex-duplicates.json`) and prints a reclaimable-sorted table with three
 sections:
 
-- **Reclaimable (safe)** — duplicate/upgrade copies you can safely remove. On a
-  Plex-only run (no `RADARR_*`/`SONARR_*`), a reclaimable copy that is a
-  **stacked** multi-part release lists each part file at its true size as
-  indented sub-rows; a single-file copy stays a one-line summary.
+- **Reclaimable (safe)** — duplicate/upgrade copies you can safely remove. A
+  reclaimable copy that is a **stacked** multi-part release lists each part file at
+  its true size as indented sub-rows; a single-file copy stays a one-line summary.
+  On an `*arr`-enabled run this breakdown is shown for **untracked/unknown**
+  candidates (a `tracked` stacked copy's parts appear in the arr-tracked section
+  instead, so they are not double-listed).
 - **Review — possible mismatches (not counted)** — items Plex merged from
   *different* titles (e.g. the 1990 and 2014 *TMNT*). These are **never** counted
   as reclaimable; check them by hand. A mis-stacked pair (two different titles
@@ -181,7 +183,9 @@ a `parts` array (`[{file, size}, …]`), always present and single-element for a
 unstacked copy, so an operator auditing the report sees an accurate file→size
 mapping for every physical file rather than only the first part at the summed
 size. In the printed table the per-part breakdown appears in the mismatch review,
-the arr-tracked section, and — on a Plex-only run — the Reclaimable (safe) section.
+the arr-tracked section, and the Reclaimable (safe) section (there for every
+stacked candidate on a Plex-only run, and for untracked/unknown stacked candidates
+when `*arr` is enabled — tracked ones show under arr-tracked instead).
 
 Flags:
 
@@ -303,8 +307,11 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
   requires `WEB_MEDIA_PATH_MAP` to map the Plex path to a *mounted* container path
   (unmapped → refused, because the Plex library is not mounted by default). A
   `tracked` copy is deleted via Radarr/Sonarr (so it does not immediately
-  re-download); its `*arr` file id is resolved live and refused if missing or
-  ambiguous.
+  re-download) by the `*arr` file id the report records for it; that id is
+  re-validated by a single by-id lookup immediately before the delete and refused
+  if the file is gone or now points at a different filename (drift). A tracked copy
+  in a report generated before this id was recorded is refused until you regenerate
+  the report.
 - **Audited.** Every real delete (and any partial failure) is written to the
   SQLite state store's `actions` table, so you can answer "what did the GUI delete".
 

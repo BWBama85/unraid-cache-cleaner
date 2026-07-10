@@ -52,13 +52,19 @@ SONARR = "sonarr"
 
 
 def _as_int(value: object) -> Optional[int]:
-    """Coerce an ``*arr`` file id to ``int``, or ``None`` if it is not numeric — so
-    a malformed id is skipped rather than raising inside the action layer."""
+    """Coerce an ``*arr`` file id to a *positive* ``int``, or ``None``.
+
+    A malformed (non-numeric) id is skipped rather than raising inside the action
+    layer; a non-positive id is treated as absent too, since an ``*arr``
+    ``movieFile``/``episodeFile`` id is always a positive integer — so ``0`` (a
+    common "unset" sentinel) never resolves to an addressable delete target.
+    """
 
     try:
-        return int(value)  # type: ignore[arg-type]
+        parsed = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+    return parsed if parsed > 0 else None
 
 
 class ArrClientError(RuntimeError):
@@ -132,21 +138,34 @@ class _ArrClient(JsonHttpClient):
         request = urllib.request.Request(self._build_url(api_path), method="DELETE")
         self._read_text(request)
 
+    def _get_object(self, api_path: str) -> dict:
+        """GET ``api_path`` and require a JSON object body (fail-closed on a
+        list/scalar). Used for the by-id single-file lookups (#61)."""
+
+        return self._ensure_json_object(self._get_json(api_path), api_path)
+
 
 class RadarrClient(_ArrClient):
     """Radarr v3 client: TMDB id -> tracked movie-file basenames."""
 
     service_name = "Radarr"
 
-    def fetch_tracked_index(self) -> Dict[str, Set[str]]:
-        """Map each movie's TMDB id to the basename(s) of its tracked file.
+    def fetch_tracked_index(self) -> Dict[str, Dict[str, Optional[int]]]:
+        """Map each movie's TMDB id to ``{basename: movieFile id}`` for its tracked
+        file (#8, #61).
 
         Movies Radarr has not imported (no ``movieFile``) are skipped: their id
-        never anchors an association, so those copies stay ``unknown``.
+        never anchors an association, so those copies stay ``unknown``. The
+        ``movieFile`` id is captured next to the basename so the web action layer
+        can reclaim a tracked copy *by id* — an ``O(1)``, drift-safe delete — rather
+        than re-resolving it live at delete time. A file whose id is absent or
+        non-positive keeps its basename (so the association still forms) with a
+        ``None`` id (so that copy is not by-id actionable and its reclaim is refused
+        until the report is regenerated).
         """
 
         movies = self._get_json("/api/v3/movie")
-        index: Dict[str, Set[str]] = {}
+        index: Dict[str, Dict[str, Optional[int]]] = {}
         for movie in movies or []:
             if not isinstance(movie, dict):
                 continue
@@ -157,33 +176,23 @@ class RadarrClient(_ArrClient):
             path = movie_file.get("path") or movie_file.get("relativePath")
             if not path:
                 continue
-            index.setdefault(str(tmdb_id), set()).add(Path(str(path)).name)
+            index.setdefault(str(tmdb_id), {})[Path(str(path)).name] = _as_int(
+                movie_file.get("id")
+            )
         return index
 
-    def fetch_file_index(self) -> Dict[str, List[int]]:
-        """Map each tracked movie-file basename to its ``movieFile`` id(s), from one
-        ``GET /api/v3/movie`` (#34 Phase 2).
+    def get_movie_file(self, file_id: int) -> dict:
+        """Fetch one Radarr ``movieFile`` by id (``GET /api/v3/moviefile/{id}``).
 
-        The web action layer builds this once per reclaim request and resolves every
-        selected basename against it — never one request per basename. Resolved live
-        (not from the report), so the id is current Radarr state at delete time. A
-        basename mapping to more than one id (two movies share a filename) is the
-        ambiguity signal the caller refuses on; a basename absent from the index is
-        no longer tracked. A non-integer id is skipped rather than raising, so one
-        malformed record cannot void the whole index.
+        The single by-id re-validation the web action layer runs immediately before
+        deleting a report-serialized file id (#61): it confirms the id still points
+        at a file whose basename matches the report before any DELETE. A 404 (the
+        file was already removed, or the id was reused for a different movie) surfaces
+        as an ``ArrClientError`` carrying ``status_code=404`` so the caller refuses
+        precisely rather than deleting the wrong file.
         """
 
-        movies = self._get_json("/api/v3/movie")
-        index: Dict[str, List[int]] = {}
-        for movie in movies or []:
-            if not isinstance(movie, dict):
-                continue
-            movie_file = movie.get("movieFile") or {}
-            path = movie_file.get("path") or movie_file.get("relativePath")
-            file_id = _as_int(movie_file.get("id"))
-            if path and file_id is not None:
-                index.setdefault(Path(str(path)).name, []).append(file_id)
-        return index
+        return self._get_object(f"/api/v3/moviefile/{int(file_id)}")
 
     def delete_movie_file(self, file_id: int) -> None:
         """Delete one Radarr-tracked movie file by its ``movieFile`` id.
@@ -208,88 +217,39 @@ _SONARR_PROGRESS_EVERY = 50
 
 
 class SonarrClient(_ArrClient):
-    """Sonarr v3 client: the set of all tracked episode-file basenames.
+    """Sonarr v3 client: tracked episode-file basenames -> ``episodeFile`` id(s).
 
-    Sonarr keys series by TVDB id, but Plex's episode guids are episode-level,
-    so this deliberately returns a flat basename set for a basename-only join
-    rather than an id-keyed index (see the module docstring).
+    Sonarr keys series by TVDB id, but Plex's episode guids are episode-level, so
+    the join is basename-only (see the module docstring). The index still carries
+    each basename's file id(s) so a tracked reclaim can delete by id (#61); a
+    basename shared across series keeps one list entry per occurrence (``None`` when
+    a file lacks an id) so the ambiguity is preserved and never collapsed to one
+    arbitrary id, which would delete the wrong series' file.
     """
 
     service_name = "Sonarr"
 
-    def fetch_tracked_index(self) -> Set[str]:
-        """Return every tracked episode-file basename across the whole library.
+    def fetch_tracked_index(self) -> Dict[str, List[Optional[int]]]:
+        """Map each tracked episode-file basename to its ``episodeFile`` id(s) (#8,
+        #61).
 
         Sonarr has no bulk episode-file endpoint, so this fans one
         ``/api/v3/episodefile`` request out per series through a bounded
         :class:`~concurrent.futures.ThreadPoolExecutor`. Each worker still calls
         :meth:`_get_json`, so the fail-closed opener, timeout, redirect guard, and
         header-only API key all still apply; the opener carries no per-request
-        mutable state (no cookie jar), so concurrent GETs are safe. A single
-        worker failure aborts the whole index — the ``*ClientError`` propagates
-        and the report degrades that kind to ``unknown`` — rather than returning a
-        partial, misleading set.
-        """
+        mutable state (no cookie jar), so concurrent GETs are safe. A single worker
+        failure aborts the whole index — the ``*ClientError`` propagates and the
+        report degrades that kind to ``unknown`` — rather than returning a partial,
+        misleading set.
 
-        series_list = self._get_json("/api/v3/series")
-        series_ids = [
-            series["id"]
-            for series in series_list or []
-            if isinstance(series, dict) and series.get("id") is not None
-        ]
-        if not series_ids:
-            return set()
-
-        total = len(series_ids)
-        basenames: Set[str] = set()
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(_SONARR_MAX_WORKERS, total)
-        ) as pool:
-            futures = [
-                pool.submit(self._episode_file_basenames, series_id)
-                for series_id in series_ids
-            ]
-            try:
-                for done, future in enumerate(
-                    concurrent.futures.as_completed(futures), start=1
-                ):
-                    basenames |= future.result()
-                    if done % _SONARR_PROGRESS_EVERY == 0 or done == total:
-                        LOGGER.info("Sonarr: indexed %s/%s series", done, total)
-            finally:
-                # Any worker failure voids the whole index, so drop the requests
-                # that have not started rather than fanning out the rest (already
-                # running ones still finish under the pool's shutdown). A no-op on
-                # the success path, where every future is already done — and robust
-                # to a worker raising something other than ArrClientError.
-                for pending in futures:
-                    pending.cancel()
-        return basenames
-
-    def _episode_file_basenames(self, series_id: object) -> Set[str]:
-        """Tracked episode-file basenames for one series (one ``/episodefile`` GET)."""
-
-        files = self._get_json("/api/v3/episodefile", {"seriesId": str(series_id)})
-        names: Set[str] = set()
-        for episode_file in files or []:
-            if not isinstance(episode_file, dict):
-                continue
-            path = episode_file.get("path")
-            if path:
-                names.add(Path(str(path)).name)
-        return names
-
-    def fetch_file_index(self) -> Dict[str, List[int]]:
-        """Map each tracked episode-file basename to its ``episodeFile`` id(s), via
-        the same bounded per-series fan-out the tracked-basename index uses (#34
-        Phase 2).
-
-        The web action layer builds this once per reclaim request, so selecting N
-        tracked episodes costs one library fan-out, not N. As with Radarr, a
-        basename mapping to more than one id (shared across series) is the ambiguity
-        signal the caller refuses on, and an absent basename is no longer tracked. A
-        single worker failure aborts the whole index (the ``ArrClientError``
-        propagates) rather than returning a partial set that could hide an ambiguity.
+        The value is the list of *every* tracked file with that basename, with a
+        ``None`` entry for one that carries no usable id — so the **occurrence
+        count** is preserved. That matters for safety: a basename shared across two
+        series where one file lacks an id must stay length-2 (ambiguous → not by-id
+        actionable), not collapse to a single pinnable id and delete the wrong
+        series' file. A basename present but with no usable id at all is ``[None]``
+        (the association still forms; it is simply not by-id actionable).
         """
 
         series_list = self._get_json("/api/v3/series")
@@ -301,36 +261,64 @@ class SonarrClient(_ArrClient):
         if not series_ids:
             return {}
 
-        index: Dict[str, List[int]] = {}
+        total = len(series_ids)
+        index: Dict[str, List[Optional[int]]] = {}
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(_SONARR_MAX_WORKERS, len(series_ids))
+            max_workers=min(_SONARR_MAX_WORKERS, total)
         ) as pool:
             futures = [
-                pool.submit(self._episode_file_index, series_id)
+                pool.submit(self._episode_file_pairs, series_id)
                 for series_id in series_ids
             ]
             try:
-                for future in concurrent.futures.as_completed(futures):
+                for done, future in enumerate(
+                    concurrent.futures.as_completed(futures), start=1
+                ):
                     for basename, file_id in future.result():
                         index.setdefault(basename, []).append(file_id)
+                    if done % _SONARR_PROGRESS_EVERY == 0 or done == total:
+                        LOGGER.info("Sonarr: indexed %s/%s series", done, total)
             finally:
+                # Any worker failure voids the whole index, so drop the requests
+                # that have not started rather than fanning out the rest (already
+                # running ones still finish under the pool's shutdown). A no-op on
+                # the success path, where every future is already done — and robust
+                # to a worker raising something other than ArrClientError.
                 for pending in futures:
                     pending.cancel()
         return index
 
-    def _episode_file_index(self, series_id: object) -> List[Tuple[str, int]]:
-        """``(basename, episodeFile id)`` pairs for one series (one GET)."""
+    def _episode_file_pairs(
+        self, series_id: object
+    ) -> List[Tuple[str, Optional[int]]]:
+        """``(basename, episodeFile id-or-None)`` pairs for one series (one GET).
+
+        Every file with a path yields a pair, so a file that lacks a usable id
+        still contributes its basename to the association (with a ``None`` id).
+        """
 
         files = self._get_json("/api/v3/episodefile", {"seriesId": str(series_id)})
-        pairs: List[Tuple[str, int]] = []
+        pairs: List[Tuple[str, Optional[int]]] = []
         for episode_file in files or []:
             if not isinstance(episode_file, dict):
                 continue
             path = episode_file.get("path")
-            file_id = _as_int(episode_file.get("id"))
-            if path and file_id is not None:
-                pairs.append((Path(str(path)).name, file_id))
+            if not path:
+                continue
+            pairs.append((Path(str(path)).name, _as_int(episode_file.get("id"))))
         return pairs
+
+    def get_episode_file(self, file_id: int) -> dict:
+        """Fetch one Sonarr ``episodeFile`` by id (``GET /api/v3/episodefile/{id}``).
+
+        The single by-id re-validation the web action layer runs before deleting a
+        report-serialized file id (#61), mirroring
+        :meth:`RadarrClient.get_movie_file`: it confirms the id still points at a
+        file whose basename matches the report before any DELETE, and a 404 surfaces
+        as an ``ArrClientError`` carrying ``status_code=404``.
+        """
+
+        return self._get_object(f"/api/v3/episodefile/{int(file_id)}")
 
     def delete_episode_file(self, file_id: int) -> None:
         """Delete one Sonarr-tracked episode file by its ``episodeFile`` id.
@@ -364,17 +352,18 @@ def _stack_key(copy: MediaCopy, index: int):
 
 
 def _apply(
-    group: DuplicateGroup, associations: List[tuple[str, Optional[str]]]
+    group: DuplicateGroup,
+    associations: List[tuple[str, Optional[str], Optional[int]]],
 ) -> DuplicateGroup:
     copies = tuple(
-        replace(c, association=assoc, arr_tracked=name)
-        for c, (assoc, name) in zip(group.copies, associations)
+        replace(c, association=assoc, arr_tracked=name, arr_file_id=file_id)
+        for c, (assoc, name, file_id) in zip(group.copies, associations)
     )
     return _refresh(group, copies)
 
 
 def _all_unknown(group: DuplicateGroup) -> DuplicateGroup:
-    return _apply(group, [(UNKNOWN, None)] * len(group.copies))
+    return _apply(group, [(UNKNOWN, None, None)] * len(group.copies))
 
 
 def _match_stacks(
@@ -410,17 +399,18 @@ def _match_stacks(
 
 def _annotate_by_id(
     group: DuplicateGroup,
-    index: Dict[str, Set[str]],
+    index: Dict[str, Dict[str, Optional[int]]],
     namespace: str,
     arr_name: str,
 ) -> DuplicateGroup:
     plex_id = group.external_ids.get(namespace)
-    tracked_basenames = index.get(plex_id) if plex_id else None
+    id_map = index.get(plex_id) if plex_id else None
 
     # Id absent in Plex, or id not in the *arr: never claim safe.
-    if not tracked_basenames:
+    if not id_map:
         return _all_unknown(group)
 
+    tracked_basenames = set(id_map.keys())
     tracked_stacks, ambiguous_stacks = _match_stacks(group, tracked_basenames)
     if not tracked_stacks and not ambiguous_stacks:
         # Id matched but no basename matches (mount map ambiguous): all unknown.
@@ -429,48 +419,62 @@ def _annotate_by_id(
     # A stacked copy is one logical unit: a stack the *arr uniquely tracks is
     # tracked (deleting it re-downloads); a stack whose only match is a basename
     # shared with another copy is unknown (can't tell which is the real file);
-    # a stack matching nothing is the redundant, safe-to-delete copy.
-    associations: List[tuple[str, Optional[str]]] = []
+    # a stack matching nothing is the redundant, safe-to-delete copy. A tracked
+    # part carries its own *arr file id (keyed per basename — never one id spread
+    # across the stack); a part whose id could not be pinned stays ``None``.
+    associations: List[tuple[str, Optional[str], Optional[int]]] = []
     for i, copy in enumerate(group.copies):
         key = _stack_key(copy, i)
         if key in tracked_stacks:
-            associations.append((TRACKED, arr_name))
+            associations.append((TRACKED, arr_name, id_map.get(copy.file.name)))
         elif key in ambiguous_stacks:
-            associations.append((UNKNOWN, None))
+            associations.append((UNKNOWN, None, None))
         else:
-            associations.append((UNTRACKED, None))
+            associations.append((UNTRACKED, None, None))
     return _apply(group, associations)
 
 
 def _annotate_by_basename(
     group: DuplicateGroup,
-    tracked_basenames: Set[str],
+    index: Dict[str, List[Optional[int]]],
     arr_name: str,
 ) -> DuplicateGroup:
+    tracked_basenames = set(index.keys())
     tracked_stacks, _ = _match_stacks(group, tracked_basenames)
     # No reliable id anchor for episodes, so anything not uniquely tracked —
-    # ambiguous or unmatched — is ``unknown`` (never ``untracked``/safe).
-    associations = [
-        (TRACKED, arr_name) if _stack_key(c, i) in tracked_stacks else (UNKNOWN, None)
-        for i, c in enumerate(group.copies)
-    ]
+    # ambiguous or unmatched — is ``unknown`` (never ``untracked``/safe). A
+    # tracked part gets its file id only when the basename maps to exactly one
+    # tracked file *and* that file has a usable id: more than one occurrence (a
+    # basename shared across series, even if only one carries an id) is ambiguous,
+    # so no id is pinned and the reclaim is refused rather than deleting the wrong
+    # file. ``ids`` preserves occurrence count via ``None`` placeholders.
+    associations: List[tuple[str, Optional[str], Optional[int]]] = []
+    for i, copy in enumerate(group.copies):
+        if _stack_key(copy, i) in tracked_stacks:
+            ids = index.get(copy.file.name) or []
+            pinned = ids[0] if len(ids) == 1 and ids[0] is not None else None
+            associations.append((TRACKED, arr_name, pinned))
+        else:
+            associations.append((UNKNOWN, None, None))
     return _apply(group, associations)
 
 
 def annotate(
     groups: List[DuplicateGroup],
-    radarr_index: Dict[str, Set[str]],
-    sonarr_basenames: Set[str],
+    radarr_index: Dict[str, Dict[str, Optional[int]]],
+    sonarr_index: Dict[str, List[Optional[int]]],
 ) -> List[DuplicateGroup]:
-    """Return ``groups`` with each copy's association filled in.
+    """Return ``groups`` with each copy's association (and, when tracked, its
+    ``*arr`` file id) filled in.
 
-    ``radarr_index`` maps TMDB id -> tracked movie-file basenames;
-    ``sonarr_basenames`` is the flat set of tracked episode-file basenames. An
-    empty index/set (e.g. that ``*arr`` unconfigured or unreachable) leaves the
-    relevant kind ``unknown``. ``mismatch`` groups (Plex merged different titles)
-    and non-movie/episode kinds are never labeled tracked/untracked — their
-    copies keep the default ``unknown``, so a copy we don't trust the grouping of
-    is never presented as safe.
+    ``radarr_index`` maps TMDB id -> ``{basename: movieFile id}``;
+    ``sonarr_index`` maps episode-file basename -> ``[episodeFile ids]`` (one entry
+    per tracked file with that basename, ``None`` for a file lacking an id). An empty
+    index (that ``*arr`` unconfigured or unreachable) leaves the relevant kind
+    ``unknown``. ``mismatch`` groups (Plex merged different titles) and
+    non-movie/episode kinds are never labeled tracked/untracked — their copies keep
+    the default ``unknown``, so a copy we don't trust the grouping of is never
+    presented as safe.
     """
 
     out: List[DuplicateGroup] = []
@@ -480,7 +484,7 @@ def annotate(
         elif group.kind == "movie":
             out.append(_annotate_by_id(group, radarr_index, "tmdb", RADARR))
         elif group.kind == "episode":
-            out.append(_annotate_by_basename(group, sonarr_basenames, SONARR))
+            out.append(_annotate_by_basename(group, sonarr_index, SONARR))
         else:
             out.append(group)
     return out

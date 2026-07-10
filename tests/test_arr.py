@@ -97,26 +97,32 @@ class ArrClientTests(unittest.TestCase):
         self.assertIn(("X-Api-Key", "SECRET-KEY-123"), client._opener.addheaders)
         self.assertIn(("Accept", "application/json"), client._opener.addheaders)
 
-    def test_radarr_index_maps_tmdb_to_basenames(self) -> None:
+    def test_radarr_index_maps_tmdb_to_basename_ids(self) -> None:
         movies = [
-            {"tmdbId": 111, "movieFile": {"path": "/movies/A (2020)/a.4k.mkv"}},
-            {"tmdbId": 222, "movieFile": {"relativePath": "b.1080.mkv"}},  # path fallback
+            {"tmdbId": 111, "movieFile": {"id": 10, "path": "/movies/A (2020)/a.4k.mkv"}},
+            {"tmdbId": 222, "movieFile": {"relativePath": "b.1080.mkv", "id": 20}},  # path fallback
+            {"tmdbId": 444, "movieFile": {"path": "/movies/D/d.mkv"}},  # tracked, id absent -> None
             {"tmdbId": 333, "hasFile": False},  # not imported -> skipped
-            {"movieFile": {"path": "/x/no-id.mkv"}},  # no tmdbId -> skipped
+            {"movieFile": {"id": 99, "path": "/x/no-id.mkv"}},  # no tmdbId -> skipped
         ]
         opener = _RecordingOpener(lambda req: json.dumps(movies).encode("utf-8"))
         client = _radarr(opener)
 
         index = client.fetch_tracked_index()
 
-        self.assertEqual(index, {"111": {"a.4k.mkv"}, "222": {"b.1080.mkv"}})
+        # tmdbId -> {basename: movieFile id} (#61); a file with no usable id keeps
+        # its basename with a None id so the association still forms.
+        self.assertEqual(
+            index,
+            {"111": {"a.4k.mkv": 10}, "222": {"b.1080.mkv": 20}, "444": {"d.mkv": None}},
+        )
         self.assertEqual(urlparse(opener.requests[0].full_url).path, "/api/v3/movie")
 
-    def test_sonarr_index_collects_episode_basenames(self) -> None:
+    def test_sonarr_index_maps_episode_basename_ids(self) -> None:
         series = [{"id": 1, "tvdbId": 9001}, {"id": 2, "tvdbId": 9002}]
         files_by_series = {
-            "1": [{"path": "/tv/Show A/S01/a1.mkv"}, {"path": "/tv/Show A/S01/a2.mkv"}],
-            "2": [{"path": "/tv/Show B/S01/b1.mkv"}, {"relativePath": "no-path.mkv"}],
+            "1": [{"id": 100, "path": "/tv/Show A/S01/a1.mkv"}, {"path": "/tv/Show A/S01/a2.mkv"}],
+            "2": [{"id": 300, "path": "/tv/Show B/S01/b1.mkv"}, {"relativePath": "no-path.mkv"}],
         }
 
         def responder(req) -> bytes:
@@ -129,9 +135,12 @@ class ArrClientTests(unittest.TestCase):
         opener = _RecordingOpener(responder)
         client = _sonarr(opener)
 
-        basenames = client.fetch_tracked_index()
+        index = client.fetch_tracked_index()
 
-        self.assertEqual(basenames, {"a1.mkv", "a2.mkv", "b1.mkv"})
+        # basename -> [episodeFile ids-or-None] (#61); a1/b1 carry ids, a2 has a
+        # path but no id (still a key, [None] — occurrence preserved so cross-series
+        # ambiguity can't collapse), no-path.mkv is dropped (no path).
+        self.assertEqual(index, {"a1.mkv": [100], "a2.mkv": [None], "b1.mkv": [300]})
         # one /series call plus one /episodefile call per series
         paths = [urlparse(r.full_url).path for r in opener.requests]
         self.assertEqual(paths.count("/api/v3/episodefile"), 2)
@@ -156,9 +165,11 @@ class ArrClientTests(unittest.TestCase):
         opener = _RecordingOpener(self._sonarr_responder(series))
         client = _sonarr(opener)
 
-        basenames = client.fetch_tracked_index()
+        index = client.fetch_tracked_index()
 
-        self.assertEqual(basenames, {f"e{i}.mkv" for i in range(1, 21)})
+        # _sonarr_responder emits no ids, so every basename maps to [None] (one
+        # occurrence, no usable id) — the key is present so matching still works.
+        self.assertEqual(index, {f"e{i}.mkv": [None] for i in range(1, 21)})
         paths = [urlparse(r.full_url).path for r in opener.requests]
         self.assertEqual(paths.count("/api/v3/series"), 1)
         self.assertEqual(paths.count("/api/v3/episodefile"), 20)
@@ -182,7 +193,7 @@ class ArrClientTests(unittest.TestCase):
         client = _sonarr(_RecordingOpener(responder))
 
         self.assertEqual(
-            client.fetch_tracked_index(), {f"e{i}.mkv" for i in range(1, n + 1)}
+            client.fetch_tracked_index(), {f"e{i}.mkv": [None] for i in range(1, n + 1)}
         )
 
     def test_sonarr_worker_failure_fails_closed(self) -> None:
@@ -225,7 +236,7 @@ class ArrClientTests(unittest.TestCase):
         opener = _RecordingOpener(lambda req: json.dumps([]).encode("utf-8"))
         client = _sonarr(opener)
 
-        self.assertEqual(client.fetch_tracked_index(), set())
+        self.assertEqual(client.fetch_tracked_index(), {})
         paths = [urlparse(r.full_url).path for r in opener.requests]
         self.assertNotIn("/api/v3/episodefile", paths)
 
@@ -319,7 +330,7 @@ class RedirectSafetyTests(unittest.TestCase):
 
     def test_same_host_redirect_followed_and_recarries_key(self) -> None:
         movies = json.dumps(
-            [{"tmdbId": 111, "movieFile": {"path": "/movies/A/a.mkv"}}]
+            [{"tmdbId": 111, "movieFile": {"id": 10, "path": "/movies/A/a.mkv"}}]
         ).encode("utf-8")
 
         def responder(req):
@@ -331,7 +342,7 @@ class RedirectSafetyTests(unittest.TestCase):
 
         index = client.fetch_tracked_index()
 
-        self.assertEqual(index, {"111": {"a.mkv"}})
+        self.assertEqual(index, {"111": {"a.mkv": 10}})
         self.assertEqual([urlparse(r.full_url).path for r in fake.requests],
                          ["/api/v3/movie", "/relocated"])
         # The followed request re-carries the key (added as an unredirected
@@ -386,21 +397,28 @@ def _by_name(group):
     return {c.file.name: (c.association, c.arr_tracked) for c in group.copies}
 
 
+def _ids_by_name(group):
+    return {c.file.name: c.arr_file_id for c in group.copies}
+
+
 class AnnotateMovieTests(unittest.TestCase):
     def test_tracked_keeper_and_untracked_sibling(self) -> None:
         group = _movie_group(
             "123",
             [("/movies/M/big.4k.mkv", 20 * GiB, "4k"), ("/movies/M/big.1080.mkv", 8 * GiB, "1080")],
         )
-        [out] = annotate([group], {"123": {"big.4k.mkv"}}, set())
+        [out] = annotate([group], {"123": {"big.4k.mkv": 55}}, {})
 
         self.assertEqual(
             _by_name(out),
             {"big.4k.mkv": (arr.TRACKED, arr.RADARR), "big.1080.mkv": (arr.UNTRACKED, None)},
         )
+        # the tracked copy carries its movieFile id (#61); the untracked sibling none
+        self.assertEqual(_ids_by_name(out), {"big.4k.mkv": 55, "big.1080.mkv": None})
         # keeper (the 4k copy) carries the tracked association, not the default
         self.assertEqual(out.keeper.association, arr.TRACKED)
         self.assertEqual(out.keeper.arr_tracked, arr.RADARR)
+        self.assertEqual(out.keeper.arr_file_id, 55)
         # classification + reclaimable math are unchanged by annotation
         self.assertEqual(out.classification, group.classification)
         self.assertEqual(out.reclaimable_bytes, group.reclaimable_bytes)
@@ -410,7 +428,7 @@ class AnnotateMovieTests(unittest.TestCase):
             "123",
             [("/movies/M/a.mkv", 20 * GiB, "4k"), ("/movies/M/b.mkv", 8 * GiB, "1080")],
         )
-        [out] = annotate([group], {"123": {"somewhere-else.mkv"}}, set())
+        [out] = annotate([group], {"123": {"somewhere-else.mkv": 55}}, {})
 
         self.assertEqual(
             {c.association for c in out.copies}, {arr.UNKNOWN}
@@ -422,7 +440,7 @@ class AnnotateMovieTests(unittest.TestCase):
             "999",
             [("/movies/M/a.mkv", 20 * GiB, "4k"), ("/movies/M/b.mkv", 8 * GiB, "1080")],
         )
-        [out] = annotate([group], {"123": {"a.mkv"}}, set())
+        [out] = annotate([group], {"123": {"a.mkv": 55}}, {})
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
     def test_missing_plex_id_is_unknown(self) -> None:
@@ -430,7 +448,7 @@ class AnnotateMovieTests(unittest.TestCase):
             None,
             [("/movies/M/a.mkv", 20 * GiB, "4k"), ("/movies/M/b.mkv", 8 * GiB, "1080")],
         )
-        [out] = annotate([group], {"123": {"a.mkv"}}, set())
+        [out] = annotate([group], {"123": {"a.mkv": 55}}, {})
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
     def test_empty_radarr_index_leaves_movies_unknown(self) -> None:
@@ -438,7 +456,7 @@ class AnnotateMovieTests(unittest.TestCase):
             "123",
             [("/movies/M/a.mkv", 20 * GiB, "4k"), ("/movies/M/b.mkv", 8 * GiB, "1080")],
         )
-        [out] = annotate([group], {}, set())
+        [out] = annotate([group], {}, {})
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
     def test_ambiguous_duplicate_basename_is_unknown(self) -> None:
@@ -449,10 +467,12 @@ class AnnotateMovieTests(unittest.TestCase):
             "123",
             [("/movies/Real/big.mkv", 20 * GiB, "4k"), ("/movies/OldDupe/big.mkv", 8 * GiB, "1080")],
         )
-        [out] = annotate([group], {"123": {"big.mkv"}}, set())
+        [out] = annotate([group], {"123": {"big.mkv": 55}}, {})
 
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
         self.assertTrue(all(c.arr_tracked is None for c in out.copies))
+        # an ambiguous (unknown) copy is never handed a file id
+        self.assertTrue(all(c.arr_file_id is None for c in out.copies))
 
     def test_unique_match_still_tracks_when_a_sibling_differs(self) -> None:
         # Only the ambiguous case degrades: a uniquely-named tracked copy is still
@@ -461,7 +481,7 @@ class AnnotateMovieTests(unittest.TestCase):
             "123",
             [("/movies/M/big.4k.mkv", 20 * GiB, "4k"), ("/movies/M/big.1080.mkv", 8 * GiB, "1080")],
         )
-        [out] = annotate([group], {"123": {"big.4k.mkv"}}, set())
+        [out] = annotate([group], {"123": {"big.4k.mkv": 55}}, {})
         self.assertEqual(
             _by_name(out),
             {"big.4k.mkv": (arr.TRACKED, arr.RADARR), "big.1080.mkv": (arr.UNTRACKED, None)},
@@ -483,21 +503,30 @@ class AnnotateMovieTests(unittest.TestCase):
         )
 
     def test_stacked_first_part_tracked_marks_copy_tracked(self) -> None:
-        [out] = annotate([self._stacked_group()], {"123": {"cd1.mkv"}}, set())
+        [out] = annotate([self._stacked_group()], {"123": {"cd1.mkv": 51}}, {})
 
-        ranked = {c.file.name: c.association for c in dedupe.rank_copies(out)}
-        self.assertEqual(ranked["cd1.mkv"], arr.TRACKED)
-        self.assertEqual(ranked["other.mkv"], arr.UNTRACKED)
+        by_assoc = {c.file.name: c.association for c in out.copies}
+        self.assertEqual(by_assoc["cd1.mkv"], arr.TRACKED)
+        self.assertEqual(by_assoc["other.mkv"], arr.UNTRACKED)
+        # the id lands on the matched part only — never spread across the stack:
+        # cd1 (matched) carries 51, cd2 (its stack sibling) stays None.
+        ids = _ids_by_name(out)
+        self.assertEqual(ids["cd1.mkv"], 51)
+        self.assertIsNone(ids["cd2.mkv"])
 
     def test_stacked_non_first_part_tracked_still_marks_copy_tracked(self) -> None:
         # Radarr tracks cd2 (the SECOND part). The merged copy keeps cd1's fields,
         # so the whole stack must carry the tracked label or the merged copy would
         # read as safe while deleting it re-downloads cd2.
-        [out] = annotate([self._stacked_group()], {"123": {"cd2.mkv"}}, set())
+        [out] = annotate([self._stacked_group()], {"123": {"cd2.mkv": 52}}, {})
 
-        ranked = {c.file.name: c.association for c in dedupe.rank_copies(out)}
-        self.assertEqual(ranked["cd1.mkv"], arr.TRACKED)
-        self.assertEqual(ranked["other.mkv"], arr.UNTRACKED)
+        by_assoc = {c.file.name: c.association for c in out.copies}
+        self.assertEqual(by_assoc["cd1.mkv"], arr.TRACKED)
+        self.assertEqual(by_assoc["other.mkv"], arr.UNTRACKED)
+        # the id is pinned to cd2 (the matched part), not propagated onto cd1.
+        ids = _ids_by_name(out)
+        self.assertEqual(ids["cd2.mkv"], 52)
+        self.assertIsNone(ids["cd1.mkv"])
 
     def test_mismatch_group_never_labeled_safe(self) -> None:
         # Two different films Plex merged into one group ({tmdb-111} vs {tmdb-222}).
@@ -509,7 +538,7 @@ class AnnotateMovieTests(unittest.TestCase):
         )
         self.assertEqual(group.classification, dedupe.MISMATCH)
 
-        [out] = annotate([group], {"111": {"a.mkv"}}, set())
+        [out] = annotate([group], {"111": {"a.mkv": 55}}, {})
 
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
         self.assertTrue(all(c.arr_tracked is None for c in out.copies))
@@ -520,18 +549,56 @@ class AnnotateEpisodeTests(unittest.TestCase):
         group = _episode_group(
             [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e1.720.mkv", 2 * GiB, "720")],
         )
-        [out] = annotate([group], {}, {"e1.mkv"})
+        [out] = annotate([group], {}, {"e1.mkv": [77]})
 
         self.assertEqual(
             _by_name(out),
             {"e1.mkv": (arr.TRACKED, arr.SONARR), "e1.720.mkv": (arr.UNKNOWN, None)},
         )
+        # the tracked episode carries its episodeFile id; the unknown copy none
+        self.assertEqual(_ids_by_name(out), {"e1.mkv": 77, "e1.720.mkv": None})
+
+    def test_tracked_basename_shared_across_series_gets_no_id(self) -> None:
+        # A basename Sonarr tracks in two series is still tracked here (it matches
+        # exactly one stack in THIS group), but its id is ambiguous across series,
+        # so no id is pinned — the reclaim path refuses it until it can be resolved.
+        group = _episode_group(
+            [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e1.720.mkv", 2 * GiB, "720")],
+        )
+        [out] = annotate([group], {}, {"e1.mkv": [77, 88]})
+
+        by_name = _by_name(out)
+        self.assertEqual(by_name["e1.mkv"], (arr.TRACKED, arr.SONARR))
+        self.assertIsNone(_ids_by_name(out)["e1.mkv"])
+
+    def test_shared_basename_one_missing_id_still_ambiguous(self) -> None:
+        # A basename in two series where ONE file lacks an id ([77, None]) must
+        # stay ambiguous — collapsing to the single id 77 would pin (and later
+        # delete) the wrong series' file. It is tracked but not by-id actionable.
+        group = _episode_group(
+            [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e1.720.mkv", 2 * GiB, "720")],
+        )
+        [out] = annotate([group], {}, {"e1.mkv": [77, None]})
+
+        self.assertEqual(_by_name(out)["e1.mkv"], (arr.TRACKED, arr.SONARR))
+        self.assertIsNone(_ids_by_name(out)["e1.mkv"])
+
+    def test_tracked_basename_no_usable_id_gets_no_id(self) -> None:
+        # A tracked basename whose only file lacks a usable id ([None]) forms the
+        # association but pins no id (refused by the action layer until resolvable).
+        group = _episode_group(
+            [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e1.720.mkv", 2 * GiB, "720")],
+        )
+        [out] = annotate([group], {}, {"e1.mkv": [None]})
+
+        self.assertEqual(_by_name(out)["e1.mkv"], (arr.TRACKED, arr.SONARR))
+        self.assertIsNone(_ids_by_name(out)["e1.mkv"])
 
     def test_no_basename_match_all_unknown(self) -> None:
         group = _episode_group(
             [("/tv/Show/S01/e1.mkv", 3 * GiB, "1080"), ("/tv/Show/S01/e2.mkv", 3 * GiB, "1080")],
         )
-        [out] = annotate([group], {}, {"totally-different.mkv"})
+        [out] = annotate([group], {}, {"totally-different.mkv": [77]})
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
     def test_ambiguous_episode_basename_is_unknown(self) -> None:
@@ -540,7 +607,7 @@ class AnnotateEpisodeTests(unittest.TestCase):
         group = _episode_group(
             [("/tv/A/e1.mkv", 3 * GiB, "1080"), ("/tv/B/e1.mkv", 3 * GiB, "1080")],
         )
-        [out] = annotate([group], {}, {"e1.mkv"})
+        [out] = annotate([group], {}, {"e1.mkv": [77]})
         self.assertEqual({c.association for c in out.copies}, {arr.UNKNOWN})
 
     def test_other_kind_passes_through_untouched(self) -> None:
@@ -551,7 +618,7 @@ class AnnotateEpisodeTests(unittest.TestCase):
         group = dedupe.analyze_group(
             DuplicateGroup(rating_key="1", kind="other", title="X", copies=copies)
         )
-        [out] = annotate([group], {"1": {"a"}}, {"a"})
+        [out] = annotate([group], {"1": {"a": 1}}, {"a": [1]})
         self.assertIs(out, group)
 
 
@@ -559,29 +626,54 @@ class AnnotateEpisodeTests(unittest.TestCase):
 # Mutation / resolve methods (#34 Phase 2)                                     #
 # --------------------------------------------------------------------------- #
 
+class AsIntTests(unittest.TestCase):
+    def test_positive_ints_pass_non_positive_and_malformed_become_none(self) -> None:
+        # An *arr file id is always a positive integer, so 0 (a common "unset"
+        # sentinel), negatives, and non-numeric values all read as absent — never
+        # as an addressable delete target (#61).
+        self.assertEqual(arr._as_int(42), 42)
+        self.assertEqual(arr._as_int("7"), 7)
+        self.assertIsNone(arr._as_int(0))
+        self.assertIsNone(arr._as_int(-1))
+        self.assertIsNone(arr._as_int("not-a-number"))
+        self.assertIsNone(arr._as_int(None))
+
+
 class ArrMutationTests(unittest.TestCase):
-    def test_radarr_file_index_maps_basename_to_ids(self) -> None:
-        movies = [
-            {"tmdbId": 1, "movieFile": {"id": 10, "path": "/movies/A/old.1080.mkv"}},
-            {"tmdbId": 2, "movieFile": {"relativePath": "keep.4k.mkv", "id": 20}},  # path fallback
-        ]
-        client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
-        self.assertEqual(client.fetch_file_index(), {"old.1080.mkv": [10], "keep.4k.mkv": [20]})
+    def test_radarr_get_movie_file_reads_by_id(self) -> None:
+        # The by-id re-validation the web action layer runs before a delete (#61):
+        # one GET /moviefile/{id} returning the current file record.
+        opener = _RecordingOpener(
+            lambda req: json.dumps({"id": 42, "path": "/movies/A/old.mkv"}).encode("utf-8")
+        )
+        client = _radarr(opener)
+        record = client.get_movie_file(42)
+        self.assertEqual(record["path"], "/movies/A/old.mkv")
+        self.assertEqual(urlparse(opener.requests[-1].full_url).path, "/api/v3/moviefile/42")
+        self.assertEqual(opener.requests[-1].get_method(), "GET")
 
-    def test_radarr_file_index_flags_ambiguous_basename(self) -> None:
-        # Two movies with the same basename -> both ids, so the caller refuses.
-        movies = [
-            {"tmdbId": 1, "movieFile": {"id": 10, "path": "/movies/A/dup.mkv"}},
-            {"tmdbId": 2, "movieFile": {"id": 11, "path": "/movies/B/dup.mkv"}},
-        ]
-        client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
-        self.assertEqual(sorted(client.fetch_file_index()["dup.mkv"]), [10, 11])
+    def test_radarr_get_movie_file_404_carries_status(self) -> None:
+        # A removed/reused id surfaces as ArrClientError(status_code=404) so the
+        # caller can refuse precisely rather than deleting the wrong file.
+        client = _radarr(_RecordingOpener(_raiser(_http_error(404, b"gone"))))
+        with self.assertRaises(ArrClientError) as ctx:
+            client.get_movie_file(7)
+        self.assertEqual(ctx.exception.status_code, 404)
 
-    def test_radarr_file_index_skips_non_numeric_id(self) -> None:
-        # A malformed id is skipped, not raised, so one bad record can't void the index.
-        movies = [{"tmdbId": 1, "movieFile": {"id": "not-a-number", "path": "/m/x.mkv"}}]
-        client = _radarr(_RecordingOpener(lambda req: json.dumps(movies).encode("utf-8")))
-        self.assertEqual(client.fetch_file_index(), {})
+    def test_radarr_get_movie_file_non_object_fails_closed(self) -> None:
+        # A non-object body (a top-level list) is refused, not silently accepted.
+        client = _radarr(_RecordingOpener(lambda req: b"[]"))
+        with self.assertRaises(ArrClientError):
+            client.get_movie_file(1)
+
+    def test_sonarr_get_episode_file_reads_by_id(self) -> None:
+        opener = _RecordingOpener(
+            lambda req: json.dumps({"id": 99, "path": "/tv/A/S01/ep.mkv"}).encode("utf-8")
+        )
+        client = _sonarr(opener)
+        record = client.get_episode_file(99)
+        self.assertEqual(record["path"], "/tv/A/S01/ep.mkv")
+        self.assertEqual(urlparse(opener.requests[-1].full_url).path, "/api/v3/episodefile/99")
 
     def test_radarr_delete_issues_delete_verb_at_moviefile_path(self) -> None:
         opener = _RecordingOpener(lambda req: b"{}")
@@ -596,23 +688,6 @@ class ArrMutationTests(unittest.TestCase):
         with self.assertRaises(ArrClientError) as ctx:
             client.delete_movie_file(7)
         self.assertEqual(ctx.exception.status_code, 404)
-
-    def test_sonarr_file_index_maps_basename_to_ids(self) -> None:
-        series = [{"id": 1}, {"id": 2}]
-        files = {
-            "1": [{"id": 100, "path": "/tv/A/S01/target.mkv"}],
-            "2": [{"id": 200, "path": "/tv/B/S01/other.mkv"}],
-        }
-
-        def responder(req) -> bytes:
-            parsed = urlparse(req.full_url)
-            if parsed.path == "/api/v3/series":
-                return json.dumps(series).encode("utf-8")
-            sid = parse_qs(parsed.query)["seriesId"][0]
-            return json.dumps(files[sid]).encode("utf-8")
-
-        client = _sonarr(_RecordingOpener(responder))
-        self.assertEqual(client.fetch_file_index(), {"target.mkv": [100], "other.mkv": [200]})
 
     def test_sonarr_delete_issues_delete_verb_at_episodefile_path(self) -> None:
         opener = _RecordingOpener(lambda req: b"{}")

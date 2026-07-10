@@ -24,7 +24,7 @@ import stat
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import arr, dedupe
 from .arr import ArrClientError, RadarrClient, SonarrClient
@@ -70,18 +70,27 @@ def _copy_json(
         # the first part's path and the summed size (#17). Always present and a
         # single element for an unstacked copy, so a consumer can read
         # ``copy["parts"]`` unconditionally. ``part_id`` is the Plex ``Part`` id —
-        # the precise per-file delete target for #34 Phase 2.
-        "parts": [
-            {"part_id": part.part_id, "file": str(part.file), "size": part.size}
-            for part in parts
-        ],
+        # the precise per-file delete target for #34 Phase 2. On an arr-enabled
+        # run each part also carries its ``*arr`` file id (#61) so the web action
+        # layer deletes a tracked copy by id (drift-safe, O(1)); it is per-part
+        # (never one id spread across a stack) and ``null`` when not pinned.
+        "parts": [_part_json(part, include_arr=include_arr) for part in parts],
     }
-    # The arr fields are serialized only when the arr layer ran, so a Plex-only
-    # report omits them (the base keys above, including media_id/part_id, are
-    # always present).
+    # The copy-level arr fields are serialized only when the arr layer ran, so a
+    # Plex-only report omits them (the base keys above, including media_id/part_id,
+    # are always present).
     if include_arr:
         payload["association"] = copy.association
         payload["arr_tracked"] = copy.arr_tracked
+    return payload
+
+
+def _part_json(part: MediaCopy, *, include_arr: bool = False) -> dict:
+    payload = {"part_id": part.part_id, "file": str(part.file), "size": part.size}
+    # ``arr_file_id`` rides only on arr-enabled reports (``null`` unless this part
+    # is a pinned tracked file), keeping the Plex-only part shape byte-identical.
+    if include_arr:
+        payload["arr_file_id"] = part.arr_file_id
     return payload
 
 
@@ -180,8 +189,8 @@ class PlexDuplicateReporter:
         analyzed.sort(key=self._group_sort_key)
 
         if self._arr_enabled:
-            radarr_index, sonarr_basenames = self._build_arr_indexes(warnings)
-            analyzed = arr.annotate(analyzed, radarr_index, sonarr_basenames)
+            radarr_index, sonarr_index = self._build_arr_indexes(warnings)
+            analyzed = arr.annotate(analyzed, radarr_index, sonarr_index)
 
         summary = dedupe.summarize(analyzed)
 
@@ -199,17 +208,18 @@ class PlexDuplicateReporter:
 
     def _build_arr_indexes(
         self, warnings: List[str]
-    ) -> Tuple[Dict[str, Set[str]], Set[str]]:
+    ) -> Tuple[Dict[str, Dict[str, Optional[int]]], Dict[str, List[Optional[int]]]]:
         """Fetch the Radarr/Sonarr tracked indexes, degrading gracefully.
 
         An unconfigured client contributes an empty index; a configured but
         unreachable one logs a warning and also contributes an empty index — so
         an ``*arr`` outage never fails the read-only report, it just leaves that
-        kind ``unknown``.
+        kind ``unknown``. Each index now carries the tracked files' ``*arr`` ids
+        (#61), captured in the same fetch, so the report can serialize them.
         """
 
-        radarr_index: dict = {}
-        sonarr_basenames: set = set()
+        radarr_index: Dict[str, Dict[str, Optional[int]]] = {}
+        sonarr_index: Dict[str, List[Optional[int]]] = {}
         if self.radarr_client is not None:
             try:
                 radarr_index = self.radarr_client.fetch_tracked_index()
@@ -217,10 +227,10 @@ class PlexDuplicateReporter:
                 warnings.append(f"Radarr association skipped: {exc}")
         if self.sonarr_client is not None:
             try:
-                sonarr_basenames = self.sonarr_client.fetch_tracked_index()
+                sonarr_index = self.sonarr_client.fetch_tracked_index()
             except ArrClientError as exc:
                 warnings.append(f"Sonarr association skipped: {exc}")
-        return radarr_index, sonarr_basenames
+        return radarr_index, sonarr_index
 
     def _summary(self, report: DuplicateReport):
         """The report's precomputed summary, recomputed only if absent."""
@@ -528,28 +538,37 @@ class PlexDuplicateReporter:
                 f"{group.classification:<9} {group.kind:<7} "
                 f"keep={keeper_res:<5} copies={len(pairs)}  {group.title}{tag}"
             )
-            if not arr_enabled:
-                rows.extend(self._reclaimable_part_rows(pairs))
+            rows.extend(self._reclaimable_part_rows(pairs, arr_enabled=arr_enabled))
         rows.extend(self._truncation_note(len(groups), len(shown)))
         return rows
 
     @staticmethod
     def _reclaimable_part_rows(
-        pairs: List[Tuple[MediaCopy, List[MediaCopy]]]
+        pairs: List[Tuple[MediaCopy, List[MediaCopy]]],
+        *,
+        arr_enabled: bool = False,
     ) -> List[str]:
-        """Indented part sub-rows for each *stacked* reclaim candidate (#48).
+        """Indented part sub-rows for each *stacked* reclaim candidate (#48, #56).
 
         The compact reclaimable summary hides which physical files a stacked
-        reclaim candidate is made of; this lists each part at its true size so a
-        Plex-only (non-``*arr``) operator sees the same file->size fidelity the
-        JSON already provides. Only non-keeper copies (``pairs[1:]``) with more
-        than one part get sub-rows, so the common single-file case is unchanged.
-        The ``*arr``-enabled run keeps the compact summary — tracked parts already
-        appear in the arr-tracked section — so this runs only when arr is off.
+        reclaim candidate is made of; this lists each part at its true size so an
+        operator sees the same file->size fidelity the JSON already provides. Only
+        non-keeper copies (``pairs[1:]``) with more than one part get sub-rows, so
+        the common single-file case is unchanged.
+
+        On an ``*arr``-enabled run a *tracked* candidate is skipped here — its parts
+        already appear (with the same fidelity) in the arr-tracked section, so
+        listing them again would double-print the copy. Untracked/unknown stacked
+        candidates are still listed, so enabling ``*arr`` no longer strips the
+        reclaimable file->size breakdown from copies the ``*arr`` does not track
+        (#56). On a Plex-only run (``arr_enabled=False``) every stacked candidate is
+        listed, exactly as before.
         """
 
         rows: List[str] = []
         for logical, parts in pairs[1:]:
+            if arr_enabled and logical.association == arr.TRACKED:
+                continue
             if len(parts) > 1:
                 for part in parts:
                     rows.append(
