@@ -18,6 +18,7 @@ from unraid_cache_cleaner import cli
 from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.models import PlexSection
 from unraid_cache_cleaner.plex import PlexClientError
+from unraid_cache_cleaner.web_actions import StagingSweepReport
 
 GiB = 1024 ** 3
 
@@ -252,6 +253,50 @@ class SafePrintTests(unittest.TestCase):
         printed = out.getvalue()
         self.assertIn("Am", printed)
         self.assertIn("?", printed)  # é replaced, not crashed
+
+
+class ReconcileWebStagingTests(unittest.TestCase):
+    """#72: the web-startup staging sweep is gated on an enabled action layer + a
+    configured media-path map, and is fail-soft (a sweep error never blocks startup)."""
+
+    class _FakeReclaim:
+        def __init__(self, *, report=None, exc=None):
+            self.calls = 0
+            self._report = report if report is not None else StagingSweepReport()
+            self._exc = exc
+
+        def reconcile_staging(self):
+            self.calls += 1
+            if self._exc is not None:
+                raise self._exc
+            return self._report
+
+    class _Cfg:
+        def __init__(self, *, mapped):
+            self.web_media_path_map = (
+                ((Path("/plex"), Path("/media")),) if mapped else ()
+            )
+
+    def test_runs_when_service_present_and_mapped(self) -> None:
+        svc = self._FakeReclaim(report=StagingSweepReport(restored=1))
+        cli._reconcile_web_staging(svc, self._Cfg(mapped=True))
+        self.assertEqual(svc.calls, 1)
+
+    def test_skips_when_actions_disabled(self) -> None:
+        # No reclaim service (actions off) — nothing to sweep, and no crash.
+        cli._reconcile_web_staging(None, self._Cfg(mapped=True))
+
+    def test_skips_when_no_path_map(self) -> None:
+        svc = self._FakeReclaim()
+        cli._reconcile_web_staging(svc, self._Cfg(mapped=False))
+        self.assertEqual(svc.calls, 0)  # no roots to sweep → never invoked
+
+    def test_sweep_failure_is_swallowed(self) -> None:
+        svc = self._FakeReclaim(exc=OSError("boom"))
+        # A sweep failure must be logged and swallowed, never propagate to block the
+        # read-only viewer from starting.
+        cli._reconcile_web_staging(svc, self._Cfg(mapped=True))
+        self.assertEqual(svc.calls, 1)
 
 
 if __name__ == "__main__":
