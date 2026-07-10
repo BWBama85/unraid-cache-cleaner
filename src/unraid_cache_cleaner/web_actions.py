@@ -869,7 +869,7 @@ class ReclaimService:
         jobs: Sequence[_DeleteJob],
         *,
         action: str,
-        catch,
+        catch: type[BaseException],
         success_message: str,
     ) -> ReclaimResult:
         """Run the prevalidated per-part delete-and-audit loop shared by both
