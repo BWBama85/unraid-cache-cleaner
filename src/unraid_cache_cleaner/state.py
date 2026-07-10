@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 import secrets
 import sqlite3
-import time
 from pathlib import Path
-from typing import Callable, Optional, Sequence, TypeVar
+from typing import Optional, Sequence
 
 from .models import (
     CLAIM_BUSY,
@@ -21,21 +20,18 @@ from .models import (
 
 LOGGER = logging.getLogger(__name__)
 
-_T = TypeVar("_T")
-
 # SQLite's default busy timeout is 5s. A slow complete_extraction (an
 # executemany over many extraction_outputs rows on a contended disk) can hold the
-# write lock longer than that, so a concurrent claim would raise "database is
-# locked" and surface as a spurious extraction failure (#45). Raise the
-# per-connection wait so a claim blocks for the writer to finish instead.
+# write lock longer than that, so a concurrent claim_extraction INSERT would raise
+# "database is locked" and surface as a spurious extraction failure (#45). Raise
+# the per-connection wait so a claim blocks for the writer to finish instead. This
+# is SQLite's own busy-handler (it sleeps and retries acquiring the lock up to the
+# timeout), so it needs no application-level retry on top — which would only
+# compound the wait and, on the rollback-journal fallback path, risk replaying a
+# transaction whose commit failed. Past the timeout the OperationalError simply
+# propagates and the caller (Extractor.extract_all) retries the archive next
+# cycle, exactly as before — just far less often.
 _BUSY_TIMEOUT_SECONDS = 30.0
-
-# Belt-and-suspenders over the busy timeout: if a writer still holds the lock
-# past the timeout, replay the whole transaction a few times with a short,
-# growing backoff before giving up. Bounded so a genuinely stuck writer still
-# surfaces an error rather than hanging forever.
-_LOCK_RETRY_ATTEMPTS = 5
-_LOCK_RETRY_BACKOFF_SECONDS = 0.1
 
 # A claim held by a crashed extraction would otherwise block that archive from
 # ever being retried. A claim older than this is considered abandoned and may be
@@ -61,10 +57,8 @@ class StateStore:
         db_path: Path,
         *,
         busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS,
-        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.db_path = db_path
-        self._sleep = sleep
         self._connection = sqlite3.connect(self.db_path, timeout=busy_timeout_seconds)
         self._connection.row_factory = sqlite3.Row
         self._enable_wal()
@@ -76,12 +70,14 @@ class StateStore:
         WAL lets a read (``get_protected_extracted_paths``) run concurrently with
         a slow write (``complete_extraction``), cutting the contention that made a
         concurrent claim time out (#45). It does **not** permit two simultaneous
-        *writers* — that is what the raised ``busy_timeout`` and
-        :meth:`_retry_on_locked` cover. Setting the mode is idempotent and
-        persists in the DB header. If the underlying mount rejects WAL (some
-        network filesystems do), SQLite silently keeps the prior mode rather than
-        raising, so this degrades to the default journaling instead of failing
-        startup; the effective mode is logged either way.
+        *writers* — that is what the raised ``busy_timeout`` covers. Setting the
+        mode is idempotent and persists in the DB header. The connection already
+        carries the raised ``busy_timeout``, so a momentary lock while a concurrent
+        process performs the one-time journal→WAL conversion is waited out rather
+        than raised. If the underlying mount genuinely rejects WAL (some network
+        filesystems do), SQLite silently keeps the prior mode instead of raising,
+        so this degrades to the default journaling rather than failing startup;
+        the effective mode is logged either way.
         """
 
         try:
@@ -96,36 +92,6 @@ class StateStore:
                 self.db_path,
                 effective,
             )
-
-    def _retry_on_locked(self, operation: Callable[[], _T]) -> _T:
-        """Run ``operation`` (a self-contained transaction), retrying on a lock.
-
-        The raised ``busy_timeout`` already makes most writers wait rather than
-        error, but under sustained contention a claim racing a slow complete can
-        still see ``database is locked`` once the timeout lapses. ``operation``
-        wraps its whole transaction in ``with self._connection`` (which rolls back
-        on the exception), so replaying it is safe and preserves the atomic
-        single-winner claim: a retry that now finds the row already inserted by
-        the winner simply returns ``CLAIM_BUSY``/``CLAIM_DONE``. After the
-        attempts are exhausted the original ``OperationalError`` propagates
-        unchanged, so a genuine failure is never masked as success.
-        """
-
-        for attempt in range(1, _LOCK_RETRY_ATTEMPTS + 1):
-            try:
-                return operation()
-            except sqlite3.OperationalError as exc:
-                if not _is_lock_error(exc) or attempt == _LOCK_RETRY_ATTEMPTS:
-                    raise
-                LOGGER.debug(
-                    "SQLite busy on %s (attempt %s/%s), retrying: %s",
-                    self.db_path,
-                    attempt,
-                    _LOCK_RETRY_ATTEMPTS,
-                    exc,
-                )
-                self._sleep(_LOCK_RETRY_BACKOFF_SECONDS * attempt)
-        raise AssertionError("unreachable")  # pragma: no cover
 
     def _initialize(self) -> None:
         with self._connection:
@@ -332,45 +298,40 @@ class StateStore:
         write lock, so a concurrent one-shot ``extract`` and a running ``service``
         cannot both win the same archive. Winning a claim always rotates the
         ``token`` so any earlier owner's in-flight ``release``/``complete`` becomes
-        a no-op (#41 fix 2). The whole transaction runs under
-        :meth:`_retry_on_locked`, so a claim racing a slow ``complete`` waits/retries
-        instead of surfacing a spurious lock failure (#45) — and because the retry
-        replays the entire atomic transaction, the single-winner guarantee holds.
+        a no-op (#41 fix 2). The connection's raised ``busy_timeout`` (#45) makes
+        this write wait for a slow concurrent ``complete`` rather than surfacing a
+        spurious lock failure.
         """
 
         key = str(archive)
+        with self._connection:
+            token = secrets.token_hex(16)
+            cursor = self._connection.execute(
+                """
+                INSERT OR IGNORE INTO extractions
+                    (archive_path, status, claimed_at, size, mtime, token)
+                VALUES (?, 'claimed', ?, ?, ?, ?)
+                """,
+                (key, now, size, mtime, token),
+            )
+            if cursor.rowcount == 1:
+                return ClaimResult(CLAIM_NEW, token)
 
-        def _claim() -> ClaimResult:
-            with self._connection:
-                token = secrets.token_hex(16)
-                cursor = self._connection.execute(
-                    """
-                    INSERT OR IGNORE INTO extractions
-                        (archive_path, status, claimed_at, size, mtime, token)
-                    VALUES (?, 'claimed', ?, ?, ?, ?)
-                    """,
-                    (key, now, size, mtime, token),
-                )
-                if cursor.rowcount == 1:
-                    return ClaimResult(CLAIM_NEW, token)
-
-                row = self._connection.execute(
-                    "SELECT status, claimed_at, size, mtime FROM extractions WHERE archive_path = ?",
-                    (key,),
-                ).fetchone()
-                if row["status"] == "extracted":
-                    if _identity_matches(row, size, mtime):
-                        return ClaimResult(CLAIM_DONE)
-                    # A genuinely different archive now occupies this path: the old
-                    # idempotency record must not suppress extracting the new one.
-                    self._reclaim(key, now, size, mtime, token)
-                    return ClaimResult(CLAIM_NEW, token)
-                if (now - float(row["claimed_at"])) >= ttl_seconds:
-                    self._reclaim(key, now, size, mtime, token)
-                    return ClaimResult(CLAIM_NEW, token)
-                return ClaimResult(CLAIM_BUSY)
-
-        return self._retry_on_locked(_claim)
+            row = self._connection.execute(
+                "SELECT status, claimed_at, size, mtime FROM extractions WHERE archive_path = ?",
+                (key,),
+            ).fetchone()
+            if row["status"] == "extracted":
+                if _identity_matches(row, size, mtime):
+                    return ClaimResult(CLAIM_DONE)
+                # A genuinely different archive now occupies this path: the old
+                # idempotency record must not suppress extracting the new one.
+                self._reclaim(key, now, size, mtime, token)
+                return ClaimResult(CLAIM_NEW, token)
+            if (now - float(row["claimed_at"])) >= ttl_seconds:
+                self._reclaim(key, now, size, mtime, token)
+                return ClaimResult(CLAIM_NEW, token)
+            return ClaimResult(CLAIM_BUSY)
 
     def _reclaim(self, key: str, now: float, size: int, mtime: float, token: str) -> None:
         """Re-arm an existing row as a fresh ``claimed`` owned by ``token``.
@@ -417,43 +378,38 @@ class StateStore:
         """
 
         key = str(archive)
-
-        def _complete() -> None:
-            with self._connection:
-                cursor = self._connection.execute(
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE extractions SET status = 'extracted', extracted_at = ?
+                WHERE archive_path = ? AND status = 'claimed' AND token IS ?
+                """,
+                (now, key, token),
+            )
+            if cursor.rowcount == 0:
+                return
+            # Now that extraction has succeeded, atomically replace this archive's
+            # protected outputs: drop the superseded set (a reused path's old files
+            # may have unrelated names that the per-path upsert below would not
+            # overwrite, leaving now-orphaned media force-protected) and record the
+            # new one. Deferring the drop to here — rather than at reclaim time —
+            # keeps the previous media protected right up until the replacement is
+            # safely on disk.
+            self._connection.execute(
+                "DELETE FROM extraction_outputs WHERE archive_path = ?",
+                (key,),
+            )
+            if outputs:
+                self._connection.executemany(
                     """
-                    UPDATE extractions SET status = 'extracted', extracted_at = ?
-                    WHERE archive_path = ? AND status = 'claimed' AND token IS ?
+                    INSERT INTO extraction_outputs (output_path, archive_path, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(output_path) DO UPDATE SET
+                        archive_path = excluded.archive_path,
+                        created_at = excluded.created_at
                     """,
-                    (now, key, token),
+                    [(str(path), key, now) for path in outputs],
                 )
-                if cursor.rowcount == 0:
-                    return
-                # Now that extraction has succeeded, atomically replace this archive's
-                # protected outputs: drop the superseded set (a reused path's old files
-                # may have unrelated names that the per-path upsert below would not
-                # overwrite, leaving now-orphaned media force-protected) and record the
-                # new one. Deferring the drop to here — rather than at reclaim time —
-                # keeps the previous media protected right up until the replacement is
-                # safely on disk. Both statements share the one transaction, so the
-                # lock-retry never exposes a partially replaced output set.
-                self._connection.execute(
-                    "DELETE FROM extraction_outputs WHERE archive_path = ?",
-                    (key,),
-                )
-                if outputs:
-                    self._connection.executemany(
-                        """
-                        INSERT INTO extraction_outputs (output_path, archive_path, created_at)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(output_path) DO UPDATE SET
-                            archive_path = excluded.archive_path,
-                            created_at = excluded.created_at
-                        """,
-                        [(str(path), key, now) for path in outputs],
-                    )
-
-        self._retry_on_locked(_complete)
 
     def release_extraction(self, archive: Path, *, token: Optional[str]) -> None:
         """Drop *our* in-flight claim so a deferred/failed archive retries.
@@ -463,14 +419,11 @@ class StateStore:
         has since reclaimed (different token) is left alone (#41 fix 2).
         """
 
-        def _release() -> None:
-            with self._connection:
-                self._connection.execute(
-                    "DELETE FROM extractions WHERE archive_path = ? AND status = 'claimed' AND token IS ?",
-                    (str(archive), token),
-                )
-
-        self._retry_on_locked(_release)
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM extractions WHERE archive_path = ? AND status = 'claimed' AND token IS ?",
+                (str(archive), token),
+            )
 
     def get_protected_extracted_paths(self, now: float, *, protect_seconds: int) -> set[Path]:
         """Return extracted output files still within their protection window."""
@@ -489,19 +442,6 @@ class StateStore:
                 "DELETE FROM extraction_outputs WHERE (? - created_at) >= ?",
                 (now, protect_seconds),
             )
-
-
-def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
-    """Whether an ``OperationalError`` is a transient write-lock contention.
-
-    SQLite raises ``OperationalError`` for many unrelated reasons (bad SQL, a
-    missing table); only the busy/locked variants are safe to retry, so match on
-    the message text rather than retrying every ``OperationalError`` — which would
-    turn a real programming error into a hang.
-    """
-
-    message = str(exc).lower()
-    return "database is locked" in message or "database is busy" in message
 
 
 def _identity_matches(row: sqlite3.Row, size: int, mtime: float) -> bool:

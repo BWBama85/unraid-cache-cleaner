@@ -5,13 +5,14 @@ from __future__ import annotations
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.extractor import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW
-from unraid_cache_cleaner.state import _LOCK_RETRY_ATTEMPTS, StateStore
+from unraid_cache_cleaner.state import StateStore
 
 
 class ExtractionLedgerTests(unittest.TestCase):
@@ -314,25 +315,55 @@ class ConcurrencyTests(unittest.TestCase):
         store = StateStore(db)
         self.assertEqual(self._journal_mode(store), "wal")
 
-    def test_claim_retries_through_a_lock_held_by_a_concurrent_writer(self) -> None:
+    def test_busy_timeout_is_raised_on_the_connection(self) -> None:
+        # The raised busy timeout is what makes a claim wait for a slow complete
+        # instead of failing. SQLite reports it in milliseconds.
+        store = StateStore(Path(self._tmp.name) / "bt.sqlite3")
+        busy_ms = store._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.assertEqual(busy_ms, 30000)
+
+    def test_claim_waits_for_a_briefly_held_write_lock(self) -> None:
         # #45: a claim racing a slow complete (which holds the write lock) must
-        # wait/retry and win rather than surfacing a spurious 'failed'.
+        # wait for it to finish and then win, not surface a spurious 'failed'.
         db = Path(self._tmp.name) / "contended.sqlite3"
-        bootstrap = StateStore(db)  # create schema + WAL, then drop the connection
-        bootstrap._connection.close()
+        StateStore(db)._connection.close()  # bootstrap schema + WAL
+        store = StateStore(db)  # generous default busy_timeout
 
-        released: list = []
+        lock_held = threading.Event()
+        release = threading.Event()
 
-        def releasing_sleep(_delay: float) -> None:
-            # Model the slow complete finishing: free the write lock on the first
-            # retry so the replayed claim transaction can win.
-            if not released:
-                blocker.rollback()
-                released.append(True)
+        def holder() -> None:
+            conn = sqlite3.connect(db, timeout=30)
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO extractions (archive_path, status, claimed_at) VALUES (?, 'claimed', ?)",
+                ("/data/other.rar", 1.0),
+            )
+            lock_held.set()
+            release.wait(5)
+            conn.commit()
+            conn.close()
 
-        # busy_timeout=0 → the held lock raises 'database is locked' immediately
-        # instead of blocking, so the retry path is exercised deterministically.
-        store = StateStore(db, busy_timeout_seconds=0, sleep=releasing_sleep)
+        worker = threading.Thread(target=holder)
+        worker.start()
+        try:
+            self.assertTrue(lock_held.wait(5))  # writer now holds the lock
+            # Free the lock shortly after; the claim below must block until then.
+            releaser = threading.Timer(0.3, release.set)
+            releaser.start()
+            result = store.claim_extraction(Path("/data/movie.rar"), 1.0, size=1, mtime=1.0)
+            self.assertEqual(result.decision, CLAIM_NEW)  # waited, then won
+        finally:
+            release.set()
+            worker.join(5)
+
+    def test_claim_surfaces_when_a_lock_outlasts_the_busy_timeout(self) -> None:
+        # busy_timeout=0 → no wait: a held write lock raises immediately. This is
+        # the documented tail (past the timeout the OperationalError propagates and
+        # Extractor.extract_all retries the archive next cycle).
+        db = Path(self._tmp.name) / "starved.sqlite3"
+        StateStore(db)._connection.close()  # bootstrap schema + WAL
+        store = StateStore(db, busy_timeout_seconds=0)
 
         blocker = sqlite3.connect(db, timeout=0)
         blocker.execute("BEGIN IMMEDIATE")
@@ -340,38 +371,12 @@ class ConcurrencyTests(unittest.TestCase):
             "INSERT INTO extractions (archive_path, status, claimed_at) VALUES (?, 'claimed', ?)",
             ("/data/other.rar", 1.0),
         )
-
-        result = store.claim_extraction(Path("/data/movie.rar"), 1.0, size=1, mtime=1.0)
-        self.assertEqual(result.decision, CLAIM_NEW)
-        self.assertTrue(released)  # a retry actually happened
-        blocker.close()
-
-    def test_retry_on_locked_reraises_after_exhausting_attempts(self) -> None:
-        store = StateStore(Path(self._tmp.name) / "s.sqlite3")
-        slept: list = []
-        store._sleep = slept.append
-
-        def always_locked() -> None:
-            raise sqlite3.OperationalError("database is locked")
-
-        with self.assertRaises(sqlite3.OperationalError):
-            store._retry_on_locked(always_locked)
-        # One backoff between each of the bounded attempts, none after the last.
-        self.assertEqual(len(slept), _LOCK_RETRY_ATTEMPTS - 1)
-
-    def test_retry_on_locked_does_not_retry_a_non_lock_error(self) -> None:
-        # A real programming error (bad SQL) must surface immediately, not be
-        # retried into a delay/hang.
-        store = StateStore(Path(self._tmp.name) / "s.sqlite3")
-        slept: list = []
-        store._sleep = slept.append
-
-        def bad_sql() -> None:
-            raise sqlite3.OperationalError("no such table: bogus")
-
-        with self.assertRaises(sqlite3.OperationalError):
-            store._retry_on_locked(bad_sql)
-        self.assertEqual(slept, [])
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                store.claim_extraction(Path("/data/movie.rar"), 1.0, size=1, mtime=1.0)
+        finally:
+            blocker.rollback()
+            blocker.close()
 
 
 if __name__ == "__main__":

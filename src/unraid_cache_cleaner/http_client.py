@@ -47,6 +47,11 @@ _RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
 #: (``base``, ``base*2``, ...). Kept small since the target is a LAN service.
 _DEFAULT_BACKOFF_SECONDS = 0.5
 
+#: Ceiling on a single backoff delay, so a large ``HTTP_MAX_ATTEMPTS`` cannot let
+#: the exponential growth stall a request for minutes (and, via Sonarr's parallel
+#: fan-out, the whole report) before it degrades.
+_MAX_BACKOFF_SECONDS = 30.0
+
 
 class JsonHttpError(RuntimeError):
     """Fallback ``*ClientError`` for a subclass that omits :attr:`error_class`.
@@ -212,7 +217,7 @@ class JsonHttpClient:
                 retryable = idempotent
 
             if retryable and attempt < self.max_attempts:
-                delay = self.backoff_seconds * (2 ** (attempt - 1))
+                delay = min(self.backoff_seconds * (2 ** (attempt - 1)), _MAX_BACKOFF_SECONDS)
                 LOGGER.debug(
                     "%s request to %s failed (attempt %s/%s), retrying in %.2fs: %s",
                     self.service_name,

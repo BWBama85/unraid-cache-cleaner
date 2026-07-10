@@ -261,6 +261,19 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(opener.calls, 1)
         self.assertEqual(slept, [])
 
+    def test_backoff_is_capped(self) -> None:
+        # A large max_attempts + exponential growth must not stall a request for
+        # minutes: each delay is capped (_MAX_BACKOFF_SECONDS = 30).
+        opener = _SequenceOpener([_http_error(500)] * 5)
+        client = _DemoClient(
+            "http://demo:9000", "t", max_attempts=5, backoff_seconds=10, sleep=(slept := []).append
+        )
+        client._opener = opener
+        with self.assertRaises(_DemoError):
+            client.get_json("/thing")
+        # 10, 20, min(40,30)=30, min(80,30)=30
+        self.assertEqual(slept, [10, 20, 30, 30])
+
     def test_default_client_makes_a_single_attempt(self) -> None:
         # max_attempts defaults to 1: retries are opt-in, so a transient failure
         # surfaces immediately (the historical behavior).
