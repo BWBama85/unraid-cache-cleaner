@@ -38,7 +38,16 @@ Fail-closed on every axis:
   drift / an id reused for a different same-named file) — no full-library fan-out, so
   a tracked reclaim costs at most one GET + one DELETE per part.
 * **Stacked-safe** — a logical copy's parts are *all* prevalidated before *any* is
-  deleted, so a multi-part copy is removed whole or refused whole.
+  deleted, so a multi-part copy is removed whole or refused whole. For a filesystem
+  copy this is enforced transactionally (#64): every part is first staged aside (an
+  in-place rename to a ``*.uncc-reclaim`` sibling — same directory, so the rename is
+  atomic and cannot fail cross-device), and only once *all* parts stage does the
+  unlink pass run; a failure to stage any part rolls the already-staged parts back,
+  leaving the copy intact with nothing deleted. The guarantee covers in-process
+  failures (``EROFS``/``EACCES`` surface at the rename, where rollback is clean); a
+  ``*arr`` reclaim is *not* transactional — a Radarr/Sonarr ``DELETE`` cannot be
+  rolled back — so its parts are prevalidated whole but deleted independently, and a
+  mid-delete failure is surfaced as a ``partial`` error (audited), not rolled back.
 """
 
 from __future__ import annotations
@@ -67,8 +76,14 @@ LOGGER = logging.getLogger(__name__)
 ReportProvider = Callable[[], Optional[dict]]
 
 #: A filesystem deleter removes one already-validated container path. Injected so a
-#: test can record calls without touching disk; production passes ``os.unlink``.
+#: test can record calls without touching disk; production passes ``os.unlink``. In
+#: the two-phase filesystem reclaim (#64) this unlinks the *staged* path.
 FilesystemDeleter = Callable[[Path], None]
+
+#: A filesystem mover renames ``src`` → ``dst`` (production: ``os.rename``). Used to
+#: stage a part aside before deleting it and to roll a staged part back on failure
+#: (#64); injected so a test can drive a mid-stage rename failure.
+FilesystemMover = Callable[[Path, Path], None]
 
 #: An audit sink persists the action records for a completed reclaim (real deletes
 #: and delete failures only — a dry-run or a refusal touches nothing to audit).
@@ -82,6 +97,12 @@ STATUS_REFUSED = "refused"
 STATUS_ERROR = "error"
 
 BACKEND_FILESYSTEM = "filesystem"
+
+#: Suffix appended in-place (same directory → same filesystem, so the rename is
+#: atomic and never hits ``EXDEV``) to stage a filesystem part aside before it is
+#: unlinked (#64). A leftover ``*.uncc-reclaim`` sibling means an earlier reclaim was
+#: interrupted mid-flight; staging refuses to clobber it rather than guess.
+STAGING_SUFFIX = ".uncc-reclaim"
 
 _MISMATCH = dedupe.MISMATCH
 
@@ -362,6 +383,7 @@ class ReclaimService:
         provider: ReportProvider,
         *,
         filesystem_deleter: FilesystemDeleter = os.unlink,
+        filesystem_mover: FilesystemMover = os.rename,
         radarr: Optional[object] = None,
         sonarr: Optional[object] = None,
         audit: Optional[AuditSink] = None,
@@ -370,6 +392,7 @@ class ReclaimService:
         self._config = config
         self._provider = provider
         self._filesystem_deleter = filesystem_deleter
+        self._filesystem_mover = filesystem_mover
         self._radarr = radarr
         self._sonarr = sonarr
         self._audit = audit
@@ -515,22 +538,32 @@ class ReclaimService:
                 target, BACKEND_FILESYSTEM, total, f"{len(validated)} file(s) via filesystem"
             )
 
+        # Two-phase move (#64): stage every part aside first, so a per-file failure
+        # surfaces at the rename (where rollback is clean) instead of after an unlink
+        # has irreversibly committed. Only once ALL parts stage does the unlink pass
+        # run — so a stacked copy is truly removed whole or refused whole.
+        staged, stage_error = self._stage_for_delete(target, validated)
+        if stage_error is not None:
+            return stage_error
+
         jobs = [
             _DeleteJob(
-                audit_path=container_path,
+                # The audit and the operator-facing message name the *original* media
+                # path, never the transient staging path.
+                audit_path=original,
                 size=size,
-                perform=(lambda p=container_path: self._filesystem_deleter(p)),
+                perform=(lambda sp=staged_path: self._filesystem_deleter(sp)),
                 deleted_message=f"rating_key={target.rating_key} part_id={target.part_id}",
                 error_message=(
                     lambda exc: f"rating_key={target.rating_key} part_id={target.part_id}: {exc}"
                 ),
                 partial_message=(
-                    lambda exc, done, p=container_path: (
+                    lambda exc, done, p=original: (
                         f"partial: deleted {done} bytes, then failed on {p}: {exc}"
                     )
                 ),
             )
-            for container_path, size in validated
+            for original, staged_path, size in staged
         ]
         return self._execute_deletes(
             target,
@@ -538,8 +571,99 @@ class ReclaimService:
             jobs,
             action="web-reclaim:filesystem",
             catch=OSError,
-            success_message=f"{len(validated)} file(s)",
+            success_message=f"{len(staged)} file(s)",
         )
+
+    def _stage_for_delete(
+        self, target: ReclaimTarget, validated: List[Tuple[Path, int]]
+    ) -> Tuple[Optional[List[Tuple[Path, Path, int]]], Optional[ReclaimResult]]:
+        """Phase 1 of the two-phase filesystem delete: rename every prevalidated part
+        to its ``*.uncc-reclaim`` staging sibling, returning ``(staged, None)`` where
+        ``staged`` is ``[(original, staged_path, size)]``.
+
+        The rename is in-place (same directory → same filesystem), so it is atomic and
+        cannot hit ``EXDEV`` even when parts resolve under different media roots. If any
+        part fails to stage — a pre-existing staging sibling (an interrupted prior run,
+        never clobbered) or an ``OSError`` — the parts already staged are rolled back
+        and ``(None, error_result)`` is returned with **nothing deleted**. A rollback
+        that itself fails leaves that part orphaned at its staging path; those are the
+        only records audited here (a clean rollback mutates nothing, so it audits
+        nothing — mirroring a validation refusal)."""
+
+        staged: List[Tuple[Path, Path, int]] = []
+        for original, size in validated:
+            staged_path = original.with_name(original.name + STAGING_SUFFIX)
+            reason: Optional[str] = None
+            if os.path.lexists(staged_path):
+                reason = (
+                    f"a stale staging file {staged_path.name} already exists next to "
+                    f"{original} (an earlier reclaim was interrupted?); refusing to "
+                    "clobber it — remove it by hand and retry"
+                )
+            else:
+                try:
+                    self._filesystem_mover(original, staged_path)
+                except OSError as exc:
+                    reason = f"could not stage {original} for deletion: {exc}"
+            if reason is not None:
+                orphans = self._rollback_staged(staged)
+                return None, self._stage_failure_result(target, reason, orphans)
+            staged.append((original, staged_path, size))
+        return staged, None
+
+    def _rollback_staged(
+        self, staged: List[Tuple[Path, Path, int]]
+    ) -> List[Tuple[Path, Path, int]]:
+        """Best-effort restore of already-staged parts (reverse order), returning the
+        parts that could **not** be restored — orphaned at their staging path. A
+        rollback failure is the only path in the two-phase delete that leaves the
+        filesystem changed, so the caller audits those orphans."""
+
+        orphans: List[Tuple[Path, Path, int]] = []
+        for original, staged_path, size in reversed(staged):
+            try:
+                self._filesystem_mover(staged_path, original)
+            except OSError as exc:
+                LOGGER.error(
+                    "reclaim rollback failed: %s could not be restored to %s (%s)",
+                    staged_path,
+                    original,
+                    exc,
+                )
+                orphans.append((original, staged_path, size))
+        return orphans
+
+    def _stage_failure_result(
+        self,
+        target: ReclaimTarget,
+        reason: str,
+        orphans: List[Tuple[Path, Path, int]],
+    ) -> ReclaimResult:
+        """Build the ``error`` result for a staging failure (0 bytes reclaimed),
+        auditing any parts a failed rollback left orphaned at their staging path."""
+
+        if orphans:
+            records = [
+                ActionRecord(
+                    path=original,
+                    action="web-reclaim:filesystem",
+                    status=STATUS_ERROR,
+                    size=size,
+                    message=(
+                        f"rating_key={target.rating_key} part_id={target.part_id}: "
+                        f"rollback failed; file left staged at {staged_path}"
+                    ),
+                )
+                for original, staged_path, size in orphans
+            ]
+            self._flush_audit(records)
+            detail = (
+                f"; {len(orphans)} file(s) could not be rolled back and remain staged "
+                "(manual restore needed)"
+            )
+        else:
+            detail = "; rolled back, nothing deleted"
+        return self._error(target, BACKEND_FILESYSTEM, 0, f"{reason}{detail}")
 
     def _validate_fs_part(self, part: _Part) -> Tuple[Optional[Path], Optional[str]]:
         """Resolve a Plex path to a real, mounted, size-matching regular file under a
