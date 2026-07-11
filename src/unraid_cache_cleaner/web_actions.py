@@ -120,6 +120,11 @@ RECONCILE_ACTION = "web-reclaim:reconcile"
 #: interrupted mid-flight; staging refuses to clobber it rather than guess.
 STAGING_SUFFIX = ".uncc-reclaim"
 
+#: A UTF-8 code point encodes to at most 4 bytes, so a mid-character cut in
+#: :meth:`ReclaimService._staging_path` can drop up to 3 trailing bytes — the slack
+#: :meth:`ReclaimService._original_for_staging` must treat as possibly-truncated.
+_MAX_UTF8_CHAR_BYTES = 4
+
 _MISMATCH = dedupe.MISMATCH
 
 
@@ -540,6 +545,12 @@ class ReclaimService:
         """
 
         report = StagingSweepReport()
+        # The shared token gate governs every media mutation: without a configured
+        # ``WEB_ACTION_TOKEN`` ``reclaim`` refuses all deletes, so the sweep — which can
+        # unlink leftovers — must stand down too. A token-less start stays fully inert,
+        # even in real-delete mode, rather than mutating the tree behind the gate.
+        if not self._config.web_action_token:
+            return report
         roots = self._staging_roots()
         if not roots:
             return report
@@ -585,10 +596,17 @@ class ReclaimService:
     def _reconcile_one_sibling(
         self, sibling: Path, records: List[ActionRecord], report: StagingSweepReport
     ) -> None:
-        # A symlink bearing our suffix is not one of ours (staging always renames a
-        # validated regular file) — never restore or delete through it.
-        if os.path.islink(sibling):
-            self._skip_sibling(sibling, records, report, "is a symlink, not a staging file")
+        # Staging only ever renames a validated *regular* file, so anything else
+        # bearing our suffix — a symlink, FIFO, socket, device node, or directory — is
+        # not one of ours and is never restored or deleted through.
+        try:
+            info = os.lstat(sibling)
+        except OSError as exc:
+            self._skip_sibling(sibling, records, report, f"could not stat sibling: {exc}")
+            return
+        if not stat_mod.S_ISREG(info.st_mode):
+            kind = "a symlink" if stat_mod.S_ISLNK(info.st_mode) else "a non-regular special file"
+            self._skip_sibling(sibling, records, report, f"is {kind}, not a staging file")
             return
         original = self._original_for_staging(sibling)
         if original is None:
@@ -625,11 +643,14 @@ class ReclaimService:
         except (OSError, ValueError, AttributeError):
             name_max = 255
         max_base = max(1, name_max - len(STAGING_SUFFIX.encode("utf-8")))
-        # ``_staging_path`` only truncates when the original overflows ``max_base``,
-        # cutting the base to exactly that budget. A staged base at (or over) the
-        # budget is therefore indistinguishable from a truncation of a longer name —
-        # so it is ambiguous. A shorter base was provably never truncated.
-        if len(base.encode("utf-8", "surrogatepass")) >= max_base:
+        # ``_staging_path`` truncates when the original overflows ``max_base``, cutting
+        # to ``max_base`` bytes — but its ``decode(..., "ignore")`` drops a trailing
+        # byte sequence left incomplete by a mid-character cut, so a *lossy* truncation
+        # of a multibyte name lands up to 3 bytes short of the budget (UTF-8 encodes a
+        # code point in at most 4 bytes). Any staged base within that slack of the
+        # budget is therefore indistinguishable from a truncation — ambiguous, so it is
+        # flagged, not reconstructed. A base comfortably shorter was provably never cut.
+        if len(base.encode("utf-8", "surrogatepass")) >= max_base - (_MAX_UTF8_CHAR_BYTES - 1):
             return None
         return sibling.with_name(base)
 

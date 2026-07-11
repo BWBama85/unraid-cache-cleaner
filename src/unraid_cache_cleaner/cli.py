@@ -189,8 +189,13 @@ def _build_web_server(config: Config) -> "web.DuplicateReportServer":
 
     provider = web.file_report_provider(config.plex_duplicate_report_path)
     reclaim_service = _build_reclaim_service(config, provider)
+    # Bind the socket BEFORE reconciling: a bad bind address, an in-use port, or an
+    # unwritable audit DB must fail the start without the staging sweep having mutated
+    # the media tree. The server is bound but not yet serving here, so the sweep still
+    # runs before any request is accepted.
+    server = web.build_server(config, provider=provider, reclaim_service=reclaim_service)
     _reconcile_web_staging(reclaim_service, config)
-    return web.build_server(config, provider=provider, reclaim_service=reclaim_service)
+    return server
 
 
 def _reconcile_web_staging(

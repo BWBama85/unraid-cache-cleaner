@@ -298,6 +298,40 @@ class ReconcileWebStagingTests(unittest.TestCase):
         cli._reconcile_web_staging(svc, self._Cfg(mapped=True))
         self.assertEqual(svc.calls, 1)
 
+    def test_build_web_server_binds_before_reconciling(self) -> None:
+        # #72 / bot review: the socket must bind before the sweep runs, so the two
+        # happen in order build → sweep (never sweep → build).
+        order = []
+        with mock.patch.object(cli.web, "file_report_provider", return_value=lambda: None), \
+                mock.patch.object(cli, "_build_reclaim_service", return_value=mock.Mock()), \
+                mock.patch.object(
+                    cli.web, "build_server",
+                    side_effect=lambda *a, **k: order.append("build") or mock.Mock(),
+                ), \
+                mock.patch.object(
+                    cli, "_reconcile_web_staging",
+                    side_effect=lambda *a: order.append("sweep"),
+                ):
+            cli._build_web_server(mock.Mock())
+        self.assertEqual(order, ["build", "sweep"])
+
+    def test_bind_failure_skips_the_sweep(self) -> None:
+        # A failed bind (bad address / port in use) must abort startup WITHOUT the
+        # staging sweep having mutated the media tree.
+        swept = []
+        with mock.patch.object(cli.web, "file_report_provider", return_value=lambda: None), \
+                mock.patch.object(cli, "_build_reclaim_service", return_value=mock.Mock()), \
+                mock.patch.object(
+                    cli.web, "build_server", side_effect=OSError("port in use")
+                ), \
+                mock.patch.object(
+                    cli, "_reconcile_web_staging",
+                    side_effect=lambda *a: swept.append("swept"),
+                ):
+            with self.assertRaises(OSError):
+                cli._build_web_server(mock.Mock())
+        self.assertEqual(swept, [])  # sweep never ran
+
 
 if __name__ == "__main__":
     unittest.main()

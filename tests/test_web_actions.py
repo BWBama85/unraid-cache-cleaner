@@ -819,15 +819,19 @@ class StagingSweepTests(unittest.TestCase):
     rollback can't reach: a crash mid-move (restore) and a post-commit purge leftover
     (remove), fail-closed on anything ambiguous."""
 
-    def _service_for(self, tmp, *, dry_run=False, nested=False, deleter=os.unlink,
-                     mover=os.rename):
+    def _service_for(self, tmp, *, dry_run=False, nested=False, token="tok",
+                     deleter=os.unlink, mover=os.rename):
         media_root = Path(tmp) / "media"
         (media_root / "movie").mkdir(parents=True)
         maps = [(Path("/plex"), media_root)]
         if nested:  # an overlapping map entry nested inside the first
             maps.append((Path("/plex/movie"), media_root / "movie"))
         audit = _FakeAudit()
-        config = _config(web_media_path_map=tuple(maps), web_actions_dry_run=dry_run)
+        config = _config(
+            web_media_path_map=tuple(maps),
+            web_actions_dry_run=dry_run,
+            web_action_token=token,
+        )
         service = _service(
             _report([]), config=config, audit=audit, deleter=deleter, mover=mover
         )
@@ -914,6 +918,55 @@ class StagingSweepTests(unittest.TestCase):
             self.assertTrue(staged.exists())  # untouched
             self.assertEqual([r.status for r in audit.records], ["skipped"])
             self.assertIn("truncat", audit.records[0].message.lower())
+
+    def test_lossy_truncation_remnant_is_skipped(self) -> None:
+        # A multibyte name cut mid-character in _staging_path leaves a base a few bytes
+        # short of the budget (decode-ignore drops the partial trailing char). Such a
+        # base — within UTF-8's 3-byte slack of the budget — must be flagged ambiguous,
+        # not reconstructed to a bogus shortened name. Simulated with a base 2 bytes
+        # under budget, exactly what a lossy cut of a 4-byte-char name produces.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp)
+            movie = media_root / "movie"
+            try:
+                name_max = int(os.pathconf(movie, "PC_NAME_MAX"))
+            except (OSError, ValueError, AttributeError):
+                name_max = 255
+            max_base = max(1, name_max - len(STAGING_SUFFIX.encode("utf-8")))
+            base = "y" * (max_base - 2)  # inside the slack; provably too long to trust
+            staged = movie / (base + STAGING_SUFFIX)
+            staged.write_bytes(b"data")
+            report = service.reconcile_staging()
+            self.assertEqual(report.skipped, 1)
+            self.assertEqual(report.restored, 0)
+            self.assertTrue(staged.exists())  # untouched
+            self.assertIn("truncat", audit.records[0].message.lower())
+
+    def test_fifo_sibling_is_skipped(self) -> None:
+        # A non-regular special file (FIFO/socket/device) bearing our suffix was never
+        # created by staging — the sweep must never rename or delete through it.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp)
+            fifo = media_root / "movie" / ("cd1.mkv" + STAGING_SUFFIX)
+            os.mkfifo(fifo)
+            report = service.reconcile_staging()
+            self.assertEqual(report.skipped, 1)
+            self.assertTrue(fifo.exists())  # untouched
+            self.assertEqual([r.status for r in audit.records], ["skipped"])
+            self.assertIn("non-regular", audit.records[0].message)
+
+    def test_no_token_configured_is_noop(self) -> None:
+        # The shared token gate governs every mutation: with WEB_ACTION_TOKEN unset,
+        # reclaim refuses all deletes, so the sweep must stand down too — even a
+        # real-delete-mode start must not unlink leftovers behind the gate.
+        with tempfile.TemporaryDirectory() as tmp:
+            service, media_root, audit = self._service_for(tmp, token="")
+            staged = media_root / "movie" / ("cd1.mkv" + STAGING_SUFFIX)
+            staged.write_bytes(b"data")
+            report = service.reconcile_staging()
+            self.assertEqual(report.total, 0)
+            self.assertTrue(staged.exists())  # untouched — sweep stood down
+            self.assertEqual(audit.records, [])
 
     def test_symlink_sibling_is_skipped(self) -> None:
         # A symlink bearing our suffix was never created by staging (which renames a
