@@ -1646,6 +1646,13 @@ class SessionTokenTests(unittest.TestCase):
         rotated = _service(_report([]), config=_config(web_action_token="different"))
         self.assertFalse(rotated._session_valid(token))
 
+    def test_non_ascii_signature_refuses_without_raising(self) -> None:
+        # A hostile cookie can smuggle a non-ASCII char into the signature (a quoted
+        # octal escape); hmac.compare_digest raises TypeError on a non-ASCII str, so a
+        # naive compare would crash the request thread. It must refuse cleanly instead.
+        service = _service(_report([]))
+        self.assertFalse(service._session_valid("v1.9999999999.\xe9abc"))
+
     def test_reclaim_accepts_valid_session_instead_of_token(self) -> None:
         service = _service(_report([]))
         session = service.mint_session()
@@ -1838,6 +1845,22 @@ class ConfirmationFlowHttpTests(unittest.TestCase):
                     {**_FORM_CT, "Origin": base},
                 )
         self.assertNotIn("Secure", h_http.get("Set-Cookie", ""))
+
+    def test_hostile_non_ascii_cookie_is_clean_403(self) -> None:
+        # A quoted cookie value smuggling a non-ASCII byte (octal escape) must yield a
+        # clean 403, never crash the request thread (hmac.compare_digest raises on a
+        # non-ASCII str) and drop the connection.
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                status, _, _ = _post_resp(
+                    base + "/actions/reclaim",
+                    _form(report_generated_at=GEN, target="900:2"),
+                    {**_FORM_CT, "Cookie": r'ucc_session="v1.9999999999.\351abc"'},
+                )
+            self.assertEqual(status, 403)
+            self.assertEqual(deleter.calls, [])
+            self.assertTrue(real.exists())
 
     def test_preview_cross_origin_on_nonloopback_is_403(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

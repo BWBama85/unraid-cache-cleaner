@@ -613,7 +613,14 @@ class ReclaimService:
             return False
         if expiry < int(self._clock()):
             return False
-        return hmac.compare_digest(signature, self._session_sig(configured, expiry))
+        # Compare UTF-8 bytes, not ``str`` — ``hmac.compare_digest`` raises TypeError on
+        # a ``str`` containing non-ASCII, and the signature is client-controlled (a
+        # cookie value can smuggle a non-ASCII char via a quoted octal escape), so a
+        # ``str`` compare would crash the request thread on a hostile cookie instead of
+        # simply refusing. Mirrors :func:`_token_ok`.
+        return hmac.compare_digest(
+            signature.encode("utf-8"), self._session_sig(configured, expiry).encode("utf-8")
+        )
 
     @staticmethod
     def _session_sig(token: str, expiry: int) -> str:
