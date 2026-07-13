@@ -165,7 +165,10 @@ section for the full contract. On Unraid specifically:
    state DB under `/config`; the read-only **`/actions`** page (linked from the
    report) lists what the UI removed, newest first. It is LAN-readable by default;
    set `WEB_ACTION_HISTORY_AUTH=true` to require your reclaim token/unlock session to
-   view it (and `/api/actions`), since it exposes previously-deleted paths.
+   view it (and `/api/actions`), since it exposes previously-deleted paths. To put the
+   **report** itself (`/` + `/api/report`) behind the same credential, set
+   `WEB_ACTION_REPORT_AUTH=true` — the gated page shows a token box to unlock in place;
+   enable both to gate the entire read surface.
 6. **Reverse proxy? Set the allowed origin.** The template binds `0.0.0.0`, so the
    reclaim *form* requires a same-origin request (a cross-site form POST is refused
    even without an `Origin` header) — direct LAN access to `http://<tower>:8080`

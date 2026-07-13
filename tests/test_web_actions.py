@@ -29,10 +29,15 @@ from unraid_cache_cleaner.web import (
     DuplicateReportServer,
     DuplicateReportViewer,
     build_server,
+    render_reclaim_result_html,
     render_report_html,
 )
 from unraid_cache_cleaner.web_actions import (
     STAGING_SUFFIX,
+    STATUS_DELETED,
+    STATUS_REFUSED,
+    ReclaimResponse,
+    ReclaimResult,
     ReclaimService,
     ReclaimTarget,
     build_action_index,
@@ -2250,6 +2255,358 @@ def _action_row_dict(**overrides) -> dict:
     )
     row.update(overrides)
     return row
+
+
+# --------------------------------------------------------------------------- #
+# #85 — opt-in auth for the report read surface (/ + /index.html + /api/report) #
+# --------------------------------------------------------------------------- #
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that never follows — so a test can assert the ``303`` the
+    unlock endpoint returns (status, ``Location``, ``Set-Cookie``) instead of urllib
+    silently chasing it to ``/``."""
+
+    def redirect_request(self, *args, **kwargs):  # noqa: D401
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _post_noredirect(url, data, headers):
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with _NO_REDIRECT_OPENER.open(req, timeout=5) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:  # a non-followed 3xx surfaces here
+        return exc.code, exc.headers, exc.read()
+
+
+class _RecordingProvider:
+    """A report provider that records whether it was ever called — so a test can prove
+    a denied request is refused *before* the report is read."""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.called = False
+
+    def __call__(self):
+        self.called = True
+        return self._payload
+
+
+@contextmanager
+def _serve_report(
+    *,
+    report_auth=True,
+    inline_script=False,
+    token="tok",
+    actions_enabled=True,
+    attach_service=True,
+    allowed_origins=(),
+    provider=None,
+    payload=None,
+):
+    """Serve via the real ``build_server`` so the config→wiring (report gate, inline
+    script, startup warning) is exercised end to end."""
+
+    if payload is None:
+        payload = _untracked_payload()
+    config = _config(
+        web_bind_address="127.0.0.1",
+        web_port=0,
+        web_action_token=token,
+        web_actions_enabled=actions_enabled,
+        web_action_report_auth=report_auth,
+        web_action_inline_script=inline_script,
+        web_allowed_origins=tuple(allowed_origins),
+    )
+    prov = _RecordingProvider(payload) if provider is None else provider
+    service = _service(payload, config=config) if attach_service else None
+    server = build_server(config, provider=prov, reclaim_service=service)
+    server.start_background()
+    try:
+        yield f"http://127.0.0.1:{server.port}", service, prov
+    finally:
+        server.shutdown()
+
+
+class ReportAuthTests(unittest.TestCase):
+    """The opt-in gate for the report read surface (#85)."""
+
+    def test_default_off_leaves_report_lan_readable(self) -> None:
+        with _serve_report(report_auth=False) as (base, _, _):
+            self.assertEqual(_get_h(base + "/")[0], 200)
+            self.assertEqual(_get_h(base + "/index.html")[0], 200)
+            self.assertEqual(_get_h(base + "/api/report")[0], 200)
+
+    def test_html_requires_credential_and_offers_unlock_form(self) -> None:
+        with _serve_report() as (base, _, prov):
+            status, headers, body = _get_h(base + "/")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get("Content-Type"), "text/html; charset=utf-8")
+        self.assertIn(b"Report locked", body)
+        self.assertIn(b'action="/actions/unlock"', body)  # the no-JS unlock entry point
+        self.assertFalse(prov.called)  # denied before the report provider is read
+
+    def test_index_html_alias_is_gated(self) -> None:
+        with _serve_report() as (base, _, prov):
+            self.assertEqual(_get_h(base + "/index.html")[0], 403)
+        self.assertFalse(prov.called)
+
+    def test_api_requires_credential(self) -> None:
+        with _serve_report() as (base, _, prov):
+            status, headers, body = _get_h(base + "/api/report")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get("Content-Type"), "application/json; charset=utf-8")
+        self.assertIn(b"authentication", body)
+        self.assertFalse(prov.called)
+
+    def test_token_header_authorizes_api(self) -> None:
+        with _serve_report() as (base, _, prov):
+            status, _, body = _get_h(base + "/api/report", {"X-Action-Token": "tok"})
+        self.assertEqual(status, 200)
+        self.assertTrue(prov.called)
+        self.assertIn(b'"available": true', body)
+
+    def test_wrong_token_is_403(self) -> None:
+        with _serve_report() as (base, _, prov):
+            self.assertEqual(_get_h(base + "/api/report", {"X-Action-Token": "nope"})[0], 403)
+        self.assertFalse(prov.called)
+
+    def test_session_cookie_authorizes_html(self) -> None:
+        with _serve_report() as (base, service, _):
+            status, _, body = _get_h(base + "/", _cookie(service.mint_session()))
+        self.assertEqual(status, 200)
+        self.assertIn(b"Plex duplicate report", body)
+
+    def test_healthz_stays_public(self) -> None:
+        with _serve_report() as (base, _, _):
+            self.assertEqual(_get_h(base + "/healthz")[0], 200)
+
+    def test_history_gate_is_independent(self) -> None:
+        # Report auth on, history auth off: the history stays LAN-readable while the
+        # report is gated — the two options are independent (#85).
+        with _serve_report() as (base, _, _):
+            self.assertEqual(_get_h(base + "/actions")[0], 200)
+            self.assertEqual(_get_h(base + "/")[0], 403)
+
+    def test_head_parity_with_get(self) -> None:
+        with _serve_report() as (base, service, _):
+            self.assertEqual(_head_status(base + "/")[0], 403)
+            status, body = _head_status(base + "/", _cookie(service.mint_session()))
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"")
+
+    def test_fail_closed_when_no_token(self) -> None:
+        # Gate on but no WEB_ACTION_TOKEN: nothing can authenticate, so the report is
+        # denied and the locked page reports unlocking is unavailable.
+        with _serve_report(token="") as (base, _, prov):
+            status, _, body = _get_h(base + "/")
+        self.assertEqual(status, 403)
+        self.assertIn(b"Unlocking is unavailable", body)
+        self.assertFalse(prov.called)
+
+    def test_fail_closed_when_actions_disabled(self) -> None:
+        with _serve_report(attach_service=False) as (base, _, prov):
+            self.assertEqual(_get_h(base + "/")[0], 403)
+            self.assertEqual(_get_h(base + "/api/report", {"X-Action-Token": "tok"})[0], 403)
+        self.assertFalse(prov.called)
+
+    def test_responses_are_no_store(self) -> None:
+        # A gated report must never be cached by a shared proxy (could replay a
+        # cookie-authorized copy to an unauthenticated client).
+        with _serve_report() as (base, service, _):
+            _, denied_headers, _ = _get_h(base + "/")
+            _, ok_headers, _ = _get_h(base + "/", _cookie(service.mint_session()))
+        self.assertEqual(denied_headers.get("Cache-Control"), "no-store")
+        self.assertEqual(ok_headers.get("Cache-Control"), "no-store")
+
+    def test_host_gate_precedes_report_auth(self) -> None:
+        with _serve_report() as (base, _, _):
+            status, _, _ = _get_h(
+                base + "/", {"X-Action-Token": "tok", "Host": "evil.example"}
+            )
+        self.assertEqual(status, 403)
+
+
+class UnlockEndpointTests(unittest.TestCase):
+    """``POST /actions/unlock`` — the no-JS unlock entry point (#85)."""
+
+    def test_valid_token_redirects_and_sets_cookie(self) -> None:
+        with _serve_report() as (base, _, _):
+            status, headers, _ = _post_noredirect(
+                base + "/actions/unlock", _form(next="/", token="tok"), _FORM_CT
+            )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers.get("Location"), "/")
+        cookie = headers.get("Set-Cookie")
+        self.assertTrue(cookie.startswith("ucc_session="))
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+
+    def test_unlock_then_report_loads_end_to_end(self) -> None:
+        # The whole no-JS flow: post the token, carry the minted cookie, load the report.
+        with _serve_report() as (base, _, _):
+            _, headers, _ = _post_noredirect(
+                base + "/actions/unlock", _form(next="/", token="tok"), _FORM_CT
+            )
+            pair = _cookie_pair(headers)
+            self.assertEqual(_get_h(base + "/", {"Cookie": pair})[0], 200)
+
+    def test_invalid_token_is_403_and_sets_no_cookie(self) -> None:
+        with _serve_report() as (base, _, _):
+            status, headers, body = _post_resp(
+                base + "/actions/unlock", _form(next="/", token="wrong"), _FORM_CT
+            )
+        self.assertEqual(status, 403)
+        self.assertIsNone(headers.get("Set-Cookie"))
+        self.assertIn(b"Invalid or missing action token", body)
+
+    def test_missing_token_is_403(self) -> None:
+        with _serve_report() as (base, _, _):
+            status, _ = _post(base + "/actions/unlock", _form(next="/"), _FORM_CT)
+        self.assertEqual(status, 403)
+
+    def test_token_is_never_echoed_into_the_response(self) -> None:
+        secret = "super-secret-value"
+        with _serve_report() as (base, _, _):
+            _, _, body = _post_resp(
+                base + "/actions/unlock", _form(next="/", token=secret), _FORM_CT
+            )
+        self.assertNotIn(secret.encode(), body)
+
+    def test_next_is_allow_listed_no_open_redirect(self) -> None:
+        with _serve_report() as (base, _, _):
+            # A hostile next collapses to the report root, never an off-site URL.
+            _, headers, _ = _post_noredirect(
+                base + "/actions/unlock",
+                _form(next="https://evil.example/x", token="tok"),
+                _FORM_CT,
+            )
+            self.assertEqual(headers.get("Location"), "/")
+            # A valid allow-listed next (the history page) is honored.
+            _, headers2, _ = _post_noredirect(
+                base + "/actions/unlock", _form(next="/actions", token="tok"), _FORM_CT
+            )
+            self.assertEqual(headers2.get("Location"), "/actions")
+
+    def test_unlock_is_405_when_actions_disabled(self) -> None:
+        with _serve_report(report_auth=False, attach_service=False) as (base, _, _):
+            status, _ = _post(base + "/actions/unlock", _form(next="/", token="tok"), _FORM_CT)
+        self.assertEqual(status, 405)
+
+    def test_oversized_body_is_413(self) -> None:
+        big = b"token=" + b"x" * (256 * 1024 + 16)
+        with _serve_report() as (base, _, _):
+            status, _ = _post(base + "/actions/unlock", big, _FORM_CT)
+        self.assertEqual(status, 413)
+
+    def test_cross_origin_is_refused(self) -> None:
+        # With an allow-list configured, browser-form origin is enforced even on loopback.
+        with _serve_report(allowed_origins=("http://ok.example",)) as (base, _, _):
+            status, _ = _post(
+                base + "/actions/unlock",
+                _form(next="/", token="tok"),
+                {**_FORM_CT, "Origin": "http://evil.example"},
+            )
+        self.assertEqual(status, 403)
+
+
+# --------------------------------------------------------------------------- #
+# #80 — optional nonce'd inline enhancement script                             #
+# --------------------------------------------------------------------------- #
+
+_NONCE_RE = re.compile(rb"script-src 'nonce-([^']+)'")
+
+
+def _csp_nonce(headers) -> str:
+    match = _NONCE_RE.search((headers.get("Content-Security-Policy") or "").encode())
+    return match.group(1).decode() if match else ""
+
+
+class InlineScriptTests(unittest.TestCase):
+    """The opt-in ``WEB_ACTION_INLINE_SCRIPT`` enhancement (#80)."""
+
+    def test_off_by_default_no_script_no_nonce(self) -> None:
+        with _serve_report(report_auth=False, inline_script=False) as (base, _, _):
+            _, headers, body = _get_h(base + "/")
+        self.assertNotIn(b"<script", body)
+        self.assertNotIn(b"script-src", (headers.get("Content-Security-Policy") or "").encode())
+
+    def test_on_emits_single_nonced_script_matching_csp(self) -> None:
+        with _serve_report(report_auth=False, inline_script=True) as (base, _, _):
+            _, headers, body = _get_h(base + "/")
+        nonce = _csp_nonce(headers)
+        self.assertTrue(nonce)
+        self.assertEqual(body.count(b"<script"), 1)
+        self.assertIn(f'<script nonce="{nonce}">'.encode(), body)
+        self.assertIn(b'id="ucc-select-all"', body)
+        self.assertIn(b"data-bytes=", body)
+
+    def test_nonce_is_fresh_per_response(self) -> None:
+        with _serve_report(report_auth=False, inline_script=True) as (base, _, _):
+            _, h1, _ = _get_h(base + "/")
+            _, h2, _ = _get_h(base + "/")
+        self.assertTrue(_csp_nonce(h1))
+        self.assertNotEqual(_csp_nonce(h1), _csp_nonce(h2))
+
+    def test_csp_keeps_strict_defaults_and_no_external_script(self) -> None:
+        with _serve_report(report_auth=False, inline_script=True) as (base, _, _):
+            _, headers, body = _get_h(base + "/")
+        csp = headers.get("Content-Security-Policy") or ""
+        self.assertIn("default-src 'none'", csp)
+        self.assertNotIn("'unsafe-inline'", csp.split("script-src", 1)[1])  # no script unsafe-inline
+        # The inline script never fetches or references an external asset.
+        self.assertNotIn(b"src=", body.split(b"<script", 1)[1].split(b"</script>", 1)[0])
+        self.assertNotIn(b"fetch(", body)
+        self.assertNotIn(b"XMLHttpRequest", body)
+
+    def test_disabled_when_actions_disabled(self) -> None:
+        # The script rides the reclaim form; the read-only viewer never emits it or a nonce.
+        with _serve_report(
+            report_auth=False, inline_script=True, actions_enabled=False, attach_service=False
+        ) as (base, _, _):
+            _, headers, body = _get_h(base + "/")
+        self.assertNotIn(b"<script", body)
+        self.assertNotIn(b"script-src", (headers.get("Content-Security-Policy") or "").encode())
+
+
+# --------------------------------------------------------------------------- #
+# #80 — reclaim result links back to the report row it affected                #
+# --------------------------------------------------------------------------- #
+
+class ResultLinkbackTests(unittest.TestCase):
+    def _result(self, rating_key="900", part_id=2, status=STATUS_DELETED):
+        return ReclaimResponse(
+            200, True, False, "",
+            [ReclaimResult(rating_key, part_id, status, "filesystem", "ok", 5 * GiB)],
+        )
+
+    def test_result_target_links_to_report_anchor(self) -> None:
+        html = render_reclaim_result_html(self._result())
+        self.assertIn('href="/#copy-900-2"', html)
+
+    def test_report_reclaimable_row_carries_matching_anchor(self) -> None:
+        html = render_report_html(_untracked_payload(), actions_enabled=True)
+        self.assertIn('id="copy-900-2"', html)
+
+    def test_unaddressable_result_renders_no_link(self) -> None:
+        html = render_reclaim_result_html(self._result(part_id=0))
+        self.assertNotIn("href=\"/#copy-", html)
+        self.assertIn("900:0", html)
+
+    def test_deleted_and_refused_targets_both_link_back(self) -> None:
+        resp = ReclaimResponse(
+            200, True, False, "",
+            [
+                ReclaimResult("900", 2, STATUS_DELETED, "filesystem", "ok", 5 * GiB),
+                ReclaimResult("901", 3, STATUS_REFUSED, "", "keeper", 0),
+            ],
+        )
+        html = render_reclaim_result_html(resp)
+        self.assertIn('href="/#copy-900-2"', html)
+        self.assertIn('href="/#copy-901-3"', html)
 
 
 if __name__ == "__main__":

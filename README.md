@@ -130,6 +130,8 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `WEB_ALLOWED_ORIGINS` | empty | Comma-separated allow-list of external origins (e.g. `https://media.example.com`) that may submit the reclaim form. Set this behind a TLS-terminating reverse proxy, where the server sees plain HTTP and can't trust `Host` to infer the external scheme. Empty uses the same-origin-vs-`Host` check (the LAN default). See [CSRF/origin hardening](#reclaiming-duplicates-from-the-browser-phase-2) |
 | `WEB_ALLOWED_HOSTS` | empty | Comma-separated allow-list of hostnames permitted in the request `Host` header, the [DNS-rebinding defense](#reclaiming-duplicates-from-the-browser-phase-2). IP-literal and `localhost` hosts are **always** accepted (an IP can't be rebound), so direct LAN-by-IP access needs no config; a request whose `Host` is an *unlisted hostname* is refused on every route. Set this if you reach the UI through a hostname (e.g. `tower.local`); hostnames of `WEB_ALLOWED_ORIGINS` are added automatically |
 | `WEB_ACTION_HISTORY_AUTH` | `false` | Require the reclaim credential to view the [action-history](#action-history) views `/actions` + `/api/actions` (which expose previously-deleted absolute paths + sizes). Off keeps them LAN-readable like `/` and `/api/report`. When `true`, `/api/actions` needs the `X-Action-Token` header (or the unlock cookie) and `/actions` needs the browser unlock session (earned via `WEB_ACTION_TOKEN` → preview). Needs actions enabled **and** a token set, or it fails closed — the history is denied to everyone (a startup warning flags the lockout). `/` + `/api/report` are unaffected |
+| `WEB_ACTION_REPORT_AUTH` | `false` | Require the reclaim credential to view the **report** surface `/` + `/index.html` + `/api/report` (which expose media paths + sizes). Off keeps them LAN-readable (the default). When `true`, `/api/report` needs the `X-Action-Token` header and the browser routes need the unlock session — the gated `/` 403 page carries a no-JS token form (`POST /actions/unlock`) so you can unlock even though `/` itself is now gated. **Independent** of `WEB_ACTION_HISTORY_AUTH`: set **both** to place the *entire* read surface behind the credential. Needs actions enabled **and** a token set, or it fails closed (report denied to everyone; a startup warning flags the lockout) |
+| `WEB_ACTION_INLINE_SCRIPT` | `false` | Opt into a single self-contained inline enhancement script on the reclaim form (select-all + a live selected-count/size total). Off keeps the strict no-script CSP. When `true` (and actions are on) the script is admitted by a fresh per-response `script-src 'nonce-…'` — no external asset, no `fetch`/XHR, and the form works fully with JavaScript disabled |
 
 > **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup. The optional `RADARR_*`/`SONARR_*` variables add [`*arr`-tracking annotations](#radarrsonarr-tracking-optional) to that report; each is inert unless both its URL and API key are set.
 
@@ -400,8 +402,18 @@ can require the reclaim credential to view them by setting `WEB_ACTION_HISTORY_A
 `/actions` needs the browser unlock session you earn by presenting `WEB_ACTION_TOKEN` on
 the report page. The gate authenticates against that token, so it needs actions enabled
 **and** a token configured — otherwise it fails closed (the history is denied to
-everyone, and the server logs a startup warning about the lockout). `/` and `/api/report`
-are never affected.
+everyone, and the server logs a startup warning about the lockout).
+
+The **report** surface (`/` + `/index.html` + `/api/report`) is likewise LAN-readable by
+default, but it too exposes media paths and sizes. Set `WEB_ACTION_REPORT_AUTH=true` to
+place it behind the same reclaim credential — `/api/report` then needs the `X-Action-Token`
+header, and the browser routes need the unlock session. Because `/` is the page you'd
+normally unlock *through*, gating it would otherwise lock you out — so the gated 403 page
+carries a no-JS **unlock form** (a bare token field posting to `POST /actions/unlock`,
+which mints the session and redirects back). This option is **independent** of
+`WEB_ACTION_HISTORY_AUTH`: enable **both** to require the credential across the *entire*
+read surface. It fails closed the same way (report denied to everyone, startup warning)
+when actions are off or no token is set.
 
 > **On the unlock credential's lifetime (#83).** The browser unlock session authorizes
 > *being unlocked* for `WEB_ACTION_SESSION_SECONDS`, not a single confirm — it is
