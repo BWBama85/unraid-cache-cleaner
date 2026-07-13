@@ -119,10 +119,12 @@ def report_generation_lock(lock_path: Path) -> Iterator[bool]:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
         except OSError as exc:
-            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
                 yield False  # another process holds it — caller skips
                 return
-            # ENOTSUP/EINVAL etc.: the mount doesn't support flock — degrade to acquired.
+            # Any other error (ENOTSUP/EINVAL on a mount that rejects flock, EACCES from a
+            # permission problem, …) is NOT lock contention — degrade to acquired and let
+            # the regeneration proceed rather than silently skipping it forever.
             LOGGER.debug("flock unsupported on %s (%s); proceeding unlocked", lock_path, exc)
             degraded = True
             yield True
@@ -203,7 +205,14 @@ class ReportRescanService:
                 return RESCAN_ALREADY_RUNNING
             self._running = True
             self._started_at = self._clock()
-        self._spawn(self._run)
+        try:
+            self._spawn(self._run)
+        except Exception:
+            # Spawning the worker failed (e.g. thread-creation resource exhaustion). Reset
+            # the flag so the service is not wedged "running" forever, then re-raise.
+            with self._lock:
+                self._running = False
+            raise
         return RESCAN_STARTED
 
     def status(self) -> RescanStatus:

@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 from .arr import ArrClientError, RadarrClient, SonarrClient
 from .config import Config
 from .extractor import Extractor, ExtractorError, summarize
+from .models import DuplicateReport
 from .planner import collapse_roots
 from .plex import PlexClient, PlexClientError
 from .plex_report import PlexDuplicateReporter
@@ -417,8 +418,9 @@ def _build_reporter(config: Config) -> PlexDuplicateReporter:
 
 
 def _generate_and_publish(
-    reporter: PlexDuplicateReporter, section_overrides=None
-):
+    reporter: PlexDuplicateReporter,
+    section_overrides: Optional[List[str]] = None,
+) -> DuplicateReport:
     """Generate the report, publish it atomically, and log the summary.
 
     The reporter's ``write_report`` is atomic (temp file + ``os.replace``), so a failure

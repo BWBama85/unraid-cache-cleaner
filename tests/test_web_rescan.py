@@ -113,6 +113,19 @@ class RescanServiceTests(unittest.TestCase):
         threads[0].join(5)
         self.assertFalse(svc.status().running)
 
+    def test_spawn_failure_resets_running_flag(self) -> None:
+        # A worker-spawn failure must not wedge the service "running" forever.
+        def bad_spawn(_target):
+            raise RuntimeError("cannot start thread")
+
+        svc = self._service(lambda: None, spawn=bad_spawn)
+        with self.assertRaises(RuntimeError):
+            svc.trigger()
+        self.assertFalse(svc.status().running)  # reset, not wedged
+        # A later trigger with a working spawn succeeds.
+        svc._spawn = _SYNC
+        self.assertEqual(svc.trigger(), RESCAN_STARTED)
+
     def test_failed_regeneration_retains_prior_report(self) -> None:
         # The prior report on disk must survive a failed regeneration untouched — the
         # production regenerate generates THEN atomically writes, so a generate failure
