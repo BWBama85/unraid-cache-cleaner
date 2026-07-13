@@ -472,6 +472,15 @@ class ReclaimService:
     def dry_run(self) -> bool:
         return bool(self._config.web_actions_dry_run)
 
+    @property
+    def can_authenticate(self) -> bool:
+        """Whether any credential *can* be presented — i.e. a ``WEB_ACTION_TOKEN`` is
+        configured. When ``False`` :meth:`authorized` denies every request and
+        :meth:`mint_session` returns ``None``, so the web layer shows an honest
+        "unlocking unavailable" state instead of a dead unlock form (#85)."""
+
+        return bool(self._config.web_action_token)
+
     def authorized(self, *, token: Optional[str], session: Optional[str]) -> bool:
         """Whether a request presenting the shared ``token`` (``WEB_ACTION_TOKEN``) and/or
         a signed unlock ``session`` is authenticated. Fails closed when no token is

@@ -57,6 +57,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import secrets
 import threading
 import time
 from html import escape as _escape
@@ -104,17 +105,28 @@ _ACTION_HISTORY_LIMIT = 200
 _SESSION_COOKIE = "ucc_session"
 
 
-def _csp(actions_enabled: bool) -> str:
+def _csp(actions_enabled: bool, *, script_nonce: Optional[str] = None) -> str:
     """The Content-Security-Policy. Nothing loads by default; the only relaxations
     are the page's own inline ``<style>`` and — only when the action form is
     served — a same-origin ``form-action`` so the reclaim POST is permitted. No
-    scripts, images, fonts, or frames: the page ships zero external assets."""
+    images, fonts, or frames: the page ships zero external assets.
+
+    ``script_nonce`` is the sole path to any script execution (#80): when the opt-in
+    ``WEB_ACTION_INLINE_SCRIPT`` enhancement is on, a fresh per-response nonce admits
+    the page's single self-contained inline ``<script>`` via ``script-src
+    'nonce-…'`` — still no ``'unsafe-inline'`` for scripts and no external ``src``,
+    so only that exact inline block (which the same response emits with a matching
+    ``nonce``) can run. ``None`` keeps scripts fully blocked by ``default-src
+    'none'``."""
 
     form_action = "'self'" if actions_enabled else "'none'"
-    return (
+    policy = (
         "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
         f"form-action {form_action}"
     )
+    if script_nonce:
+        policy += f"; script-src 'nonce-{script_nonce}'"
+    return policy
 
 
 def _fmt_gib(num_bytes: object) -> str:
@@ -207,7 +219,7 @@ class DuplicateReportViewer:
         # "unavailable" state — they never construct a store themselves.
         self._action_history = action_history
 
-    def render_html(self) -> str:
+    def render_html(self, *, script_nonce: Optional[str] = None) -> str:
         """Render the current report, degrading a corrupt one to the empty state.
 
         The provider only guarantees the payload is a JSON object; a report whose
@@ -215,6 +227,10 @@ class DuplicateReportViewer:
         ``groups`` is not a list of dicts) would raise inside the renderer. Catch
         that here so the documented "malformed report → empty-state page, never a
         500" guarantee holds for structural corruption, not just a bad top level.
+
+        ``script_nonce`` (#80), when supplied, admits the optional inline reclaim-form
+        enhancement script under a matching ``script-src 'nonce-…'`` — see
+        :func:`render_report_html`.
         """
 
         show_history = self._action_history is not None
@@ -223,11 +239,15 @@ class DuplicateReportViewer:
                 self._provider(),
                 actions_enabled=self._actions_enabled,
                 show_history_link=show_history,
+                script_nonce=script_nonce,
             )
         except Exception:  # noqa: BLE001 — any structural corruption degrades gracefully
             LOGGER.warning("rendering the duplicate report failed; showing empty state", exc_info=True)
             return render_report_html(
-                None, actions_enabled=self._actions_enabled, show_history_link=show_history
+                None,
+                actions_enabled=self._actions_enabled,
+                show_history_link=show_history,
+                script_nonce=script_nonce,
             )
 
     def report_api(self) -> dict:
@@ -317,6 +337,8 @@ th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid #eef0f
 th { background: #f0f2f4; font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; color: #555; }
 tr:last-child td { border-bottom: none; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.copy { padding: .15rem .3rem; border-radius: 6px; margin: 0 -.3rem; }
+.copy:target { background: #fff4cc; box-shadow: 0 0 0 2px #f0c000; }
 .parts { margin: .25rem 0 0; padding-left: 1rem; color: #666; font-size: .85rem; }
 .tag { display: inline-block; padding: 0 .4rem; border-radius: 4px; font-size: .75rem; font-weight: 600; }
 .tag.tracked { background: #fdecec; color: #b3261e; }
@@ -337,6 +359,7 @@ footer { margin: 2rem 0 0; color: #888; font-size: .8rem; }
   th { background: #23272f; color: #aab; }
   th, td { border-color: #262b33; }
   .sub, .tile .l, .parts { color: #9aa1ab; }
+  .copy:target { background: #3a3410; box-shadow: 0 0 0 2px #8a7a00; }
 }
 """
 
@@ -373,6 +396,7 @@ def render_report_html(
     *,
     actions_enabled: bool = False,
     show_history_link: bool = False,
+    script_nonce: Optional[str] = None,
 ) -> str:
     """Render the report payload as a full HTML page (pure).
 
@@ -380,6 +404,13 @@ def render_report_html(
     (a checkbox per redundant copy + a token field) that POSTs to
     ``/actions/reclaim``; otherwise the page is the Phase 1 read-only viewer.
     ``show_history_link`` adds a link to the read-only ``/actions`` audit page.
+
+    ``script_nonce`` (#80): when supplied *and* ``actions_enabled``, the reclaim
+    form gains a single inline enhancement ``<script nonce="…">`` (select-all + a
+    live selected count/size) plus the inert controls it drives. It is pure
+    progressive enhancement — the form submits and every target is selectable with
+    JavaScript disabled — and the nonce must equal the one the response's CSP
+    ``script-src`` carries or the browser refuses to run it.
     """
 
     footer = _ACTION_FOOTER if actions_enabled else _READONLY_FOOTER
@@ -419,31 +450,76 @@ def render_report_html(
 
     reclaimable_html = _render_reclaimable(reclaimable, actions_enabled=actions_enabled)
     if actions_enabled:
-        reclaimable_html = _wrap_reclaim_form(reclaimable_html, payload.get("generated_at"))
+        reclaimable_html = _wrap_reclaim_form(
+            reclaimable_html, payload.get("generated_at"), script_nonce=script_nonce
+        )
     parts.append(reclaimable_html)
     parts.append(_render_mismatches(mismatches))
     parts.append(_render_arr_tracked(reclaimable, arr_enabled))
     return _page("Plex duplicate report", "".join(parts), footer_note=footer)
 
 
-def _wrap_reclaim_form(reclaimable_html: str, generated_at: object) -> str:
+#: The single inline enhancement script (#80), admitted only under a matching
+#: ``script-src 'nonce-…'``. Pure progressive enhancement: wires the (otherwise
+#: inert, no-``name`` so never submitted) "select all" box to toggle every reclaim
+#: checkbox and shows a live selected count + GiB total from each checkbox's
+#: ``data-bytes``. No fetch/XHR, no external asset, no auth, never submits a delete;
+#: the form is fully usable with this disabled. Kept tiny and self-contained.
+_INLINE_SCRIPT = (
+    "(function(){"
+    "var f=document.querySelector('form.reclaim');if(!f)return;"
+    "var boxes=[].slice.call(f.querySelectorAll('input[type=checkbox][name=target]'));"
+    "var all=document.getElementById('ucc-select-all');"
+    "var out=document.getElementById('ucc-selected');"
+    "function upd(){var n=0,b=0;boxes.forEach(function(x){"
+    "if(x.checked){n++;b+=parseInt(x.getAttribute('data-bytes')||'0',10)||0;}});"
+    "if(all){all.checked=n>0&&n===boxes.length;}"
+    "if(out){out.textContent=n+' selected \\u00b7 '+(b/1073741824).toFixed(1)+' GiB';}}"
+    "if(all){all.addEventListener('change',function(){"
+    "boxes.forEach(function(x){x.checked=all.checked;});upd();});}"
+    "boxes.forEach(function(x){x.addEventListener('change',upd);});upd();"
+    "})();"
+)
+
+
+def _wrap_reclaim_form(
+    reclaimable_html: str, generated_at: object, *, script_nonce: Optional[str] = None
+) -> str:
     """Wrap the reclaimable table in the no-JS action form: the checkboxes rendered
     inside it, plus the token field, the hidden ``generated_at`` freshness token,
-    and the submit button. No JavaScript — a native form POST keeps the strict CSP
-    (only ``form-action 'self'`` is relaxed).
+    and the submit button. No JavaScript required — a native form POST keeps the
+    strict CSP (only ``form-action 'self'`` is relaxed).
 
     The form posts to ``/actions/preview`` (not the destructive ``/actions/reclaim``):
     the operator lands on a confirmation page (#62) before anything is deleted. The
     token is optional (#68) — pasting it once establishes an unlock session so a
     later reclaim need not re-paste it; an already-unlocked browser can leave it
-    blank and the preview authenticates via the session cookie."""
+    blank and the preview authenticates via the session cookie.
+
+    ``script_nonce`` (#80): when supplied, an inert "select all" checkbox + a live
+    selected-total readout are rendered and the single :data:`_INLINE_SCRIPT` is
+    emitted with that nonce. Purely additive — omitted entirely without a nonce, and
+    inert (unchecked, unsubmitted) with scripts disabled."""
 
     gen = _esc("" if generated_at is None else generated_at)
+    select_all = (
+        '<label><input type="checkbox" id="ucc-select-all"> Select all</label> '
+        '<span class="sub" id="ucc-selected"></span> '
+        if script_nonce
+        else ""
+    )
+    script = (
+        f'<script nonce="{_esc(script_nonce)}">{_INLINE_SCRIPT}</script>'
+        if script_nonce
+        else ""
+    )
     return (
         '<form method="post" action="/actions/preview" class="reclaim">'
         + reclaimable_html
         + f'<input type="hidden" name="report_generated_at" value="{gen}">'
-        + '<div class="controls"><label>Action token '
+        + '<div class="controls">'
+        + select_all
+        + '<label>Action token '
         + '<input type="password" name="token" autocomplete="off"></label> '
         + '<button type="submit">Preview reclaim&hellip;</button></div>'
         + '<p class="sub">Shows a confirmation page listing exactly what would be '
@@ -453,11 +529,31 @@ def _wrap_reclaim_form(reclaimable_html: str, generated_at: object) -> str:
         + "re-download. Refuses the keeper, mismatch groups, and unconfirmed copies. "
         + "Honors <code>WEB_ACTIONS_DRY_RUN</code>.</p>"
         + "</form>"
+        + script
     )
 
 
+def _result_target_cell(result: object) -> str:
+    """The Target cell for a reclaim-result row: the ``rating_key:part_id`` id, linked
+    back to the exact report row it affected (#80) via the copy's stable ``/#copy-…``
+    anchor. An unaddressable target (missing key/part) renders as plain text so the
+    link never points at an anchor that cannot exist."""
+
+    rating_key = getattr(result, "rating_key", "")
+    part_id = getattr(result, "part_id", "")
+    label = f"{_esc(rating_key)}:{_esc(part_id)}"
+    if not rating_key or not part_id:
+        return f"<td>{label}</td>"
+    anchor = _esc(f"/#copy-{rating_key}-{part_id}")
+    return f'<td><a href="{anchor}">{label}</a></td>'
+
+
 def render_reclaim_result_html(response: ReclaimResponse) -> str:
-    """Render a reclaim outcome as an HTML result page (for the browser form)."""
+    """Render a reclaim outcome as an HTML result page (for the browser form).
+
+    Each target links back to the exact report row it affected (#80); a same-origin
+    ``/#copy-…`` fragment that the report highlights via ``:target`` CSS, so the
+    operator lands on the copy they just acted on rather than a generic back-link."""
 
     rows: List[str] = []
     for result in response.results:
@@ -465,7 +561,7 @@ def render_reclaim_result_html(response: ReclaimResponse) -> str:
             "<tr>"
             f'<td>{_esc(result.status)}</td>'
             f'<td>{_esc(result.backend or "-")}</td>'
-            f'<td>{_esc(result.rating_key)}:{_esc(result.part_id)}</td>'
+            f'{_result_target_cell(result)}'
             f'<td class="num">{_esc(_fmt_gib(result.reclaimed_bytes))}</td>'
             f'<td>{_esc(result.message)}</td>'
             "</tr>"
@@ -479,6 +575,11 @@ def render_reclaim_result_html(response: ReclaimResponse) -> str:
             "<table><thead><tr><th>Status</th><th>Backend</th><th>Target</th>"
             "<th>Reclaimed</th><th>Detail</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+        body.append(
+            '<p class="sub">Each target links back to the copy it affected on the '
+            "report. A deleted copy is gone from the next regenerated report; a "
+            "refused one is still listed there for review.</p>"
         )
     elif not response.message:
         body.append('<div class="empty">No targets were selected.</div>')
@@ -611,6 +712,83 @@ def _confirm_form(would: Sequence, generated_at: object, session_token: Optional
         + '<div class="controls"><button type="submit">'
         + f"Confirm delete of {len(would)} cop{'y' if len(would) == 1 else 'ies'}"
         + "</button></div></form>"
+    )
+
+
+#: The routes an ``/actions/unlock`` may redirect back to after minting a session.
+#: A closed allow-list (never the raw client value) so the ``next`` field can never
+#: become an open redirect — an unrecognized value falls back to the report root.
+_UNLOCK_NEXT_ALLOWED = ("/", "/actions")
+
+
+def _unlock_next(raw: object) -> str:
+    """Normalize a submitted ``next`` target to a member of the closed allow-list,
+    defaulting to ``/`` — so a hostile ``next`` can never redirect off-site."""
+
+    return raw if raw in _UNLOCK_NEXT_ALLOWED else "/"
+
+
+def _unlock_form(next_path: str) -> str:
+    """The no-JS unlock form (#85): a bare ``WEB_ACTION_TOKEN`` field POSTing to
+    ``/actions/unlock`` with the (allow-listed) ``next`` target. Mirrors the reclaim
+    form's ``form-action 'self'`` CSP; the token is a password field and is never
+    echoed back into any page."""
+
+    return (
+        '<form method="post" action="/actions/unlock" class="reclaim">'
+        f'<input type="hidden" name="next" value="{_esc(_unlock_next(next_path))}">'
+        '<div class="controls"><label>Action token '
+        '<input type="password" name="token" autocomplete="off"></label> '
+        '<button type="submit">Unlock</button></div></form>'
+    )
+
+
+def _render_locked(
+    title: str, lead_html: str, *, next_path: str, can_unlock: bool, error: bool
+) -> str:
+    body = [f"<h1>{_esc(title)}</h1>", f'<p class="sub">{lead_html}</p>']
+    if error:
+        body.append('<div class="err">Invalid or missing action token.</div>')
+    if can_unlock:
+        body.append(_unlock_form(next_path))
+    else:
+        body.append(
+            '<div class="empty">Unlocking is unavailable: web actions are disabled or no '
+            "<code>WEB_ACTION_TOKEN</code> is configured.</div>"
+        )
+    # When the form can mint a session the action layer is genuinely enabled; when it
+    # cannot (the fail-closed lockout), the read-only footer states the truth rather
+    # than claiming an action layer that is disabled.
+    footer = _ACTION_FOOTER if can_unlock else _READONLY_FOOTER
+    return _page(title, "".join(body), footer_note=footer)
+
+
+def render_report_locked_html(*, can_unlock: bool = True, error: bool = False) -> str:
+    """The ``403`` for a gated report request from a browser (#85): the unlock entry
+    point. Carries the no-JS token form so an operator can establish the ``ucc_session``
+    even though ``/`` — the page they normally unlock through — is itself gated."""
+
+    lead = (
+        "This report is protected. Enter the <code>WEB_ACTION_TOKEN</code> to unlock this "
+        "browser, or send it as an <code>X-Action-Token</code> header."
+    )
+    return _render_locked(
+        "Report locked", lead, next_path="/", can_unlock=can_unlock, error=error
+    )
+
+
+def render_history_locked_html(*, can_unlock: bool = True, error: bool = False) -> str:
+    """The ``403`` for a gated action-history request from a browser (#82). Now carries
+    the same no-JS unlock form (#85) so the history is reachable even when the report
+    page is empty (the old "unlock from the report page" hint had no form to offer
+    there)."""
+
+    lead = (
+        "The reclaim action history is protected. Enter the <code>WEB_ACTION_TOKEN</code> "
+        "to unlock this browser, or send it as an <code>X-Action-Token</code> header."
+    )
+    return _render_locked(
+        "Action history locked", lead, next_path="/actions", can_unlock=can_unlock, error=error
     )
 
 
@@ -812,22 +990,61 @@ def _assoc_tag(copy: dict) -> str:
     return ""
 
 
+def _copy_target(group: dict, copy: dict) -> Optional[tuple]:
+    """The ``(rating_key, part_id)`` a reclaim addresses this copy by — its Plex
+    ``rating_key`` and the copy's first physical ``part_id`` — or ``None`` when the
+    copy is unaddressable (no rating_key or a zero/absent first part). Shared by the
+    reclaim checkbox and the #80 report-row anchor so the checkbox value and the
+    anchor a result page links back to are always the same id."""
+
+    rating_key = group.get("rating_key")
+    parts = copy.get("parts") or []
+    part_id = parts[0].get("part_id") if parts and isinstance(parts[0], dict) else None
+    if not rating_key or not part_id:
+        return None
+    return rating_key, part_id
+
+
+def _copy_anchor_id(group: dict, copy: dict) -> Optional[str]:
+    """The stable HTML ``id`` for an addressable reclaimable copy row (#80),
+    ``copy-<rating_key>-<part_id>``, or ``None`` when the copy is unaddressable.
+    A reclaim *result* row links back to ``/#<this id>`` so an operator lands on
+    (and, via ``:target`` CSS, sees highlighted) the exact copy they acted on."""
+
+    target = _copy_target(group, copy)
+    if target is None:
+        return None
+    return f"copy-{target[0]}-{target[1]}"
+
+
+def _anchor_attr(anchor_id: Optional[str]) -> str:
+    """An `` id="…"`` attribute (leading space, escaped) for a copy row, or ``""``
+    when the copy has no stable anchor. The id is derived only from the report's own
+    rating_key/part_id, but is HTML-escaped anyway so a hostile report can never break
+    out of the attribute."""
+
+    return f' id="{_esc(anchor_id)}"' if anchor_id else ""
+
+
 def _checkbox(group: dict, copy: dict, actions_enabled: bool) -> str:
     """A reclaim checkbox for one redundant copy, valued ``{rating_key}:{part_id}``
     on the copy's first physical part. Targeting any one part reclaims the whole
     logical copy (all its parts), so one checkbox per copy is enough. Omitted when
     the copy is unaddressable (no rating_key or a zero/absent first part_id) so a
-    row can never post an id the action layer would refuse anyway."""
+    row can never post an id the action layer would refuse anyway. Carries the copy's
+    size as ``data-bytes`` for the optional live-total script (#80)."""
 
     if not actions_enabled:
         return ""
-    rating_key = group.get("rating_key")
-    parts = copy.get("parts") or []
-    part_id = parts[0].get("part_id") if parts and isinstance(parts[0], dict) else None
-    if not rating_key or not part_id:
+    target = _copy_target(group, copy)
+    if target is None:
         return '<span class="tag unknown">n/a</span> '
-    value = f"{rating_key}:{part_id}"
-    return f'<input type="checkbox" name="target" value="{_esc(value)}"> '
+    value = f"{target[0]}:{target[1]}"
+    size = _as_int(copy.get("size"))
+    return (
+        f'<input type="checkbox" name="target" value="{_esc(value)}" '
+        f'data-bytes="{size}"> '
+    )
 
 
 def _render_reclaimable(groups: List[dict], *, actions_enabled: bool = False) -> str:
@@ -846,7 +1063,8 @@ def _render_reclaimable(groups: List[dict], *, actions_enabled: bool = False) ->
         candidates = _reclaim_candidates(group)
         keep_res = _copy_label(group.get("keeper"))
         detail = "".join(
-            f'<div>{_checkbox(group, c, actions_enabled)}{_assoc_tag(c)} '
+            f'<div{_anchor_attr(_copy_anchor_id(group, c))} class="copy">'
+            f'{_checkbox(group, c, actions_enabled)}{_assoc_tag(c)} '
             f'{_copy_label(c)}{_render_parts(c)}</div>'
             for c in candidates
         )
@@ -1235,6 +1453,19 @@ class _Handler(BaseHTTPRequestHandler):
     def _history_auth_required(self) -> bool:
         return bool(getattr(self.server, "web_action_history_auth", False))  # type: ignore[attr-defined]
 
+    @property
+    def _report_auth_required(self) -> bool:
+        return bool(getattr(self.server, "web_action_report_auth", False))  # type: ignore[attr-defined]
+
+    @property
+    def _inline_script_enabled(self) -> bool:
+        # The enhancement script only exists alongside the reclaim form, so it is off
+        # unless actions are enabled — no nonce is ever emitted for the read-only viewer.
+        return (
+            bool(getattr(self.server, "web_action_inline_script", False))  # type: ignore[attr-defined]
+            and self._actions_enabled
+        )
+
     def _host_gate(self, *, body: bool = True) -> bool:
         """Apply the DNS-rebinding Host policy (#67) *before* any routing, provider, or
         reclaim service runs. A duplicate ``Host`` (RFC-forbidden, never sent by a real
@@ -1275,22 +1506,16 @@ class _Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(data)
 
-    def _history_view_authorized(self) -> bool:
-        """Whether the read-only action-history views may be served to this request.
+    def _reclaim_credential_ok(self) -> bool:
+        """Whether this request presents a valid reclaim credential — the shared
+        ``WEB_ACTION_TOKEN`` (as an ``X-Action-Token`` header, the JSON/scripted path)
+        or a valid unlock session (the ``ucc_session`` cookie a browser earns via the
+        token→preview or ``/actions/unlock`` flow). The single primitive behind both
+        opt-in read gates (#82 history, #85 report) so they never drift. Fail-closed:
+        with no reclaim service attached (actions disabled) or no token configured,
+        :meth:`ReclaimService.authorized` returns ``False`` for every request, so a
+        gated view is *denied*, never silently reopened."""
 
-        The opt-in gate (#82) is off by default, so this is ``True`` and the history
-        stays LAN-readable exactly as before. When the gate is on, the request must
-        carry a valid credential — the shared ``WEB_ACTION_TOKEN`` (as an
-        ``X-Action-Token`` header, the JSON path) or a valid unlock session (the
-        ``ucc_session`` cookie a browser earns via the token→preview flow). Fail-closed:
-        with the gate on but no reclaim service attached (actions disabled) or no token
-        configured, :meth:`ReclaimService.authorized` returns ``False`` for every
-        request, so the history is *denied*, never silently reopened — ``build_server``
-        warns about that lockout at startup. Evaluated before the viewer touches the
-        state DB, so an unauthorized request never reads the audit history."""
-
-        if not self._history_auth_required:
-            return True
         service = self._reclaim
         if service is None or not service.enabled:
             # Actions disabled → the reclaim endpoints are 405 and no unlock session can
@@ -1302,22 +1527,57 @@ class _Handler(BaseHTTPRequestHandler):
             session=self._read_session_cookie(),
         )
 
+    def _history_view_authorized(self) -> bool:
+        """Whether the read-only action-history views may be served (#82). Off by
+        default, so ``True`` and the history stays LAN-readable; when the gate is on the
+        request must present a valid reclaim credential. ``build_server`` warns at
+        startup if the gate is on but no credential can ever be presented. Evaluated
+        before the viewer touches the state DB, so an unauthorized request never reads
+        the audit history."""
+
+        return not self._history_auth_required or self._reclaim_credential_ok()
+
+    def _report_view_authorized(self) -> bool:
+        """Whether the report read surface (``/`` + ``/index.html`` + ``/api/report``)
+        may be served (#85). Off by default (``True``, LAN-readable as before);
+        independent of the history gate. When on, the request must present a valid
+        reclaim credential — evaluated before the viewer reads the report provider, so
+        an unauthorized request never triggers a report read."""
+
+        return not self._report_auth_required or self._reclaim_credential_ok()
+
+    def _can_unlock(self) -> bool:
+        """Whether the no-JS unlock form can actually mint a session — a reclaim service
+        is attached, actions are enabled, and a ``WEB_ACTION_TOKEN`` is configured. When
+        ``False`` the locked page shows an honest "unlocking unavailable" state rather
+        than a form that could never succeed."""
+
+        service = self._reclaim
+        return bool(service is not None and service.enabled and service.can_authenticate)
+
     def _history_auth_denied(self, path: str) -> tuple:
         """The ``403`` for a gated history request that failed auth — JSON for the API
-        route, an HTML "unlock from the report page" page for the browser route."""
+        route, an HTML unlock page (with the no-JS token form) for the browser route."""
 
         if path == "/api/actions":
             body = json.dumps(
                 {"message": "action history requires authentication"}, sort_keys=True
             ).encode("utf-8")
             return HTTPStatus.FORBIDDEN, "application/json; charset=utf-8", body
-        page = _page(
-            "Forbidden",
-            "<h1>403</h1><p>The reclaim action history is protected. Unlock it from the "
-            '<a href="/">report page</a> by presenting the action token, or send it as '
-            "an <code>X-Action-Token</code> header.</p>",
-            footer_note=_ACTION_FOOTER if self._actions_enabled else _READONLY_FOOTER,
-        )
+        page = render_history_locked_html(can_unlock=self._can_unlock())
+        return HTTPStatus.FORBIDDEN, "text/html; charset=utf-8", page.encode("utf-8")
+
+    def _report_auth_denied(self, path: str) -> tuple:
+        """The ``403`` for a gated report request that failed auth (#85) — JSON for
+        ``/api/report``, an HTML unlock page (the no-JS token entry point) for the
+        browser routes ``/`` + ``/index.html``."""
+
+        if path == "/api/report":
+            body = json.dumps(
+                {"message": "report requires authentication"}, sort_keys=True
+            ).encode("utf-8")
+            return HTTPStatus.FORBIDDEN, "application/json; charset=utf-8", body
+        page = render_report_locked_html(can_unlock=self._can_unlock())
         return HTTPStatus.FORBIDDEN, "text/html; charset=utf-8", page.encode("utf-8")
 
     def _resolve(self, path: str) -> tuple:
@@ -1334,11 +1594,19 @@ class _Handler(BaseHTTPRequestHandler):
                 # GET and HEAD (both route through here), so a HEAD can never leak a 200
                 # status/length where the equivalent GET is 403.
                 return self._history_auth_denied(path)
+            if (
+                path in ("/", "/index.html", "/api/report")
+                and not self._report_view_authorized()
+            ):
+                # Gate the report views (#85) before the viewer reads the report provider —
+                # same GET/HEAD-shared choke point, so a HEAD can never leak a 200 the GET
+                # would 403. Independent of the history gate above.
+                return self._report_auth_denied(path)
             if path in ("/", "/index.html"):
                 return (
                     HTTPStatus.OK,
                     "text/html; charset=utf-8",
-                    self._viewer.render_html().encode("utf-8"),
+                    self._viewer.render_html(script_nonce=self._csp_nonce).encode("utf-8"),
                 )
             if path == "/api/report":
                 body = json.dumps(self._viewer.report_api(), sort_keys=True).encode("utf-8")
@@ -1367,7 +1635,23 @@ class _Handler(BaseHTTPRequestHandler):
                 _page("Error", "<h1>500</h1><p>The report could not be rendered.</p>").encode("utf-8"),
             )
 
+    #: The per-response CSP script nonce (#80). Defaults to ``None`` (scripts fully
+    #: blocked); a GET/HEAD sets a fresh random value only when the inline-script
+    #: enhancement is enabled, so the report page's ``<script>`` and the ``script-src``
+    #: header always carry the same nonce and every other response stays script-free.
+    _csp_nonce: Optional[str] = None
+
+    def _begin_request(self) -> None:
+        """Reset per-request response state. A ``ThreadingHTTPServer`` reuses a handler
+        instance across keep-alive requests on one connection, so a stale nonce from a
+        prior GET must never linger onto a later response."""
+
+        self._csp_nonce = (
+            secrets.token_urlsafe(16) if self._inline_script_enabled else None
+        )
+
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler dispatch name)
+        self._begin_request()
         if not self._host_gate():
             return
         status, content_type, body = self._resolve(urlparse(self.path).path)
@@ -1377,6 +1661,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         # Same headers as the equivalent GET, but no body (RFC 9110) — so a health
         # check or proxy can probe any GET route with a cheap HEAD.
+        self._begin_request()
         if not self._host_gate(body=False):
             return
         status, content_type, body = self._resolve(urlparse(self.path).path)
@@ -1390,6 +1675,10 @@ class _Handler(BaseHTTPRequestHandler):
         means a server built with actions disabled stays a read-only viewer whose
         every mutating verb is refused, exactly like the plain viewer."""
 
+        # POST responses (confirm/result/unlock/notice pages) never carry the inline
+        # enhancement script, so they stay script-free — clear any nonce a keep-alive GET
+        # on this reused handler instance may have left set.
+        self._csp_nonce = None
         if not self._host_gate():
             return
         service = self._reclaim
@@ -1403,6 +1692,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_reclaim_preview(service)
         elif path == "/actions/reclaim":
             self._handle_reclaim_form(service)
+        elif path == "/actions/unlock":
+            self._handle_unlock(service)
         else:
             self._method_not_allowed()
 
@@ -1411,6 +1702,10 @@ class _Handler(BaseHTTPRequestHandler):
         # too (#67) — an unknown-Host request to any verb is refused before a 405. A
         # request routed here from do_POST already passed the gate; the re-check is a
         # cheap no-op that writes nothing when the Host is fine.
+        #
+        # Clear any nonce a prior keep-alive GET on this reused handler set, so a 405
+        # (which carries no script) never echoes a stale per-response nonce in its CSP.
+        self._csp_nonce = None
         if not self._host_gate():
             return
         # Accurate whether actions are on or off: the reclaim POST routes are
@@ -1544,6 +1839,39 @@ class _Handler(BaseHTTPRequestHandler):
             set_cookie=set_cookie,
         )
 
+    def _handle_unlock(self, service: ReclaimService) -> None:
+        """``POST /actions/unlock``: the no-JS unlock entry point (#85). Validates a bare
+        ``WEB_ACTION_TOKEN`` under the same browser envelope as a reclaim (the Host gate
+        already ran; here the Origin/Referer check and the body-size cap), and on success
+        mints the ``ucc_session`` cookie and ``303``-redirects to the allow-listed ``next``
+        target so an operator can unlock even when ``/`` — the page they normally unlock
+        through — is itself gated. It NEVER reads the report provider: it authorizes *being
+        unlocked*, nothing else. A bad/missing token re-renders the locked page with an
+        error and mints nothing; the token is never echoed into the response."""
+
+        if not self._origin_ok(browser_path=True):
+            self._write_html(HTTPStatus.FORBIDDEN, self._cross_origin_page())
+            return
+        raw = self._read_body()
+        if raw is None:  # a 413/400 was already written
+            return
+        fields = dict(parse_qsl(raw.decode("utf-8", "replace"), keep_blank_values=True))
+        next_path = _unlock_next(fields.get("next"))
+        # A token authenticates; an already-valid session cookie also re-affirms the unlock.
+        if service.authorized(token=fields.get("token"), session=self._read_session_cookie()):
+            self._redirect(next_path, set_cookie=self._session_cookie_header(service))
+            return
+        # Re-render with the same can_unlock verdict the GET path uses, so a token-less
+        # deployment (report auth on, actions on, no WEB_ACTION_TOKEN) keeps showing the
+        # honest "unlocking unavailable" state instead of a form that can never succeed.
+        can_unlock = self._can_unlock()
+        locked = (
+            render_history_locked_html(can_unlock=can_unlock, error=True)
+            if next_path == "/actions"
+            else render_report_locked_html(can_unlock=can_unlock, error=True)
+        )
+        self._write_html(HTTPStatus.FORBIDDEN, locked)
+
     @staticmethod
     def _cross_origin_page() -> str:
         return _page(
@@ -1617,6 +1945,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _redirect(self, location: str, *, set_cookie: Optional[str] = None) -> None:
+        """A ``303 See Other`` (POST→redirect→GET) to a same-origin path, optionally
+        setting the unlock cookie. Empty body; ``location`` is always one of our own
+        allow-listed routes (see :func:`_unlock_next`), never a client-controlled URL, so
+        this can never become an open redirect."""
+
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self._common_headers(0, "text/plain; charset=utf-8")
+        self.send_header("Location", location)
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", set_cookie)
+        self.end_headers()
+
     def _read_session_cookie(self) -> Optional[str]:
         """The unlock-session cookie value from the request, or ``None`` (no/blank/
         malformed ``Cookie`` header). Parsing never raises: a hostile cookie header is
@@ -1683,7 +2024,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", _csp(self._actions_enabled))
+        self.send_header(
+            "Content-Security-Policy",
+            _csp(self._actions_enabled, script_nonce=self._csp_nonce),
+        )
+        # Never let a shared cache/proxy store a response: a gated report (#85) is served
+        # only to a cookie/token-authorized request, so a cached copy could otherwise be
+        # replayed to an unauthenticated client. The payloads are small and dynamic, so
+        # no-store costs nothing and applies uniformly to every route.
+        self.send_header("Cache-Control", "no-store")
         # ``same-origin`` when the action form is served, so a same-origin form POST
         # carries a ``Referer`` the CSRF check can use as an ``Origin`` fallback while
         # still sending no referrer cross-site; ``no-referrer`` for the read-only
@@ -1716,6 +2065,8 @@ class DuplicateReportServer:
         allowed_origins: Sequence[str] = (),
         allowed_hosts: Sequence[str] = (),
         history_auth: bool = False,
+        report_auth: bool = False,
+        inline_script: bool = False,
     ) -> None:
         self._httpd = ThreadingHTTPServer((bind_address, port), _Handler)
         self._httpd.daemon_threads = True
@@ -1736,6 +2087,13 @@ class DuplicateReportServer:
         # Off keeps the LAN-readable default; on requires the reclaim token/unlock
         # session and fails closed when neither can be presented (no service/token).
         self._httpd.web_action_history_auth = bool(history_auth)  # type: ignore[attr-defined]
+        # Opt-in auth for the report read surface ``/`` + ``/index.html`` + ``/api/report``
+        # (#85). Independent of the history gate; same fail-closed posture. The gated ``/``
+        # 403 page carries a no-JS unlock form so an operator can still mint the session.
+        self._httpd.web_action_report_auth = bool(report_auth)  # type: ignore[attr-defined]
+        # Opt-in inline reclaim-form enhancement script (#80), admitted only under a fresh
+        # per-response CSP nonce; off keeps the strict no-script CSP.
+        self._httpd.web_action_inline_script = bool(inline_script)  # type: ignore[attr-defined]
         self._started = False
 
     @property
@@ -1852,6 +2210,18 @@ def build_server(
             if not actions_enabled
             else "WEB_ACTION_TOKEN is not set",
         )
+    # Same fail-closed lockout warning for the report gate (#85): with it on but no
+    # credential presentable, ``/`` + ``/api/report`` are denied to everyone AND the
+    # 403 unlock form can never mint a session, so surface it loudly.
+    if config.web_action_report_auth and not (actions_enabled and config.web_action_token):
+        LOGGER.warning(
+            "WEB_ACTION_REPORT_AUTH is set but %s; the report views (/ and /api/report) "
+            "will be denied to every request — including the unlock form — until both are "
+            "in place",
+            "web actions are disabled (set WEB_ENABLE_ACTIONS=true)"
+            if not actions_enabled
+            else "WEB_ACTION_TOKEN is not set",
+        )
     return DuplicateReportServer(
         config.web_bind_address,
         config.web_port,
@@ -1861,4 +2231,6 @@ def build_server(
         allowed_origins=allowed_origins,
         allowed_hosts=allowed_hosts,
         history_auth=config.web_action_history_auth,
+        report_auth=config.web_action_report_auth,
+        inline_script=config.web_action_inline_script,
     )

@@ -226,6 +226,29 @@ class Config:
     # about the lockout at startup. Appended with a default so existing positional
     # Config(...) calls and from_env keep working.
     web_action_history_auth: bool = False
+    # Opt-in auth for the *report* read surface ``/`` + ``/index.html`` + ``/api/report``
+    # (#85). Default False keeps today's behavior: the report is LAN-readable under the
+    # Host-allow-list model (#67), like the history views were before #82. When True, those
+    # routes require the same credential a reclaim does — the shared ``WEB_ACTION_TOKEN`` (as
+    # an ``X-Action-Token`` header on ``/api/report``) or a valid unlock session (the
+    # ``ucc_session`` cookie). Independent of :attr:`web_action_history_auth`: enable *both*
+    # to place the *entire* read surface behind the credential. Because ``/`` is the door a
+    # browser unlocks through, gating it needs a no-JS unlock entry point — the 403 page
+    # carries a bare token form posting to ``POST /actions/unlock`` (mints the session, then
+    # 303-redirects back). Fail-closed like #82: with the gate on but no ``WEB_ACTION_TOKEN``
+    # (or actions disabled) there is no credential to accept, so the report is *denied*, never
+    # silently reopened — ``build_server`` warns about the lockout at startup. Appended with a
+    # default so existing positional Config(...) calls and from_env keep working.
+    web_action_report_auth: bool = False
+    # Opt-in progressive-enhancement inline script for the reclaim form (#80). Default False
+    # keeps the strict no-script CSP (``default-src 'none'``; scripts blocked entirely). When
+    # True *and* actions are enabled, the report page carries a single self-contained inline
+    # ``<script>`` (select-all + a live selected-count/size total) admitted by a per-response
+    # ``script-src 'nonce-<random>'`` — no external asset, no fetch/XHR, and every path still
+    # works with JavaScript disabled (the script is pure enhancement, never carries auth or
+    # submits deletes). Appended with a default so existing positional Config(...) calls and
+    # from_env keep working.
+    web_action_inline_script: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -287,6 +310,8 @@ class Config:
             web_allowed_hosts=_parse_str_list(os.getenv("WEB_ALLOWED_HOSTS")),
             web_action_session_seconds=_parse_int(os.getenv("WEB_ACTION_SESSION_SECONDS"), 3600),
             web_action_history_auth=_parse_bool(os.getenv("WEB_ACTION_HISTORY_AUTH"), False),
+            web_action_report_auth=_parse_bool(os.getenv("WEB_ACTION_REPORT_AUTH"), False),
+            web_action_inline_script=_parse_bool(os.getenv("WEB_ACTION_INLINE_SCRIPT"), False),
         )
         config.ensure_directories()
         return config

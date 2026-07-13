@@ -840,6 +840,8 @@ class RenderPureFunctionTests(unittest.TestCase):
             web_allowed_origins = ()
             web_allowed_hosts = ()
             web_action_history_auth = False
+            web_action_report_auth = False
+            web_action_inline_script = False
 
         server = build_server(_Cfg())
         server.start_background()

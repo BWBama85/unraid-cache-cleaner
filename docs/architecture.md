@@ -115,13 +115,27 @@ checkpoints (`state.WebActionHistoryReader`). Those two history views are LAN-re
 by default but can be opt-in gated behind the reclaim credential with
 `WEB_ACTION_HISTORY_AUTH=true` (#82) — the handler runs `ReclaimService.authorized`
 (token or unlock session) *before* the provider touches SQLite, and fails closed when no
-token/service is available (denied to everyone, with a startup warning). The
+token/service is available (denied to everyone, with a startup warning). The **report**
+surface (`/` + `/index.html` + `/api/report`) has the same opt-in gate under
+`WEB_ACTION_REPORT_AUTH=true` (#85), evaluated in the same `_resolve` choke point (so GET
+and HEAD share it) *before* the viewer reads the report provider, and independent of the
+history gate — set both to gate the whole read surface. Because `/` is the page a browser
+unlocks through, gating it exposes a no-JS unlock entry point: the 403 page carries a bare
+token form posting to `POST /actions/unlock`, which validates the token via
+`ReclaimService.authorized` (never reading the report), mints the `ucc_session`, and
+`303`-redirects back (`next` is restricted to a `/`|`/actions` allow-list, never an open
+redirect). Every dynamic response also carries `Cache-Control: no-store` so a shared proxy
+cannot replay a cookie-authorized report to an unauthenticated client. The
 rendering functions are pure over the report dict, and the report is supplied by
 an injectable provider (the default reads the file; tests inject a fake), so the
 server is unit-tested end-to-end on an ephemeral port without any network
 service. Safety envelope: every Plex-supplied string is HTML-escaped, routes are
 explicit (no directory serving/CORS/external assets) under a strict
-`Content-Security-Policy`, and a missing/truncated/malformed report degrades to an
+`Content-Security-Policy` — `default-src 'none'` with scripts blocked entirely, unless the
+opt-in `WEB_ACTION_INLINE_SCRIPT=true` (#80) admits the reclaim form's single
+self-contained enhancement script (select-all + a live total) via a fresh per-response
+`script-src 'nonce-…'` (no `'unsafe-inline'`, no external `src`; the form works with
+JavaScript disabled) — and a missing/truncated/malformed report degrades to an
 empty-state page rather than a `500`. When no action layer is attached (the
 default), every non-`GET` verb is `405`. Run it standalone with the `web`
 subcommand, or fold it into the `service` loop on a daemon thread with
