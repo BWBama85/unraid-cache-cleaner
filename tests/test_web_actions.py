@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -2619,6 +2620,90 @@ class ResultLinkbackTests(unittest.TestCase):
         html = render_reclaim_result_html(resp)
         self.assertIn('href="/#copy-900-2"', html)
         self.assertIn('href="/#copy-901-3"', html)
+
+
+# --------------------------------------------------------------------------- #
+# #87 — copy anchor / result link-back round-trips for a special rating_key    #
+# --------------------------------------------------------------------------- #
+
+class AnchorRoundTripTests(unittest.TestCase):
+    def _reclaimable_payload(self, rating_key):
+        keeper = _keeper()
+        dup = _copy("/plex/x.mkv", 5 * GiB, media_id=21, association="untracked")
+        return _report([_group([keeper, dup], keeper=keeper, rating_key=rating_key)])
+
+    def _anchor_id(self, html):
+        m = re.search(r'id="(copy-[^"]*)"', html)
+        self.assertIsNotNone(m, "expected a copy anchor id in the report HTML")
+        return m.group(1)
+
+    def test_special_rating_key_id_and_fragment_match(self) -> None:
+        # #87: a rating_key with a space and a '#' (URL/CSS-special) must still
+        # land its reclaim-result link on the report row — the id the report row
+        # carries and the fragment the result links to must be identical.
+        rating_key = "a b#c"
+        report_html = render_report_html(
+            self._reclaimable_payload(rating_key), actions_enabled=True
+        )
+        anchor_id = self._anchor_id(report_html)
+        # fixed-charset token: no space / '#' / percent-encoding survived
+        self.assertRegex(anchor_id, r"^copy-[A-Za-z0-9_]+-[A-Za-z0-9_]+$")
+
+        resp = ReclaimResponse(
+            200, True, False, "",
+            [ReclaimResult(rating_key, 2, STATUS_DELETED, "filesystem", "ok", 5 * GiB)],
+        )
+        href = re.search(
+            r'href="(/#copy-[^"]+)"', render_reclaim_result_html(resp)
+        ).group(1)
+        fragment = urlsplit(href).fragment
+        # the browser decodes the fragment once before matching the element id;
+        # since the token carries no percent-encoding, the decoded fragment equals
+        # the id, so the :target highlight lands.
+        self.assertEqual(unquote(fragment), anchor_id)
+        self.assertEqual(fragment, anchor_id)
+
+    def test_numeric_rating_key_unchanged(self) -> None:
+        # #87 AC: numeric rating_keys render exactly as before.
+        report_html = render_report_html(
+            self._reclaimable_payload("900"), actions_enabled=True
+        )
+        self.assertEqual(self._anchor_id(report_html), "copy-900-2")
+        resp = ReclaimResponse(
+            200, True, False, "",
+            [ReclaimResult("900", 2, STATUS_DELETED, "filesystem", "ok", 5 * GiB)],
+        )
+        self.assertIn('href="/#copy-900-2"', render_reclaim_result_html(resp))
+
+    def test_special_rating_key_preserves_escaping_and_checkbox_addressing(self) -> None:
+        # #87: HTML-special characters stay escaped, and the reclaim checkbox
+        # still addresses the copy by the RAW rating_key:part_id — the display
+        # anchor is separate from the action addressing.
+        html = render_report_html(
+            self._reclaimable_payload('a<b"c'), actions_enabled=True
+        )
+        self.assertIn('value="a&lt;b&quot;c:2"', html)
+        anchor_id = self._anchor_id(html)
+        self.assertNotIn("<", anchor_id)
+        self.assertNotIn('"', anchor_id)
+        self.assertRegex(anchor_id, r"^copy-[A-Za-z0-9_]+-[A-Za-z0-9_]+$")
+
+    def test_unicode_rating_key_round_trips(self) -> None:
+        # A non-ASCII rating_key encodes to the ASCII-safe token on both sides.
+        rating_key = "mövie"
+        report_html = render_report_html(
+            self._reclaimable_payload(rating_key), actions_enabled=True
+        )
+        anchor_id = self._anchor_id(report_html)
+        self.assertRegex(anchor_id, r"^copy-[A-Za-z0-9_]+-[A-Za-z0-9_]+$")
+        resp = ReclaimResponse(
+            200, True, False, "",
+            [ReclaimResult(rating_key, 2, STATUS_DELETED, "filesystem", "ok", 5 * GiB)],
+        )
+        href = re.search(
+            r'href="(/#copy-[^"]+)"', render_reclaim_result_html(resp)
+        ).group(1)
+        self.assertEqual(urlsplit(href).fragment, anchor_id)
 
 
 if __name__ == "__main__":

@@ -88,13 +88,53 @@ class PlexClient(JsonHttpClient):
         payload = super()._get_json(api_path, params, extra_headers=extra_headers)
         return self._ensure_json_object(payload, api_path)
 
+    def _media_container(self, payload: dict, api_path: str) -> dict:
+        """Return the ``MediaContainer`` object from a decoded Plex body.
+
+        ``_ensure_json_object`` (in :meth:`_get_json`) guards only the *top level*.
+        This guards the nested shape: a well-formed object whose ``MediaContainer``
+        *value* is not a dict (``{"MediaContainer": []}`` / ``{"MediaContainer":
+        null}``, e.g. from a misbehaving reverse proxy) would otherwise let the
+        callers' ``container.get(...)`` raise a bare ``AttributeError`` that escapes
+        the 404/section-skip handler and crashes the read-only report. A missing
+        key stays ``{}`` (the prior behavior — "no items"); a present-but-non-dict
+        value surfaces as ``PlexClientError`` naming the endpoint.
+        """
+
+        container = payload.get("MediaContainer", {})
+        if not isinstance(container, dict):
+            raise PlexClientError(
+                f"Plex returned a non-object MediaContainer from {api_path} "
+                f"(expected an object, got {type(container).__name__})"
+            )
+        return container
+
+    def _container_list(self, container: dict, field: str, api_path: str) -> list:
+        """Return a list-valued ``MediaContainer`` child (``Directory`` /
+        ``Metadata``). Absent stays ``[]``; a present-but-non-list value surfaces
+        as ``PlexClientError`` naming the endpoint, rather than crashing the
+        subsequent ``for`` on a non-iterable (or silently mis-iterating a dict)."""
+
+        value = container.get(field)
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise PlexClientError(
+                f"Plex returned a non-list {field} from {api_path} "
+                f"(expected a list, got {type(value).__name__})"
+            )
+        return value
+
     def fetch_sections(self) -> List[PlexSection]:
         """Return the Plex library sections."""
 
-        payload = self._get_json("/library/sections")
-        container = payload.get("MediaContainer", {})
+        api_path = "/library/sections"
+        payload = self._get_json(api_path)
+        container = self._media_container(payload, api_path)
         sections: List[PlexSection] = []
-        for directory in container.get("Directory", []):
+        for directory in self._container_list(container, "Directory", api_path):
+            if not isinstance(directory, dict):
+                continue
             sections.append(
                 PlexSection(
                     key=str(directory.get("key", "")),
@@ -124,12 +164,13 @@ class PlexClient(JsonHttpClient):
             "duplicate": "1",
             "includeGuids": "1",
         }
+        api_path = f"/library/sections/{section_id}/all"
         items: List[dict] = []
         start = 0
         while True:
             try:
                 payload = self._get_json(
-                    f"/library/sections/{section_id}/all",
+                    api_path,
                     params,
                     container_start=start,
                     container_size=page_size,
@@ -140,9 +181,9 @@ class PlexClient(JsonHttpClient):
                     return []
                 raise
 
-            container = payload.get("MediaContainer", {})
-            page = container.get("Metadata") or []
-            items.extend(page)
+            container = self._media_container(payload, api_path)
+            page = self._container_list(container, "Metadata", api_path)
+            items.extend(item for item in page if isinstance(item, dict))
             if not page:
                 break
 

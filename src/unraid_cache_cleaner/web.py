@@ -533,6 +533,37 @@ def _wrap_reclaim_form(
     )
 
 
+def _fragment_safe(value: str) -> str:
+    """Encode an arbitrary string into the fixed ``[A-Za-z0-9_]`` charset so it is
+    byte-identical inside an HTML ``id`` attribute and a URL ``#fragment`` — no
+    percent-encoding (which the browser decodes once, so a ``%20`` in the id would
+    never match ``#…%20``) and no CSS/URL-fragment-special character survives.
+
+    ASCII alphanumerics pass through unchanged — a numeric Plex ``rating_key`` keeps
+    its literal form — and every other byte becomes ``_<hex>``. ``_`` is therefore
+    only ever an escape marker, so the mapping is injective: distinct inputs yield
+    distinct tokens (no two copies collide on one anchor)."""
+
+    out: List[str] = []
+    for ch in value:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+        else:
+            out.extend(f"_{byte:02x}" for byte in ch.encode("utf-8"))
+    return "".join(out)
+
+
+def _copy_anchor_token(rating_key: object, part_id: object) -> str:
+    """The stable, round-trip-safe token shared by a copy's report-row ``id`` and the
+    reclaim-result ``/#…`` link-back (#80/#87): ``copy-<rating_key>-<part_id>`` with
+    each component :func:`_fragment_safe`-encoded. Because a literal ``-`` in a
+    component is escaped, the two ``-`` in the template are unambiguous separators, so
+    the token round-trips even for a ``rating_key`` carrying a space, ``#``, or other
+    special character; numeric keys render exactly as before (``copy-900-2``)."""
+
+    return f"copy-{_fragment_safe(str(rating_key))}-{_fragment_safe(str(part_id))}"
+
+
 def _result_target_cell(result: object) -> str:
     """The Target cell for a reclaim-result row: the ``rating_key:part_id`` id, linked
     back to the exact report row it affected (#80) via the copy's stable ``/#copy-…``
@@ -544,7 +575,7 @@ def _result_target_cell(result: object) -> str:
     label = f"{_esc(rating_key)}:{_esc(part_id)}"
     if not rating_key or not part_id:
         return f"<td>{label}</td>"
-    anchor = _esc(f"/#copy-{rating_key}-{part_id}")
+    anchor = _esc("/#" + _copy_anchor_token(rating_key, part_id))
     return f'<td><a href="{anchor}">{label}</a></td>'
 
 
@@ -1014,7 +1045,7 @@ def _copy_anchor_id(group: dict, copy: dict) -> Optional[str]:
     target = _copy_target(group, copy)
     if target is None:
         return None
-    return f"copy-{target[0]}-{target[1]}"
+    return _copy_anchor_token(target[0], target[1])
 
 
 def _anchor_attr(anchor_id: Optional[str]) -> str:
