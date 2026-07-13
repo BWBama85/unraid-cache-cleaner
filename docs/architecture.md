@@ -162,6 +162,17 @@ independently and a mid-delete failure is surfaced as a `partial` error). Every
 real delete (or partial failure) is persisted via `ActionRecord` in the SQLite
 `actions` table, always under the original media path.
 
+The two-phase rollback is in-process only, so two residues can outlive it: a crash
+mid-move, and a post-commit purge failure (a later part left staged after an earlier
+unlink already committed — enumerated as explicit `left staged` audit rows rather
+than left silent). `ReclaimService.reconcile_staging` reconciles both. It runs at web
+startup (under the reclaim lock, before the socket serves) over the mapped media
+roots: a sibling whose original is missing is **restored**, one whose original is
+present is **removed** (deferred under dry-run), and an ambiguous sibling — a symlink,
+or a name near `NAME_MAX` that can't be reconstructed un-truncated — is left in place
+and audited `skipped`. Its outcomes land in the same `actions` table under a distinct
+`web-reclaim:reconcile` action.
+
 ## Failure Model
 
 The service fails closed:

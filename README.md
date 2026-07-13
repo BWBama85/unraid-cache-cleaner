@@ -317,6 +317,15 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
   sibling) before any is unlinked, so if one part can't be staged the rest roll back
   and nothing is deleted. (A tracked copy's Radarr/Sonarr deletes can't be rolled
   back, so they run independently and a mid-delete failure is reported as a partial.)
+- **Self-healing staging.** The two-phase move's rollback is in-process only; a
+  container crash mid-move, or the near-impossible post-commit purge failure, can
+  strand a `*.uncc-reclaim` sibling. On every web start (when actions are enabled and
+  `WEB_MEDIA_PATH_MAP` is set) the server sweeps the mapped media roots and reconciles
+  each leftover: it **restores** the file if its original is missing (recovering
+  crash-stranded media) and **removes** it if the original is already back (a
+  completed delete's residue — skipped under `WEB_ACTIONS_DRY_RUN`). Anything
+  ambiguous (a symlink, or a name too long to reconstruct) is left in place and
+  logged. These show up in the action history as `web-reclaim:reconcile` rows.
 - **Audited.** Every real delete (and any partial failure) is written to the
   SQLite state store's `actions` table, so you can answer "what did the GUI delete".
 

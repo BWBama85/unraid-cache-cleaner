@@ -189,7 +189,43 @@ def _build_web_server(config: Config) -> "web.DuplicateReportServer":
 
     provider = web.file_report_provider(config.plex_duplicate_report_path)
     reclaim_service = _build_reclaim_service(config, provider)
-    return web.build_server(config, provider=provider, reclaim_service=reclaim_service)
+    # Bind the socket BEFORE reconciling: a bad bind address, an in-use port, or an
+    # unwritable audit DB must fail the start without the staging sweep having mutated
+    # the media tree. The server is bound but not yet serving here, so the sweep still
+    # runs before any request is accepted.
+    server = web.build_server(config, provider=provider, reclaim_service=reclaim_service)
+    _reconcile_web_staging(reclaim_service, config)
+    return server
+
+
+def _reconcile_web_staging(
+    reclaim_service: Optional[ReclaimService], config: Config
+) -> None:
+    """Reconcile orphaned two-phase staging siblings (#72) at web startup, before the
+    socket serves — restoring media a crash left staged and clearing completed-delete
+    leftovers under the configured media roots.
+
+    Best-effort: it needs the action layer (the reclaim service owns the media-path
+    map and the audit store) and a path map to have roots to sweep, and any failure is
+    logged and swallowed so reconciliation can never block the read-only viewer from
+    starting."""
+
+    logger = logging.getLogger(__name__)
+    if reclaim_service is None or not config.web_media_path_map:
+        return
+    try:
+        report = reclaim_service.reconcile_staging()
+    except Exception:  # noqa: BLE001 — reconciliation must never block startup
+        logger.warning("Startup staging reconciliation failed", exc_info=True)
+        return
+    if report.total:
+        logger.info(
+            "Startup staging reconciliation: restored=%s removed=%s would_remove=%s skipped=%s",
+            report.restored,
+            report.removed,
+            report.would_remove,
+            report.skipped,
+        )
 
 
 def _build_reclaim_service(
