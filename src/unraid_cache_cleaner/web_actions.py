@@ -55,6 +55,7 @@ Fail-closed on every axis:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
@@ -126,6 +127,18 @@ STAGING_SUFFIX = ".uncc-reclaim"
 _MAX_UTF8_CHAR_BYTES = 4
 
 _MISMATCH = dedupe.MISMATCH
+
+#: Lifetime of a browser "unlock" session (#68). After the operator presents the
+#: shared ``WEB_ACTION_TOKEN`` once, the web layer mints an HMAC-signed session token
+#: (keyed by that secret) so subsequent confirm submits carry authorization via a
+#: ``SameSite=Strict`` cookie instead of re-pasting the token. Bounded so a captured
+#: cookie is not valid indefinitely; rotating ``WEB_ACTION_TOKEN`` invalidates every
+#: outstanding session because the signing key changes.
+_SESSION_TTL_SECONDS = 3600
+
+#: Version prefix for the signed session token, so its wire format can evolve without
+#: a silently-accepted ambiguity.
+_SESSION_VERSION = "v1"
 
 
 @dataclass(frozen=True)
@@ -463,9 +476,20 @@ class ReclaimService:
         *,
         token: Optional[str],
         report_generated_at: Optional[object],
+        session: Optional[str] = None,
+        force_dry_run: bool = False,
     ) -> ReclaimResponse:
         """Reclaim ``targets`` under the full safety envelope. Never raises for a
-        bad request — every failure is a typed :class:`ReclaimResponse`."""
+        bad request — every failure is a typed :class:`ReclaimResponse`.
+
+        Authorization is satisfied by *either* the shared ``token`` *or* a valid
+        signed ``session`` (the #68 browser unlock cookie, minted by
+        :meth:`mint_session` only after a token was presented) — the session is
+        never weaker than the token because it is an HMAC over the same secret.
+        ``force_dry_run`` runs the whole validate-and-plan path with the deletes
+        suppressed regardless of ``WEB_ACTIONS_DRY_RUN``; :meth:`preview` uses it so
+        the confirmation step (#62) can show a would-delete summary without ever
+        mutating media."""
 
         if not self.enabled:
             return self._gate(403, "web actions are disabled (set WEB_ENABLE_ACTIONS=true)")
@@ -484,8 +508,13 @@ class ReclaimService:
                     "web actions are enabled but WEB_ACTION_TOKEN is not set; refusing to "
                     "expose an unauthenticated delete endpoint",
                 )
-            if not _token_ok(token, configured):
+            if not (_token_ok(token, configured) or self._session_valid(session)):
                 return self._gate(403, "invalid or missing action token")
+
+            # Resolve the effective dry-run once, after auth, so both the branch
+            # logic and the reported ``dry_run`` flag agree: a forced preview never
+            # deletes even when live mode is configured.
+            dry_run = self.dry_run or force_dry_run
 
             payload = self._load_report()
             if payload is None:
@@ -507,15 +536,96 @@ class ReclaimService:
                     continue
                 seen.add(key)
                 try:
-                    result = self._reclaim_one(target, index, seen_copies)
+                    result = self._reclaim_one(target, index, seen_copies, dry_run)
                 except Exception:  # noqa: BLE001 — one bad target must not crash the request
                     LOGGER.warning("reclaim of %s failed unexpectedly", key, exc_info=True)
                     result = self._refused(target, "", "internal error while processing this target")
                 if result is not None:
                     results.append(result)
 
-        self._log_summary(results)
-        return ReclaimResponse(200, True, self.dry_run, "", results)
+        self._log_summary(results, dry_run)
+        return ReclaimResponse(200, True, dry_run, "", results)
+
+    def preview(
+        self,
+        targets: Sequence[ReclaimTarget],
+        *,
+        token: Optional[str],
+        report_generated_at: Optional[object],
+        session: Optional[str] = None,
+    ) -> ReclaimResponse:
+        """The side-effect-free planning pass behind the #62 confirmation step.
+
+        Runs the full auth + freshness + per-target safety validation exactly like
+        :meth:`reclaim`, but with the deletes forced off — so the response is a
+        would-delete/refused breakdown the confirm page renders, and a subsequent
+        confirm re-runs :meth:`reclaim` (reloading the report and repeating every
+        filesystem/``*arr`` drift check) so nothing about the plan is trusted."""
+
+        return self.reclaim(
+            targets,
+            token=token,
+            report_generated_at=report_generated_at,
+            session=session,
+            force_dry_run=True,
+        )
+
+    # -- browser unlock session (#68) ---------------------------------------- #
+
+    @property
+    def session_max_age(self) -> int:
+        """The ``Max-Age`` (seconds) the web layer stamps on the unlock cookie."""
+
+        return _SESSION_TTL_SECONDS
+
+    def mint_session(self) -> Optional[str]:
+        """Mint a signed unlock-session token (``v1.<expiry>.<hmac>``), or ``None``
+        when no ``WEB_ACTION_TOKEN`` is configured (nothing to sign with, so no
+        session can exist). The value carries no secret — it is an HMAC of the
+        expiry keyed by the token — so it is safe to hand to the browser, and it
+        can only be minted server-side after a real token was accepted."""
+
+        configured = self._config.web_action_token
+        if not configured:
+            return None
+        expiry = int(self._clock()) + _SESSION_TTL_SECONDS
+        return f"{_SESSION_VERSION}.{expiry}.{self._session_sig(configured, expiry)}"
+
+    def _session_valid(self, value: Optional[str]) -> bool:
+        """Whether ``value`` is a live, untampered unlock-session token: correct
+        version, unexpired, and a constant-time signature match against the current
+        ``WEB_ACTION_TOKEN``. Any malformed field, a rotated token (key mismatch), or
+        a lapsed expiry fails closed — a session is never accepted the token itself
+        would not be."""
+
+        configured = self._config.web_action_token
+        if not configured or not value:
+            return False
+        parts = value.split(".", 2)
+        if len(parts) != 3:
+            return False
+        version, expiry_text, signature = parts
+        if version != _SESSION_VERSION:
+            return False
+        try:
+            expiry = int(expiry_text)
+        except ValueError:
+            return False
+        if expiry < int(self._clock()):
+            return False
+        # Compare UTF-8 bytes, not ``str`` — ``hmac.compare_digest`` raises TypeError on
+        # a ``str`` containing non-ASCII, and the signature is client-controlled (a
+        # cookie value can smuggle a non-ASCII char via a quoted octal escape), so a
+        # ``str`` compare would crash the request thread on a hostile cookie instead of
+        # simply refusing. Mirrors :func:`_token_ok`.
+        return hmac.compare_digest(
+            signature.encode("utf-8"), self._session_sig(configured, expiry).encode("utf-8")
+        )
+
+    @staticmethod
+    def _session_sig(token: str, expiry: int) -> str:
+        message = f"ucc-session:{_SESSION_VERSION}:{expiry}".encode("utf-8")
+        return hmac.new(token.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
     # -- staging reconciliation (#72) ---------------------------------------- #
 
@@ -769,6 +879,7 @@ class ReclaimService:
         target: ReclaimTarget,
         index: _ActionIndex,
         seen_copies: Set[int],
+        dry_run: bool,
     ) -> Optional[ReclaimResult]:
         if not target.rating_key or target.part_id == 0:
             return self._refused(target, "", "invalid target id (empty rating_key or zero part_id)")
@@ -810,14 +921,16 @@ class ReclaimService:
             )
 
         if entry.association == arr.UNTRACKED:
-            return self._reclaim_filesystem(target, entry)
+            return self._reclaim_filesystem(target, entry, dry_run)
         if entry.association == arr.TRACKED:
-            return self._reclaim_arr(target, entry)
+            return self._reclaim_arr(target, entry, dry_run)
         return self._refused(target, "", f"unsupported association {entry.association!r}")
 
     # -- filesystem backend -------------------------------------------------- #
 
-    def _reclaim_filesystem(self, target: ReclaimTarget, entry: _CopyEntry) -> ReclaimResult:
+    def _reclaim_filesystem(
+        self, target: ReclaimTarget, entry: _CopyEntry, dry_run: bool
+    ) -> ReclaimResult:
         # Prevalidate EVERY part before deleting ANY, so a stacked copy is removed
         # whole or refused whole (never half-deleted).
         validated: List[Tuple[Path, int]] = []
@@ -828,7 +941,7 @@ class ReclaimService:
             validated.append((container_path, part.size))
 
         total = sum(size for _, size in validated)
-        if self.dry_run:
+        if dry_run:
             return self._would_delete(
                 target, BACKEND_FILESYSTEM, total, f"{len(validated)} file(s) via filesystem"
             )
@@ -1091,7 +1204,9 @@ class ReclaimService:
 
     # -- *arr backend -------------------------------------------------------- #
 
-    def _reclaim_arr(self, target: ReclaimTarget, entry: _CopyEntry) -> ReclaimResult:
+    def _reclaim_arr(
+        self, target: ReclaimTarget, entry: _CopyEntry, dry_run: bool
+    ) -> ReclaimResult:
         backend = entry.arr_tracked or ""
         client = self._arr_client(backend)
         if client is None:
@@ -1110,7 +1225,7 @@ class ReclaimService:
             return self._refused(target, backend, error or "arr resolution failed")
 
         total = sum(size for _, _, size in resolved)
-        if self.dry_run:
+        if dry_run:
             return self._would_delete(target, backend, total, f"{len(resolved)} file(s) via {backend}")
 
         jobs = [
@@ -1337,7 +1452,7 @@ class ReclaimService:
         except Exception:  # noqa: BLE001 — an audit-write failure must not mask a completed delete
             LOGGER.warning("persisting the reclaim audit trail failed", exc_info=True)
 
-    def _log_summary(self, results: List[ReclaimResult]) -> None:
+    def _log_summary(self, results: List[ReclaimResult], dry_run: bool) -> None:
         counts: Dict[str, int] = {}
         reclaimed = 0
         for result in results:
@@ -1345,7 +1460,7 @@ class ReclaimService:
             reclaimed += result.reclaimed_bytes
         LOGGER.info(
             "web reclaim: dry_run=%s targets=%s deleted=%s would_delete=%s refused=%s error=%s bytes=%s",
-            self.dry_run,
+            dry_run,
             len(results),
             counts.get(STATUS_DELETED, 0),
             counts.get(STATUS_WOULD_DELETE, 0),

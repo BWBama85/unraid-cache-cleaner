@@ -133,7 +133,15 @@ JSON, or the no-JS `POST /actions/reclaim` browser form) into
 `{rating_key, part_id}` targets and hands them to `ReclaimService`, which owns the
 entire safety envelope and is constructed with injected collaborators (report
 provider, filesystem deleter, Radarr/Sonarr clients, audit sink, clock) so every
-path is fake-tested without a real socket or disk write. Fail-closed on every
+path is fake-tested without a real socket or disk write. The browser flow is
+two-step (#62): the report form posts to `POST /actions/preview`, which runs a
+request-scoped forced dry run (`ReclaimService.preview`) and renders a confirmation
+page before `POST /actions/reclaim` performs the delete. Authorization for the
+browser is an HMAC-signed unlock session (#68) — minted by `mint_session` only after
+a real token is accepted, keyed by `WEB_ACTION_TOKEN`, carried as an
+`HttpOnly`/`SameSite=Strict` cookie so the confirm submit need not re-paste the
+token and the secret never lands in page HTML; the JSON API stays token-only via
+`X-Action-Token` and never consults the cookie. Fail-closed on every
 axis: disabled + dry-run by default; a shared `WEB_ACTION_TOKEN` is required
 (enabling actions without one refuses every request); on top of the token a
 CSRF/origin check scales with the bind address — loopback stays permissive (the

@@ -1325,6 +1325,33 @@ def _post(url, data, headers, method="POST"):
         return exc.code, exc.read()
 
 
+def _post_resp(url, data, headers, method="POST"):
+    """Like ``_post`` but also returns the response headers (so the two-step
+    confirmation tests can read the ``Set-Cookie`` the preview step mints)."""
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+def _form(**fields) -> bytes:
+    return "&".join(f"{k}={v}" for k, v in fields.items()).encode()
+
+
+def _cookie_pair(headers) -> str:
+    """The ``name=value`` pair from a response ``Set-Cookie`` (attributes stripped),
+    ready to echo back as a request ``Cookie`` header."""
+
+    raw = headers.get("Set-Cookie")
+    return raw.split(";", 1)[0] if raw else ""
+
+
+_FORM_CT = {"Content-Type": "application/x-www-form-urlencoded"}
+
+
 def _untracked_payload(size=5):
     keeper = _keeper()
     return _report([_group([keeper, _copy("/plex/x.mkv", size, media_id=21, association="untracked")], keeper=keeper)])
@@ -1556,7 +1583,9 @@ class ActionFormRenderTests(unittest.TestCase):
             with urllib.request.urlopen(base + "/", timeout=5) as resp:
                 headers = resp.headers
                 html = resp.read().decode("utf-8")
-        self.assertIn('action="/actions/reclaim"', html)
+        # The report form now posts to the confirmation step (#62), not straight to
+        # the destructive endpoint; the token field remains for the first unlock (#68).
+        self.assertIn('action="/actions/preview"', html)
         self.assertIn('name="target"', html)
         self.assertIn('name="token"', html)
         self.assertIn("form-action 'self'", headers.get("Content-Security-Policy", ""))
@@ -1574,6 +1603,305 @@ class ActionFormRenderTests(unittest.TestCase):
     def test_render_report_html_actions_disabled_has_no_form(self) -> None:
         html = render_report_html(_untracked_payload(), actions_enabled=False)
         self.assertNotIn("/actions/reclaim", html)
+
+
+# --------------------------------------------------------------------------- #
+# Unlock session token + preview (#68 / #62), at the service level             #
+# --------------------------------------------------------------------------- #
+
+class SessionTokenTests(unittest.TestCase):
+    def test_minted_session_validates(self) -> None:
+        service = _service(_report([]))
+        token = service.mint_session()
+        self.assertIsNotNone(token)
+        self.assertTrue(token.startswith("v1."))
+        self.assertTrue(service._session_valid(token))
+
+    def test_no_token_configured_cannot_mint_or_validate(self) -> None:
+        service = _service(_report([]), config=_config(web_action_token=""))
+        self.assertIsNone(service.mint_session())
+        self.assertFalse(service._session_valid("v1.9999999999.deadbeef"))
+
+    def test_tampered_or_garbage_session_refused(self) -> None:
+        service = _service(_report([]))
+        token = service.mint_session()
+        self.assertFalse(service._session_valid(token + "x"))       # signature altered
+        self.assertFalse(service._session_valid(None))
+        self.assertFalse(service._session_valid(""))
+        self.assertFalse(service._session_valid("not.a.session"))
+        self.assertFalse(service._session_valid("v1.notanumber.sig"))
+        self.assertFalse(service._session_valid("v2.3723." + token.split(".")[2]))
+
+    def test_expired_session_refused(self) -> None:
+        now = [1000.0]
+        service = _service(_report([]))
+        service._clock = lambda: now[0]
+        token = service.mint_session()
+        self.assertTrue(service._session_valid(token))
+        now[0] = 1000.0 + service.session_max_age + 1
+        self.assertFalse(service._session_valid(token))
+
+    def test_rotated_token_invalidates_session(self) -> None:
+        token = _service(_report([])).mint_session()
+        rotated = _service(_report([]), config=_config(web_action_token="different"))
+        self.assertFalse(rotated._session_valid(token))
+
+    def test_non_ascii_signature_refuses_without_raising(self) -> None:
+        # A hostile cookie can smuggle a non-ASCII char into the signature (a quoted
+        # octal escape); hmac.compare_digest raises TypeError on a non-ASCII str, so a
+        # naive compare would crash the request thread. It must refuse cleanly instead.
+        service = _service(_report([]))
+        self.assertFalse(service._session_valid("v1.9999999999.\xe9abc"))
+
+    def test_reclaim_accepts_valid_session_instead_of_token(self) -> None:
+        service = _service(_report([]))
+        session = service.mint_session()
+        self.assertEqual(
+            service.reclaim([], token=None, session=session, report_generated_at=GEN).status_code,
+            200,
+        )
+        self.assertEqual(
+            service.reclaim([], token=None, session=None, report_generated_at=GEN).status_code,
+            403,
+        )
+        self.assertEqual(
+            service.reclaim(
+                [], token=None, session="v1.9999999999.bad", report_generated_at=GEN
+            ).status_code,
+            403,
+        )
+
+    def test_preview_forces_dry_run_even_in_live_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            real, group, config = FilesystemTests()._fixture(tmp)  # live config (dry_run False)
+            deleter = _FakeDeleter()
+            audit = _FakeAudit()
+            service = _service(_report([group]), config=config, deleter=deleter, audit=audit)
+            preview = service.preview([ReclaimTarget("900", 2)], token="tok", report_generated_at=GEN)
+            self.assertTrue(preview.dry_run)
+            self.assertEqual(preview.results[0].status, "would-delete")
+            self.assertEqual(deleter.calls, [])   # preview deleted nothing
+            self.assertEqual(audit.records, [])    # and audited nothing
+            self.assertTrue(real.exists())         # sentinel intact
+            # The same live service DOES delete on a real reclaim — proving the
+            # preview suppression is request-scoped, not a globally dry-run service.
+            live = service.reclaim([ReclaimTarget("900", 2)], token="tok", report_generated_at=GEN)
+            self.assertEqual(live.results[0].status, "deleted")
+
+
+# --------------------------------------------------------------------------- #
+# Two-step confirmation flow + unlock cookie over real HTTP (#62 / #68)         #
+# --------------------------------------------------------------------------- #
+
+class ConfirmationFlowHttpTests(unittest.TestCase):
+    def _fs_service(self, tmp, *, dry_run=False):
+        """A live-by-default reclaim service over a real, mapped media file, so a
+        preview yields ``would-delete`` (not the unmapped-path refusal) and a confirm
+        actually runs the delete."""
+
+        media_root = Path(tmp) / "media"
+        real = media_root / "movie/old.mkv"
+        real.parent.mkdir(parents=True, exist_ok=True)
+        real.write_bytes(b"x" * 5)
+        config = _config(
+            web_media_path_map=((Path("/plex"), media_root),),
+            web_actions_dry_run=dry_run,
+        )
+        keeper = _keeper()
+        group = _group(
+            [keeper, _copy("/plex/movie/old.mkv", 5, media_id=21, association="untracked")],
+            keeper=keeper,
+        )
+        payload = _report([group])
+        deleter = _FakeDeleter()
+        service = _service(payload, config=config, deleter=deleter)
+        return payload, service, deleter, real
+
+    def test_preview_renders_confirmation_and_sets_unlock_cookie(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp)
+            with _serve(payload, service) as base:
+                status, headers, raw = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+            self.assertEqual(status, 200)
+            self.assertIn(b"Confirm reclaim", raw)
+            self.assertIn(b"You are about to delete", raw)
+            cookie = headers.get("Set-Cookie") or ""
+            self.assertIn("ucc_session=", cookie)
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=Strict", cookie)
+            self.assertEqual(deleter.calls, [])    # preview never deletes
+            self.assertTrue(real.exists())
+
+    def test_live_preview_page_warns_of_real_delete_not_dry_run(self) -> None:
+        # #76 review (P1): preview() always forces dry-run, but the confirmation page
+        # must reflect the CONFIGURED mode. In live mode (WEB_ACTIONS_DRY_RUN=false)
+        # it must warn of a real delete, never claim Confirm "removes nothing".
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp)  # live (dry_run False)
+            with _serve(payload, service) as base:
+                status, _, raw = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+            self.assertEqual(status, 200)
+            self.assertNotIn(b"removes nothing", raw)
+            self.assertIn(b"permanently deletes", raw)
+            self.assertIn(b"Live mode", raw)
+
+    def test_dry_run_preview_page_says_removes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                status, _, raw = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+            self.assertEqual(status, 200)
+            self.assertIn(b"removes nothing", raw)
+
+    def test_preview_bad_token_is_403_and_sets_no_cookie(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp)
+            with _serve(payload, service) as base:
+                status, headers, _ = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="wrong", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+        self.assertEqual(status, 403)
+        self.assertIsNone(headers.get("Set-Cookie"))
+
+    def test_preview_stale_generation_is_409(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp)
+            with _serve(payload, service) as base:
+                status, _, raw = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN + 5, target="900:2"),
+                    _FORM_CT,
+                )
+        self.assertEqual(status, 409)
+        self.assertIn(b"reload", raw)
+
+    def test_confirm_via_cookie_needs_no_token(self) -> None:
+        # The #68 headline: unlock once via preview, then the destructive confirm
+        # carries only the SameSite cookie — no re-pasted token — and deletes.
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp)
+            with _serve(payload, service) as base:
+                s1, h1, _ = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+                self.assertEqual(s1, 200)
+                cookie = _cookie_pair(h1)
+                self.assertTrue(cookie.startswith("ucc_session="))
+                self.assertEqual(deleter.calls, [])   # preview still deleted nothing
+                s2, _, raw2 = _post_resp(
+                    base + "/actions/reclaim",
+                    _form(report_generated_at=GEN, target="900:2"),  # NO token field
+                    {**_FORM_CT, "Cookie": cookie},
+                )
+            self.assertEqual(s2, 200)
+            self.assertIn(b"Reclaim result", raw2)
+            self.assertEqual(len(deleter.calls), 1)   # confirm ran the real delete
+            self.assertFalse(real.exists())            # staged away from its media path
+
+    def test_confirm_without_cookie_or_token_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp)
+            with _serve(payload, service) as base:
+                status, _, _ = _post_resp(
+                    base + "/actions/reclaim",
+                    _form(report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+            self.assertEqual(status, 403)
+            self.assertEqual(deleter.calls, [])
+            self.assertTrue(real.exists())
+
+    def test_json_api_does_not_accept_session_cookie(self) -> None:
+        # #68 AC: the X-Action-Token JSON path is unchanged — a browser cookie must
+        # not authorize it. Mint a real cookie, then hit /api/reclaim with only the
+        # cookie (no header token) and confirm it is still refused.
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                _, h1, _ = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+                cookie = _cookie_pair(h1)
+                self.assertTrue(cookie.startswith("ucc_session="))
+                body = json.dumps(
+                    {"report_generated_at": GEN, "targets": [{"rating_key": "900", "part_id": 2}]}
+                ).encode()
+                status, _, _ = _post_resp(
+                    base + "/api/reclaim", body,
+                    {"Content-Type": "application/json", "Cookie": cookie},
+                )
+        self.assertEqual(status, 403)
+
+    def test_unlock_cookie_is_secure_only_over_https(self) -> None:
+        # Behind a TLS proxy (https Origin) the cookie is marked Secure; on the plain
+        # -HTTP LAN default it is not (a Secure cookie would be dropped by the browser).
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp, dry_run=True)
+            with _serve(
+                payload, service, require_browser_origin=True,
+                allowed_origins=("https://media.example.com",),
+            ) as base:
+                _, h_https, _ = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    {**_FORM_CT, "Origin": "https://media.example.com"},
+                )
+        self.assertIn("Secure", h_https.get("Set-Cookie", ""))
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                _, h_http, _ = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    {**_FORM_CT, "Origin": base},
+                )
+        self.assertNotIn("Secure", h_http.get("Set-Cookie", ""))
+
+    def test_hostile_non_ascii_cookie_is_clean_403(self) -> None:
+        # A quoted cookie value smuggling a non-ASCII byte (octal escape) must yield a
+        # clean 403, never crash the request thread (hmac.compare_digest raises on a
+        # non-ASCII str) and drop the connection.
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                status, _, _ = _post_resp(
+                    base + "/actions/reclaim",
+                    _form(report_generated_at=GEN, target="900:2"),
+                    {**_FORM_CT, "Cookie": r'ucc_session="v1.9999999999.\351abc"'},
+                )
+            self.assertEqual(status, 403)
+            self.assertEqual(deleter.calls, [])
+            self.assertTrue(real.exists())
+
+    def test_preview_cross_origin_on_nonloopback_is_403(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service, require_browser_origin=True) as base:
+                status, headers, _ = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    {**_FORM_CT, "Origin": "http://evil.example"},
+                )
+        self.assertEqual(status, 403)
+        self.assertIsNone(headers.get("Set-Cookie"))
 
 
 if __name__ == "__main__":
