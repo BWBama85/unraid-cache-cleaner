@@ -124,7 +124,7 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `WEB_PORT` | `8080` | TCP port the web UI listens on |
 | `WEB_ENABLE_ACTIONS` | `false` | Enable the [action layer](#reclaiming-duplicates-from-the-browser-phase-2) so an operator can delete redundant copies from the browser. Off by default; the viewer is read-only until you set this |
 | `WEB_ACTIONS_DRY_RUN` | `true` | When actions are on, report what a reclaim *would* delete and touch nothing (mirrors `DRY_RUN`). Set `false` only after reviewing a dry run |
-| `WEB_ACTION_TOKEN` | empty | Shared secret every reclaim must present (`X-Action-Token` header or the form field). **Required** to actually delete: with actions enabled but no token, every reclaim is refused |
+| `WEB_ACTION_TOKEN` | empty | Shared secret every reclaim must present (`X-Action-Token` header for the JSON API; pasted once in the browser to set a one-hour unlock cookie). **Required** to actually delete: with actions enabled but no token, every reclaim is refused |
 | `WEB_MEDIA_PATH_MAP` | empty | Comma-separated `plex_prefix:container_prefix` pairs mapping Plex-reported paths to this container's mounts, e.g. `/mnt/user/Media:/media`. Needed for a filesystem delete of an *untracked* copy; an unmapped path is refused |
 | `WEB_ALLOWED_ORIGINS` | empty | Comma-separated allow-list of external origins (e.g. `https://media.example.com`) that may submit the reclaim form. Set this behind a TLS-terminating reverse proxy, where the server sees plain HTTP and can't trust `Host` to infer the external scheme. Empty uses the same-origin-vs-`Host` check (the LAN default). See [CSRF/origin hardening](#reclaiming-duplicates-from-the-browser-phase-2) |
 
@@ -259,7 +259,8 @@ Open `http://<host>:8080/`. Routes:
 | `/api/actions` | GET | `{"available": bool, "actions": [...]}` — the recent `web-reclaim:*` audit rows |
 | `/healthz` | GET | `ok` (liveness) |
 | `/api/reclaim` | POST | Reclaim endpoint (JSON) — only when actions are enabled; `405` otherwise |
-| `/actions/reclaim` | POST | Browser-form reclaim — only when actions are enabled |
+| `/actions/preview` | POST | Browser confirmation step — previews what a reclaim would delete (only when actions are enabled) |
+| `/actions/reclaim` | POST | Browser-form reclaim (the confirm submit) — only when actions are enabled |
 
 - **Read-only by default, fail-closed.** Until `WEB_ENABLE_ACTIONS=true` no
   mutation endpoint exists and every non-`GET` verb returns `405`. All
@@ -284,9 +285,23 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
 - **Disabled and dry-run by default.** Actions are off until you opt in, and even
   then `WEB_ACTIONS_DRY_RUN=true` (the default) reports what *would* be deleted and
   touches nothing. Set `WEB_ACTIONS_DRY_RUN=false` only after reviewing a dry run.
-- **Token-gated.** Every reclaim must present `WEB_ACTION_TOKEN` (via the
-  `X-Action-Token` header or the form's token field). Enabling actions **without**
-  a token refuses every request — there is never an unauthenticated delete endpoint.
+- **Token-gated, unlock once per browser.** Every reclaim must present
+  `WEB_ACTION_TOKEN`. Enabling actions **without** a token refuses every request —
+  there is never an unauthenticated delete endpoint. In the browser you paste the
+  token **once** on the report page; a successful preview then sets a signed,
+  `HttpOnly`/`SameSite=Strict` unlock cookie (valid one hour, keyed by the token so
+  rotating it invalidates every session) so the confirm submit — and later reclaims
+  in the window — need not re-paste it, and the secret never appears in page HTML.
+  The **JSON API is unchanged**: it stays token-only via the `X-Action-Token` header
+  and never accepts the cookie. (Cookies must be enabled for the browser flow.)
+- **Two-step confirmation.** The report form no longer deletes on submit: it posts to
+  `/actions/preview`, which shows an interstitial page listing exactly which copies
+  would be deleted (and how much space they free) and which were excluded (keeper,
+  mismatch, unknown) — nothing is touched until you click **Confirm**. The preview is
+  a forced dry run regardless of `WEB_ACTIONS_DRY_RUN`, and the confirm re-runs the
+  full validation server-side (fresh report snapshot + TOCTOU re-checks), so the
+  preview is never a trusted plan and a refreshed/replayed confirm re-validates
+  rather than double-deleting.
 - **CSRF/origin hardened.** On top of the token, a same-origin check defends against
   a cross-site request forgery. It scales with the bind address:
   - **Loopback bind (`127.0.0.1`, the code default):** behavior is unchanged — a

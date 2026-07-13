@@ -32,8 +32,11 @@ from unraid_cache_cleaner.web import (
     build_server,
     file_report_provider,
     render_actions_html,
+    render_reclaim_confirm_html,
+    render_reclaim_notice_html,
     render_report_html,
 )
+from unraid_cache_cleaner.web_actions import ReclaimResponse, ReclaimResult
 
 GiB = 1024 ** 3
 
@@ -625,6 +628,52 @@ class ActionHistoryViewerTests(unittest.TestCase):
         self.assertIn("No action history is available", page_body.decode("utf-8"))
         self.assertEqual(api_status, 200)
         self.assertFalse(json.loads(api_body)["available"])
+
+
+class ConfirmPageRenderTests(unittest.TestCase):
+    """The #62 confirmation page + the action-layer notice page (pure renderers)."""
+
+    def _resp(self, results, *, dry_run=False):
+        return ReclaimResponse(200, True, dry_run, "", results)
+
+    def test_confirm_page_summarizes_and_carries_targets_without_a_token(self) -> None:
+        results = [
+            ReclaimResult("900", 2, "would-delete", "filesystem", "1 file(s) via filesystem", 5 * GiB),
+        ]
+        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0)
+        self.assertIn("Confirm reclaim", html)
+        self.assertIn("You are about to delete", html)
+        self.assertIn("5.0 GiB", html)
+        # The confirm form posts to the destructive route, carrying the selection…
+        self.assertIn('action="/actions/reclaim"', html)
+        self.assertIn('name="target" value="900:2"', html)
+        self.assertIn('name="report_generated_at" value="1720000000.0"', html)
+        # …but never a token field: the browser proves auth with the session cookie.
+        self.assertNotIn('name="token"', html)
+
+    def test_confirm_page_shows_refusals_and_no_form_when_nothing_deletable(self) -> None:
+        results = [ReclaimResult("900", 1, "refused", "", "target is the group keeper; never deleted")]
+        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0)
+        self.assertIn("Nothing selected would be deleted", html)
+        self.assertIn("keeper", html)
+        self.assertNotIn('action="/actions/reclaim"', html)  # no confirm form to submit
+
+    def test_confirm_page_flags_dry_run(self) -> None:
+        results = [ReclaimResult("900", 2, "would-delete", "filesystem", "x", 5 * GiB)]
+        html = render_reclaim_confirm_html(self._resp(results, dry_run=True), 1_720_000_000.0)
+        self.assertIn("Dry-run mode", html)
+
+    def test_confirm_page_escapes_hostile_message(self) -> None:
+        results = [ReclaimResult("900", 2, "refused", "", "<script>alert(1)</script>")]
+        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0)
+        self.assertNotIn("<script>alert", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_notice_page_escapes_message_and_links_back(self) -> None:
+        html = render_reclaim_notice_html("Reclaim refused", "invalid or missing action token")
+        self.assertIn("Reclaim refused", html)
+        self.assertIn("invalid or missing action token", html)
+        self.assertIn('href="/"', html)
 
 
 class RenderPureFunctionTests(unittest.TestCase):

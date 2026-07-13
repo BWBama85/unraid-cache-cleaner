@@ -25,11 +25,22 @@ Action path (Phase 2, off unless ``WEB_ENABLE_ACTIONS=true``):
   which owns the entire safety envelope (token gate, fresh-snapshot resolution,
   keeper/mismatch/unknown refusals, TOCTOU re-validation, audit). This module only
   parses the request and renders the result — it never deletes anything itself.
+* the browser reclaim is two-step (#62): the report form posts to a
+  ``POST /actions/preview`` that runs a forced dry-run
+  (:meth:`~unraid_cache_cleaner.web_actions.ReclaimService.preview`) and renders a
+  confirmation page listing exactly what would be deleted, before ``/actions/reclaim``
+  performs it. Browser authorization is a signed unlock session (#68): a successful
+  preview sets an ``HttpOnly``/``SameSite=Strict`` cookie
+  (:meth:`~unraid_cache_cleaner.web_actions.ReclaimService.mint_session`, keyed by the
+  token) so the confirm submit need not re-paste ``WEB_ACTION_TOKEN`` and the secret
+  never appears in page HTML; the JSON API is unchanged and never consults the cookie.
 * on top of that token gate this module enforces a CSRF/origin check (#63): the
   JSON API stays token-only when it sends no ``Origin`` (so ``curl`` works), but a
   browser reclaim form on a *non-loopback* bind must present a matching ``Origin``
   (or same-origin ``Referer``); a ``WEB_ALLOWED_ORIGINS`` allow-list covers a
-  reverse-proxy deployment where the server sees plain HTTP.
+  reverse-proxy deployment where the server sees plain HTTP. ``SameSite=Strict`` on
+  the unlock cookie is what keeps the cookie-authorized confirm POST CSRF-safe on the
+  loopback bind, where the origin check is permissive.
 * when no reclaim service is attached (the plain viewer, or actions disabled),
   every non-``GET`` verb is answered ``405``, exactly as in Phase 1.
 
@@ -50,6 +61,7 @@ import threading
 import time
 from html import escape as _escape
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
@@ -57,7 +69,12 @@ from urllib.parse import parse_qsl, urlparse
 
 from .config import Config
 from .state import WebActionHistoryReader
-from .web_actions import ReclaimResponse, ReclaimService, ReclaimTarget
+from .web_actions import (
+    STATUS_WOULD_DELETE,
+    ReclaimResponse,
+    ReclaimService,
+    ReclaimTarget,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +95,13 @@ ActionHistoryProvider = Callable[[], Optional[List[dict]]]
 
 #: Rows the ``/actions`` history endpoint requests per load (the reader caps this).
 _ACTION_HISTORY_LIMIT = 200
+
+#: Name of the browser unlock-session cookie (#68). Set on a successful preview,
+#: carried (``SameSite=Strict``, ``HttpOnly``) on the confirm POST so the operator
+#: does not re-paste ``WEB_ACTION_TOKEN`` per submit. The value is an HMAC minted by
+#: :meth:`ReclaimService.mint_session` — it holds no secret and is validated only by
+#: the service, so this module shuttles the opaque string and never inspects it.
+_SESSION_COOKIE = "ucc_session"
 
 
 def _csp(actions_enabled: bool) -> str:
@@ -406,20 +430,28 @@ def _wrap_reclaim_form(reclaimable_html: str, generated_at: object) -> str:
     """Wrap the reclaimable table in the no-JS action form: the checkboxes rendered
     inside it, plus the token field, the hidden ``generated_at`` freshness token,
     and the submit button. No JavaScript — a native form POST keeps the strict CSP
-    (only ``form-action 'self'`` is relaxed)."""
+    (only ``form-action 'self'`` is relaxed).
+
+    The form posts to ``/actions/preview`` (not the destructive ``/actions/reclaim``):
+    the operator lands on a confirmation page (#62) before anything is deleted. The
+    token is optional (#68) — pasting it once establishes an unlock session so a
+    later reclaim need not re-paste it; an already-unlocked browser can leave it
+    blank and the preview authenticates via the session cookie."""
 
     gen = _esc("" if generated_at is None else generated_at)
     return (
-        '<form method="post" action="/actions/reclaim" class="reclaim">'
+        '<form method="post" action="/actions/preview" class="reclaim">'
         + reclaimable_html
         + f'<input type="hidden" name="report_generated_at" value="{gen}">'
         + '<div class="controls"><label>Action token '
-        + '<input type="password" name="token" autocomplete="off" required></label> '
-        + '<button type="submit">Reclaim selected</button></div>'
-        + '<p class="sub">Deletes the selected redundant copies — an *arr-tracked '
-        + "copy is removed via Radarr/Sonarr so it does not re-download. Refuses the "
-        + "keeper, mismatch groups, and unconfirmed copies. Honors "
-        + "<code>WEB_ACTIONS_DRY_RUN</code>.</p>"
+        + '<input type="password" name="token" autocomplete="off"></label> '
+        + '<button type="submit">Preview reclaim&hellip;</button></div>'
+        + '<p class="sub">Shows a confirmation page listing exactly what would be '
+        + "deleted before anything is removed. Paste <code>WEB_ACTION_TOKEN</code> "
+        + "once to unlock this browser for an hour; leave it blank if already "
+        + "unlocked. An *arr-tracked copy is removed via Radarr/Sonarr so it does not "
+        + "re-download. Refuses the keeper, mismatch groups, and unconfirmed copies. "
+        + "Honors <code>WEB_ACTIONS_DRY_RUN</code>.</p>"
         + "</form>"
     )
 
@@ -452,6 +484,109 @@ def render_reclaim_result_html(response: ReclaimResponse) -> str:
         body.append('<div class="empty">No targets were selected.</div>')
     body.append('<p class="sub"><a href="/">&larr; Back to the report</a></p>')
     return _page("Reclaim result", "".join(body), footer_note=_ACTION_FOOTER)
+
+
+# --------------------------------------------------------------------------- #
+# Confirmation step (#62) — interstitial preview before the destructive POST    #
+# --------------------------------------------------------------------------- #
+
+def render_reclaim_confirm_html(
+    response: ReclaimResponse, generated_at: object
+) -> str:
+    """Render the interstitial confirmation page for a preview (#62).
+
+    ``response`` is a forced-dry-run :class:`ReclaimResponse`, so its ``would-delete``
+    results are what a confirm would act on and its ``refused`` results explain what
+    the plan already excludes (keeper, mismatch, unknown, …). Only the ``would-delete``
+    targets are carried into the confirm form as hidden fields; the confirm re-runs
+    the full validation server-side, so these are a selection to re-check, never a
+    trusted plan. No token field — the browser proves authorization with the unlock
+    session cookie set alongside this page (#68)."""
+
+    would = [r for r in response.results if r.status == STATUS_WOULD_DELETE]
+    refused = [r for r in response.results if r.status != STATUS_WOULD_DELETE]
+    total = sum(_as_int(r.reclaimed_bytes) for r in would)
+
+    body: List[str] = ["<h1>Confirm reclaim</h1>"]
+    if response.dry_run:
+        body.append(
+            '<div class="warn">Dry-run mode (<code>WEB_ACTIONS_DRY_RUN</code>): '
+            "confirming reports what would be deleted but removes nothing.</div>"
+        )
+
+    if would:
+        body.append(
+            f'<p class="sub">You are about to delete <strong>{len(would)}</strong> '
+            f"redundant cop{'y' if len(would) == 1 else 'ies'} totaling "
+            f"<strong>{_esc(_fmt_gib(total))}</strong>. This cannot be undone.</p>"
+        )
+        body.append(_confirm_targets_table(would))
+        body.append(_confirm_form(would, generated_at))
+    else:
+        body.append(
+            '<div class="empty">Nothing selected would be deleted &mdash; every '
+            "selected copy was refused or no copy was selected. Review the reasons "
+            "below, then go back and adjust your selection.</div>"
+        )
+
+    if refused:
+        body.append('<h2>Excluded from this reclaim</h2>')
+        body.append(_confirm_targets_table(refused))
+
+    body.append('<p class="sub"><a href="/">&larr; Cancel and go back to the report</a></p>')
+    return _page("Confirm reclaim", "".join(body), footer_note=_ACTION_FOOTER)
+
+
+def _confirm_targets_table(results: Sequence) -> str:
+    rows: List[str] = []
+    for result in results:
+        rows.append(
+            "<tr>"
+            f'<td>{_esc(result.status)}</td>'
+            f'<td>{_esc(result.backend or "-")}</td>'
+            f'<td>{_esc(result.rating_key)}:{_esc(result.part_id)}</td>'
+            f'<td class="num">{_esc(_fmt_gib(result.reclaimed_bytes))}</td>'
+            f'<td>{_esc(result.message)}</td>'
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Plan</th><th>Backend</th><th>Target</th>"
+        "<th>Size</th><th>Detail</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _confirm_form(would: Sequence, generated_at: object) -> str:
+    """The Confirm form: hidden ``target`` fields for the would-delete copies plus the
+    freshness token, POSTing to the destructive ``/actions/reclaim``. Carries no token
+    field — authorization rides on the unlock session cookie (#68)."""
+
+    gen = _esc("" if generated_at is None else generated_at)
+    hidden = "".join(
+        f'<input type="hidden" name="target" value="{_esc(f"{r.rating_key}:{r.part_id}")}">'
+        for r in would
+    )
+    return (
+        '<form method="post" action="/actions/reclaim" class="reclaim">'
+        + hidden
+        + f'<input type="hidden" name="report_generated_at" value="{gen}">'
+        + '<div class="controls"><button type="submit">'
+        + f"Confirm delete of {len(would)} cop{'y' if len(would) == 1 else 'ies'}"
+        + "</button></div></form>"
+    )
+
+
+def render_reclaim_notice_html(title: str, message: str) -> str:
+    """A minimal action-layer notice page (a gate refusal or a stale-report warning
+    surfaced by the preview step), escaping the service-supplied ``message`` and
+    linking back to the report."""
+
+    body = (
+        f"<h1>{_esc(title)}</h1>"
+        f'<div class="warn">{_esc(message)}</div>'
+        '<p class="sub"><a href="/">&larr; Back to the report</a></p>'
+    )
+    return _page(title, body, footer_note=_ACTION_FOOTER)
 
 
 # --------------------------------------------------------------------------- #
@@ -1025,6 +1160,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/reclaim":
             self._handle_reclaim_json(service)
+        elif path == "/actions/preview":
+            self._handle_reclaim_preview(service)
         elif path == "/actions/reclaim":
             self._handle_reclaim_form(service)
         else:
@@ -1079,33 +1216,86 @@ class _Handler(BaseHTTPRequestHandler):
         )
         self._write_json(response.status_code, response.as_dict())
 
-    def _handle_reclaim_form(self, service: ReclaimService) -> None:
-        """``POST /actions/reclaim``: the no-JS browser form (form-encoded ``token``,
-        ``report_generated_at``, and repeated ``target=rating_key:part_id``). Renders
-        an HTML result page."""
+    def _handle_reclaim_preview(self, service: ReclaimService) -> None:
+        """``POST /actions/preview``: the confirmation step (#62). Validates the same
+        origin/token/freshness envelope as a reclaim but forces dry-run, so it renders
+        a would-delete/refused breakdown instead of deleting. On success it mints the
+        unlock session cookie (#68) so the confirm submit need not re-paste the token."""
 
         if not self._origin_ok(browser_path=True):
+            self._write_html(HTTPStatus.FORBIDDEN, self._cross_origin_page())
+            return
+        raw = self._read_body()
+        if raw is None:
+            return
+        token, generated_at, targets = _parse_form_reclaim(raw)
+        response = service.preview(
+            targets,
+            token=token,
+            report_generated_at=generated_at,
+            session=self._read_session_cookie(),
+        )
+        if response.status_code != HTTPStatus.OK:
+            # A gate refusal (bad/missing token → 403) or a stale report (409): show
+            # the service message, and never mint a session — the cookie is granted
+            # only to a request that actually authenticated.
+            title = "Reclaim refused" if response.status_code == 403 else "Report changed"
             self._write_html(
-                HTTPStatus.FORBIDDEN,
-                _page(
-                    "Reclaim refused",
-                    '<h1>Cross-origin request refused</h1>'
-                    '<p class="sub">This reclaim form must be submitted from the report '
-                    "page on this same server. If you reach the UI through a reverse "
-                    "proxy, set <code>WEB_ALLOWED_ORIGINS</code> to its external origin.</p>"
-                    '<p class="sub"><a href="/">&larr; Back to the report</a></p>',
-                    footer_note=_ACTION_FOOTER,
-                ),
+                response.status_code, render_reclaim_notice_html(title, response.message)
             )
+            return
+        # Authenticated + validated: refresh the unlock session so the confirm submit
+        # (and later reclaims within the window) need not re-paste the token.
+        self._write_html(
+            HTTPStatus.OK,
+            render_reclaim_confirm_html(response, generated_at),
+            set_cookie=self._session_cookie_header(service),
+        )
+
+    def _handle_reclaim_form(self, service: ReclaimService) -> None:
+        """``POST /actions/reclaim``: the destructive confirm submit (no-JS browser
+        form). Form-encoded ``report_generated_at`` + repeated ``target=rating_key:part_id``;
+        authorization is the unlock session cookie (#68) or, for backward compatibility,
+        a ``token`` field. Renders an HTML result page and refreshes the session."""
+
+        if not self._origin_ok(browser_path=True):
+            self._write_html(HTTPStatus.FORBIDDEN, self._cross_origin_page())
             return
         raw = self._read_body()
         if raw is None:
             return
         token, generated_at, targets = _parse_form_reclaim(raw)
         response = service.reclaim(
-            targets, token=token, report_generated_at=generated_at
+            targets,
+            token=token,
+            report_generated_at=generated_at,
+            session=self._read_session_cookie(),
         )
-        self._write_html(response.status_code, render_reclaim_result_html(response))
+        # Refresh the unlock session on a successful, authenticated reclaim so a
+        # follow-up reclaim in the same window stays paste-free; a gate refusal
+        # (403/409) grants nothing.
+        set_cookie = (
+            self._session_cookie_header(service)
+            if response.status_code == HTTPStatus.OK
+            else None
+        )
+        self._write_html(
+            response.status_code,
+            render_reclaim_result_html(response),
+            set_cookie=set_cookie,
+        )
+
+    @staticmethod
+    def _cross_origin_page() -> str:
+        return _page(
+            "Reclaim refused",
+            '<h1>Cross-origin request refused</h1>'
+            '<p class="sub">This reclaim form must be submitted from the report '
+            "page on this same server. If you reach the UI through a reverse "
+            "proxy, set <code>WEB_ALLOWED_ORIGINS</code> to its external origin.</p>"
+            '<p class="sub"><a href="/">&larr; Back to the report</a></p>',
+            footer_note=_ACTION_FOOTER,
+        )
 
     def _origin_ok(self, *, browser_path: bool) -> bool:
         """Apply the CSRF/origin policy (:func:`_request_origin_ok`) to this request,
@@ -1159,12 +1349,65 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _write_html(self, status: int, html: str) -> None:
+    def _write_html(self, status: int, html: str, *, set_cookie: Optional[str] = None) -> None:
         body = html.encode("utf-8")
         self.send_response(status)
         self._common_headers(len(body), "text/html; charset=utf-8")
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_session_cookie(self) -> Optional[str]:
+        """The unlock-session cookie value from the request, or ``None`` (no/blank/
+        malformed ``Cookie`` header). Parsing never raises: a hostile cookie header is
+        a missing session, refused by the service, not a crashed request thread."""
+
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+        except Exception:  # noqa: BLE001 — a malformed cookie is simply "no session"
+            return None
+        morsel = jar.get(_SESSION_COOKIE)
+        return morsel.value if morsel is not None else None
+
+    def _session_cookie_header(self, service: ReclaimService) -> Optional[str]:
+        """A ``Set-Cookie`` header carrying a freshly minted unlock session (#68), or
+        ``None`` when the service cannot mint one (no token configured). Always
+        ``HttpOnly`` + ``SameSite=Strict`` (so the browser never sends it cross-site,
+        which is what defends the destructive confirm POST against CSRF on the
+        loopback bind where the origin check is permissive); ``Secure`` is added only
+        when the request arrived over HTTPS, so the default plain-HTTP LAN deployment
+        does not set a ``Secure`` cookie the browser would drop."""
+
+        value = service.mint_session()
+        if value is None:
+            return None
+        attrs = [
+            f"{_SESSION_COOKIE}={value}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Strict",
+            f"Max-Age={service.session_max_age}",
+        ]
+        if self._request_is_https():
+            attrs.append("Secure")
+        return "; ".join(attrs)
+
+    def _request_is_https(self) -> bool:
+        """Whether this request demonstrably arrived over HTTPS, judged only from the
+        client ``Origin``/``Referer`` scheme (never a spoofable ``X-Forwarded-*``,
+        per #63/#67). The server itself terminates plain HTTP, so this is only true
+        behind a TLS proxy where the browser sends an ``https`` origin."""
+
+        for header in ("Origin", "Referer"):
+            value = self.headers.get(header)
+            if value and value.strip().lower().startswith("https://"):
+                return True
+        return False
 
     def _respond(self, status: HTTPStatus, content_type: str, length: int) -> None:
         self.send_response(status)
