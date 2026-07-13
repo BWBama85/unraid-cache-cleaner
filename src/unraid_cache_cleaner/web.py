@@ -1243,7 +1243,12 @@ class _Handler(BaseHTTPRequestHandler):
         )
         if ok:
             return True
-        LOGGER.warning(
+        # DEBUG, not WARNING: a rejected Host is an expected, per-request event once the
+        # defense is deployed (a scanner or rebind attempt), so a warning per request
+        # would flood the log and amplify a scan — matching the silent origin-refusal
+        # precedent. The 403 page itself tells a locked-out operator to set
+        # WEB_ALLOWED_HOSTS, so no diagnosis breadcrumb is lost.
+        LOGGER.debug(
             "web: refusing request with unrecognized Host %r; add it to "
             "WEB_ALLOWED_HOSTS if you reach the UI through a hostname/proxy",
             hosts,
