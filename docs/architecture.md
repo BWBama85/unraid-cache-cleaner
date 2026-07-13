@@ -111,7 +111,11 @@ subcommand (or a cron) already wrote, so it can never fan out to Plex. The one G
 that touches SQLite is the history view, a bounded, indexed, newest-first SELECT of
 the `web-reclaim:*` audit rows over a long-lived, query-only connection (opened once,
 reused, never creating or migrating the DB) so a page load is a pure SELECT that never
-checkpoints (`state.WebActionHistoryReader`). The
+checkpoints (`state.WebActionHistoryReader`). Those two history views are LAN-readable
+by default but can be opt-in gated behind the reclaim credential with
+`WEB_ACTION_HISTORY_AUTH=true` (#82) — the handler runs `ReclaimService.authorized`
+(token or unlock session) *before* the provider touches SQLite, and fails closed when no
+token/service is available (denied to everyone, with a startup warning). The
 rendering functions are pure over the report dict, and the report is supplied by
 an injectable provider (the default reads the file; tests inject a fake), so the
 server is unit-tested end-to-end on an ephemeral port without any network
@@ -146,8 +150,13 @@ cookie-less fallback that is no weaker (identical HMAC, only obtainable from an
 already-authenticated preview, and the confirm re-validates every target regardless).
 The session lifetime is `WEB_ACTION_SESSION_SECONDS` (#79, default one hour; a
 non-positive value falls back to that default), driving both the cookie `Max-Age` and
-the signed expiry. The JSON API stays token-only via `X-Action-Token` and never
-consults the cookie or the hidden field. Fail-closed on every
+the signed expiry. The session is deliberately *replay-until-expiry* rather than
+single-use (#83): it authorizes being unlocked for the window so follow-up reclaims stay
+paste-free — single-use would need new server-side nonce state and regress that UX, while
+a captured confirm is already bounded by `SameSite=Strict` + the origin check + the HMAC
+credential + the `generated_at` freshness match + per-target re-validation, so a replay
+can only delete a copy the fresh report still marks reclaimable. The JSON API stays
+token-only via `X-Action-Token` and never consults the cookie or the hidden field. Fail-closed on every
 axis: disabled + dry-run by default; a shared `WEB_ACTION_TOKEN` is required
 (enabling actions without one refuses every request); on top of the token a
 CSRF/origin check scales with the bind address — loopback stays permissive (the

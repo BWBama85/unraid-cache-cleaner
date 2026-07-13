@@ -472,6 +472,20 @@ class ReclaimService:
     def dry_run(self) -> bool:
         return bool(self._config.web_actions_dry_run)
 
+    def authorized(self, *, token: Optional[str], session: Optional[str]) -> bool:
+        """Whether a request presenting the shared ``token`` (``WEB_ACTION_TOKEN``) and/or
+        a signed unlock ``session`` is authenticated. Fails closed when no token is
+        configured — there is then nothing to authenticate against, so *every* request is
+        unauthorized rather than silently allowed. This is the single gate reused by both
+        a reclaim (:meth:`reclaim`) and the opt-in read-only history views (#82), so they
+        never drift apart. Both credential checks are constant-time (see :func:`_token_ok`
+        and :meth:`_session_valid`)."""
+
+        configured = self._config.web_action_token
+        if not configured:
+            return False
+        return _token_ok(token, configured) or self._session_valid(session)
+
     def reclaim(
         self,
         targets: Sequence[ReclaimTarget],
@@ -510,7 +524,7 @@ class ReclaimService:
                     "web actions are enabled but WEB_ACTION_TOKEN is not set; refusing to "
                     "expose an unauthenticated delete endpoint",
                 )
-            if not (_token_ok(token, configured) or self._session_valid(session)):
+            if not self.authorized(token=token, session=session):
                 return self._gate(403, "invalid or missing action token")
 
             # Resolve the effective dry-run once, after auth, so both the branch
@@ -573,6 +587,15 @@ class ReclaimService:
         )
 
     # -- browser unlock session (#68) ---------------------------------------- #
+    #
+    # #83 decision — the session is deliberately *replay-until-expiry*, not single-use:
+    # it authorizes "being unlocked" for the TTL, so follow-up reclaims stay paste-free
+    # (#68). Making it single-use (or binding it to one previewed target set) would need
+    # new server-side nonce state AND would regress that multi-reclaim UX, for near-nil
+    # gain: the confirm is already gated by SameSite=Strict + the origin check + the HMAC
+    # credential + a fresh generated_at match, and every target is re-validated against a
+    # freshly-loaded report (see reclaim()), so a replayed confirm can only ever delete a
+    # copy the current report still marks reclaimable — never the last copy. Kept as-is.
 
     @property
     def _session_ttl(self) -> int:

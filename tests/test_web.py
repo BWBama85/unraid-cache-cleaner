@@ -839,6 +839,7 @@ class RenderPureFunctionTests(unittest.TestCase):
             state_db_path = Path("/nonexistent/state.sqlite3")
             web_allowed_origins = ()
             web_allowed_hosts = ()
+            web_action_history_auth = False
 
         server = build_server(_Cfg())
         server.start_background()
