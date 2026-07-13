@@ -756,7 +756,11 @@ def _render_locked(
             '<div class="empty">Unlocking is unavailable: web actions are disabled or no '
             "<code>WEB_ACTION_TOKEN</code> is configured.</div>"
         )
-    return _page(title, "".join(body), footer_note=_ACTION_FOOTER)
+    # When the form can mint a session the action layer is genuinely enabled; when it
+    # cannot (the fail-closed lockout), the read-only footer states the truth rather
+    # than claiming an action layer that is disabled.
+    footer = _ACTION_FOOTER if can_unlock else _READONLY_FOOTER
+    return _page(title, "".join(body), footer_note=footer)
 
 
 def render_report_locked_html(*, can_unlock: bool = True, error: bool = False) -> str:
@@ -1698,6 +1702,10 @@ class _Handler(BaseHTTPRequestHandler):
         # too (#67) — an unknown-Host request to any verb is refused before a 405. A
         # request routed here from do_POST already passed the gate; the re-check is a
         # cheap no-op that writes nothing when the Host is fine.
+        #
+        # Clear any nonce a prior keep-alive GET on this reused handler set, so a 405
+        # (which carries no script) never echoes a stale per-response nonce in its CSP.
+        self._csp_nonce = None
         if not self._host_gate():
             return
         # Accurate whether actions are on or off: the reclaim POST routes are
