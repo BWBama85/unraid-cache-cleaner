@@ -59,6 +59,11 @@ _WEB_RECLAIM_LIKE = "web-reclaim:%"
 #: pull an unbounded audit table into memory regardless of the requested limit.
 _ACTION_HISTORY_MAX = 1000
 
+#: Cap on the per-path audit rows the reconciliation sweep loads for one sibling (#74).
+#: A single media path accrues at most a handful of reclaim/reconcile rows, so this
+#: bounds a pathological case without limiting any real trail.
+_RECONCILE_EVIDENCE_LIMIT = 50
+
 
 class WebActionHistoryReader:
     """A long-lived, read-only reader for the web-reclaim audit rows (#62).
@@ -221,6 +226,14 @@ class StateStore:
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS ix_actions_occurred_at ON actions(occurred_at)"
             )
+            # Secondary index on ``path`` for the startup staging-reconciliation sweep
+            # (#74): it looks up the recent ``web-reclaim:*`` rows for one media path to
+            # tell a committed-purge leftover (→ remove) from a crash-mid-move staging
+            # sibling (→ restore). Without it that per-path lookup scans the whole shared
+            # actions table; additive, so an existing store gains it on the next open.
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_actions_path ON actions(path)"
+            )
             # One row per archive that has been claimed/extracted. Replaces the
             # bash tool's flat processed_files.log: `status='claimed'` is an
             # in-flight claim (with a TTL so a crash can't wedge it), `'extracted'`
@@ -356,6 +369,29 @@ class StateStore:
                 "DELETE FROM candidates WHERE path = ?",
                 [(str(path),) for path in paths],
             )
+
+    def recent_web_reclaim_actions(
+        self, path: Path, *, limit: int = _RECONCILE_EVIDENCE_LIMIT
+    ) -> list[dict]:
+        """Return recent ``web-reclaim:*`` audit rows for ``path`` (newest first).
+
+        Read-only helper for the startup staging-reconciliation sweep (#74), which
+        consults the audit trail to disambiguate a missing-original staging sibling: a
+        *committed-purge* leftover (an earlier part's unlink already committed, so the
+        reclaim is irreversible) is **removed** to complete the delete, while a
+        crash-mid-move sibling (nothing committed) is **restored**. Bounded and indexed
+        (``ix_actions_path``) so the per-sibling lookup never scans the whole shared
+        ``actions`` table. Includes the sweep's own ``web-reclaim:reconcile`` rows (they
+        match ``web-reclaim:%``) so evidence a prior sweep already acted on is visible.
+        """
+
+        rows = self._connection.execute(
+            "SELECT path, action, status, size, message, occurred_at "
+            "FROM actions WHERE path = ? AND action LIKE ? "
+            "ORDER BY occurred_at DESC, id DESC LIMIT ?",
+            (str(path), _WEB_RECLAIM_LIKE, max(0, int(limit))),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_actions(self, actions: list[ActionRecord], now: float) -> None:
         """Persist action history."""

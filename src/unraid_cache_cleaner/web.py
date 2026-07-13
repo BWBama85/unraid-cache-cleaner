@@ -76,6 +76,14 @@ from .web_actions import (
     ReclaimService,
     ReclaimTarget,
 )
+from .web_rescan import (
+    RESCAN_ALREADY_RUNNING,
+    RESCAN_STARTED,
+    RESULT_FAILED,
+    RESULT_SKIPPED,
+    ReportRescanService,
+    RescanStatus,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -206,6 +214,7 @@ class DuplicateReportViewer:
         provider: ReportProvider,
         *,
         actions_enabled: bool = False,
+        rescan_enabled: bool = False,
         action_history: Optional[ActionHistoryProvider] = None,
     ) -> None:
         self._provider = provider
@@ -213,6 +222,9 @@ class DuplicateReportViewer:
         # field). Off for the plain read-only viewer, so the form and its relaxed
         # ``form-action`` CSP never appear unless an operator opted into actions.
         self._actions_enabled = actions_enabled
+        # When True the page renders the "Regenerate report" control (#77); set only
+        # when a rescan service is attached (actions on and Plex configured).
+        self._rescan_enabled = rescan_enabled
         # Optional read-only audit history (#62). When wired, ``/actions`` and
         # ``/api/actions`` surface the recent web-reclaim rows and the report page
         # links to them. ``None`` (the plain viewer) leaves those routes an empty,
@@ -239,6 +251,7 @@ class DuplicateReportViewer:
                 self._provider(),
                 actions_enabled=self._actions_enabled,
                 show_history_link=show_history,
+                show_rescan=self._rescan_enabled,
                 script_nonce=script_nonce,
             )
         except Exception:  # noqa: BLE001 — any structural corruption degrades gracefully
@@ -247,6 +260,7 @@ class DuplicateReportViewer:
                 None,
                 actions_enabled=self._actions_enabled,
                 show_history_link=show_history,
+                show_rescan=self._rescan_enabled,
                 script_nonce=script_nonce,
             )
 
@@ -347,11 +361,16 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: now
 .empty { background: #fff; border: 1px dashed #cfd4da; border-radius: 8px; padding: 1.5rem; color: #555; }
 .warn { background: #fff4e5; border: 1px solid #f0d9b0; border-radius: 8px; padding: .6rem .9rem; margin: .4rem 0; }
 .err { background: #fdecec; border: 1px solid #f0b3ae; border-radius: 8px; padding: .6rem .9rem; margin: .4rem 0; }
+.ok { background: #e7f5ec; border: 1px solid #b7dfc4; border-radius: 8px; padding: .6rem .9rem; margin: .4rem 0; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
 .controls { margin: 1rem 0; display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; }
 .controls input[type="password"] { padding: .3rem .4rem; }
 .controls button { padding: .4rem .9rem; border-radius: 6px; border: 1px solid #b3261e;
   background: #b3261e; color: #fff; font-weight: 600; cursor: pointer; }
+.rescan { margin: 1rem 0; display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+.rescan input[type="password"] { padding: .3rem .4rem; }
+.rescan button { padding: .4rem .9rem; border-radius: 6px; border: 1px solid #2c6fbb;
+  background: #2c6fbb; color: #fff; font-weight: 600; cursor: pointer; }
 footer { margin: 2rem 0 0; color: #888; font-size: .8rem; }
 @media (prefers-color-scheme: dark) {
   body { color: #e6e6e6; background: #14161a; }
@@ -360,6 +379,7 @@ footer { margin: 2rem 0 0; color: #888; font-size: .8rem; }
   th, td { border-color: #262b33; }
   .sub, .tile .l, .parts { color: #9aa1ab; }
   .copy:target { background: #3a3410; box-shadow: 0 0 0 2px #8a7a00; }
+  .ok { background: #12291b; border-color: #24503a; }
 }
 """
 
@@ -371,11 +391,18 @@ _ACTION_FOOTER = (
 )
 
 
-def _page(title: str, body: str, *, footer_note: str = _READONLY_FOOTER) -> str:
+def _page(
+    title: str, body: str, *, footer_note: str = _READONLY_FOOTER, head_extra: str = ""
+) -> str:
+    """Wrap ``body`` in the shared page shell. ``head_extra`` injects extra ``<head>``
+    markup (e.g. the rescan page's ``<meta http-equiv="refresh">``); callers pass only
+    trusted, self-authored strings — never user data."""
+
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"{head_extra}"
         f"<title>{_esc(title)}</title>"
         f"<style>{_STYLE}</style></head><body><main>{body}"
         f"<footer>unraid-cache-cleaner &middot; {footer_note}</footer>"
@@ -391,11 +418,31 @@ def _history_nav(show_history_link: bool) -> str:
     return '<p class="nav"><a href="/actions">View reclaim action history &rarr;</a></p>'
 
 
+def _rescan_control(show_rescan: bool) -> str:
+    """The "Regenerate report" control (#77): a no-JS form that POSTs to
+    ``/actions/rescan``. Rendered only when a rescan service is attached (actions on and
+    Plex configured). Authorization is the unlock session (already held once the operator
+    unlocked to reclaim) or the optional token field, so a locked browser can still start
+    a regeneration by pasting the token — mirroring the reclaim form."""
+
+    if not show_rescan:
+        return ""
+    return (
+        '<form class="rescan" method="post" action="/actions/rescan">'
+        '<button type="submit">Regenerate report</button>'
+        '<input type="password" name="token" autocomplete="off" '
+        'placeholder="action token (only if not unlocked)">'
+        '<span class="sub">Fans out to Plex; runs in the background.</span>'
+        "</form>"
+    )
+
+
 def render_report_html(
     payload: Optional[dict],
     *,
     actions_enabled: bool = False,
     show_history_link: bool = False,
+    show_rescan: bool = False,
     script_nonce: Optional[str] = None,
 ) -> str:
     """Render the report payload as a full HTML page (pure).
@@ -415,13 +462,15 @@ def render_report_html(
 
     footer = _ACTION_FOOTER if actions_enabled else _READONLY_FOOTER
     nav = _history_nav(show_history_link)
+    rescan = _rescan_control(show_rescan)
 
     if payload is None:
         body = (
             "<h1>Plex duplicate report</h1>"
             + nav
             + '<p class="sub">No report available yet.</p>'
-            '<div class="empty">Run <code>unraid-cache-cleaner plex-duplicates</code> '
+            + rescan
+            + '<div class="empty">Run <code>unraid-cache-cleaner plex-duplicates</code> '
             "(or wait for the scheduled scan) to generate a report, then reload this "
             "page. This viewer only displays an existing report — it never runs a "
             "scan itself.</div>"
@@ -432,7 +481,7 @@ def render_report_html(
     totals = payload.get("totals") or {}
     arr_enabled = bool(payload.get("arr_enabled"))
 
-    parts: List[str] = ["<h1>Plex duplicate report</h1>", nav]
+    parts: List[str] = ["<h1>Plex duplicate report</h1>", nav, rescan]
     parts.append(f'<p class="sub">{_render_meta(payload)}</p>')
     parts.append(_render_totals(totals, arr_enabled))
     parts.append(_render_messages(payload.get("warnings"), "warn"))
@@ -834,6 +883,71 @@ def render_reclaim_notice_html(title: str, message: str) -> str:
         '<p class="sub"><a href="/">&larr; Back to the report</a></p>'
     )
     return _page(title, body, footer_note=_ACTION_FOOTER)
+
+
+#: How often (seconds) the no-JS rescan status page auto-refreshes while a regeneration
+#: is running, so an operator sees it finish without clicking. Dropped once idle.
+_RESCAN_POLL_SECONDS = 4
+
+
+def render_rescan_unavailable_html() -> str:
+    """The page shown when a rescan is requested but no rescan service is attached —
+    actions are on but ``PLEX_URL``/``PLEX_TOKEN`` are not configured, so this process
+    cannot fan out to Plex to regenerate the report."""
+
+    body = (
+        "<h1>Report regeneration unavailable</h1>"
+        '<div class="warn">This server cannot regenerate the duplicate report: '
+        "set <code>PLEX_URL</code> and <code>PLEX_TOKEN</code> so it can query Plex.</div>"
+        '<p class="sub"><a href="/">&larr; Back to the report</a></p>'
+    )
+    return _page("Report regeneration unavailable", body, footer_note=_ACTION_FOOTER)
+
+
+def render_rescan_status_html(status: RescanStatus, *, triggered: Optional[str] = None) -> str:
+    """The rescan status page (#77): a pure in-memory view of the regeneration state.
+
+    While a run is in flight the page carries a ``<meta http-equiv="refresh">`` so a
+    no-JS browser polls itself until the scan finishes (no script, no fetch — the strict
+    CSP is untouched). ``triggered`` is the just-submitted :meth:`ReportRescanService.trigger`
+    outcome (``started``/``already-running``) when this page is the POST response, so the
+    operator sees whether their click launched a run or joined one already going."""
+
+    running = status.running
+    head_extra = (
+        f'<meta http-equiv="refresh" content="{_RESCAN_POLL_SECONDS}; url=/actions/rescan">'
+        if running
+        else ""
+    )
+    parts: List[str] = ["<h1>Report regeneration</h1>"]
+    if triggered == RESCAN_STARTED:
+        parts.append('<div class="ok">Started a report regeneration.</div>')
+    elif triggered == RESCAN_ALREADY_RUNNING:
+        parts.append('<div class="warn">A report regeneration was already in progress.</div>')
+
+    if running:
+        parts.append(
+            '<p class="sub">Regenerating the duplicate report&hellip; this fans out to '
+            "Plex and can take a minute or two. This page refreshes itself; leave it open "
+            "or come back to the report shortly.</p>"
+        )
+    else:
+        parts.append(_rescan_result_block(status))
+    parts.append('<p class="nav"><a href="/">&larr; Back to the report</a></p>')
+    return _page("Report regeneration", "".join(parts), footer_note=_ACTION_FOOTER, head_extra=head_extra)
+
+
+def _rescan_result_block(status: RescanStatus) -> str:
+    """The outcome block for a *finished* (or not-yet-run) regeneration."""
+
+    if status.last_status is None:
+        return '<p class="sub">No report regeneration has run yet in this session.</p>'
+    css = {RESULT_FAILED: "err", RESULT_SKIPPED: "warn"}.get(status.last_status, "ok")
+    when = f" ({_utc_stamp(status.finished_at)})" if status.finished_at else ""
+    return (
+        f'<div class="{css}">Last regeneration: {_esc(status.last_status)}{_esc(when)}<br>'
+        f"{_esc(status.last_message)}</div>"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1464,6 +1578,10 @@ class _Handler(BaseHTTPRequestHandler):
         return getattr(self.server, "reclaim_service", None)
 
     @property
+    def _rescan(self) -> Optional[ReportRescanService]:
+        return getattr(self.server, "rescan_service", None)
+
+    @property
     def _actions_enabled(self) -> bool:
         service = self._reclaim
         return bool(service is not None and service.enabled)
@@ -1651,6 +1769,12 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/actions":
                 body = json.dumps(self._viewer.actions_api(), sort_keys=True).encode("utf-8")
                 return HTTPStatus.OK, "application/json; charset=utf-8", body
+            if path in ("/actions/rescan", "/api/rescan"):
+                # Rescan status is a pure in-memory read — it NEVER touches Plex, so the
+                # "a GET never reaches Plex" guarantee holds. Present only when a rescan
+                # service is attached, and gated behind the reclaim credential so a locked
+                # deployment does not leak scan state / error messages.
+                return self._resolve_rescan_status(path)
             if path == "/healthz":
                 return HTTPStatus.OK, "text/plain; charset=utf-8", b"ok\n"
             return (
@@ -1665,6 +1789,41 @@ class _Handler(BaseHTTPRequestHandler):
                 "text/html; charset=utf-8",
                 _page("Error", "<h1>500</h1><p>The report could not be rendered.</p>").encode("utf-8"),
             )
+
+    def _resolve_rescan_status(self, path: str) -> tuple:
+        """Serve the rescan status (#77) for a GET of ``/actions/rescan`` (HTML) or
+        ``/api/rescan`` (JSON). A pure in-memory read: never touches Plex. Absent when no
+        rescan service is attached; otherwise gated behind the reclaim credential."""
+
+        rescan = self._rescan
+        if rescan is None:
+            if path == "/api/rescan":
+                body = json.dumps(
+                    {"message": "report regeneration is not available"}, sort_keys=True
+                ).encode("utf-8")
+                return HTTPStatus.NOT_FOUND, "application/json; charset=utf-8", body
+            return (
+                HTTPStatus.NOT_FOUND,
+                "text/html; charset=utf-8",
+                self._viewer.render_not_found().encode("utf-8"),
+            )
+        if not self._reclaim_credential_ok():
+            if path == "/api/rescan":
+                body = json.dumps(
+                    {"message": "report regeneration requires authentication"}, sort_keys=True
+                ).encode("utf-8")
+                return HTTPStatus.FORBIDDEN, "application/json; charset=utf-8", body
+            page = render_report_locked_html(can_unlock=self._can_unlock())
+            return HTTPStatus.FORBIDDEN, "text/html; charset=utf-8", page.encode("utf-8")
+        status = rescan.status()
+        if path == "/api/rescan":
+            body = json.dumps(status.as_dict(), sort_keys=True).encode("utf-8")
+            return HTTPStatus.OK, "application/json; charset=utf-8", body
+        return (
+            HTTPStatus.OK,
+            "text/html; charset=utf-8",
+            render_rescan_status_html(status).encode("utf-8"),
+        )
 
     #: The per-response CSP script nonce (#80). Defaults to ``None`` (scripts fully
     #: blocked); a GET/HEAD sets a fresh random value only when the inline-script
@@ -1725,6 +1884,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_reclaim_form(service)
         elif path == "/actions/unlock":
             self._handle_unlock(service)
+        elif path == "/api/rescan":
+            self._handle_rescan_json(service)
+        elif path == "/actions/rescan":
+            self._handle_rescan_form(service)
         else:
             self._method_not_allowed()
 
@@ -1902,6 +2065,81 @@ class _Handler(BaseHTTPRequestHandler):
             else render_report_locked_html(can_unlock=can_unlock, error=True)
         )
         self._write_html(HTTPStatus.FORBIDDEN, locked)
+
+    def _handle_rescan_json(self, service: ReclaimService) -> None:
+        """``POST /api/rescan``: trigger a report regeneration (JSON/scripted path).
+
+        Token via ``X-Action-Token`` header or a ``{"token": …}`` body. Returns ``202``
+        with the rescan status when a run was started, ``409`` when one is already in
+        flight, ``403`` for a bad token or cross-origin request, and ``503`` when this
+        server has no rescan service (Plex not configured). Never blocks on the scan."""
+
+        rescan = self._rescan
+        if rescan is None:
+            self._write_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"message": "report regeneration is not available (PLEX_URL/PLEX_TOKEN not set)"},
+            )
+            return
+        if not self._origin_ok(browser_path=False):
+            self._write_json(HTTPStatus.FORBIDDEN, {"message": "cross-origin request refused"})
+            return
+        raw = self._read_body()
+        if raw is None:  # a 413/400 was already written
+            return
+        try:
+            data = json.loads(raw or b"{}")
+        except (json.JSONDecodeError, ValueError):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"message": "request body is not valid JSON"})
+            return
+        if not isinstance(data, dict):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"message": "request body must be a JSON object"})
+            return
+        token = self.headers.get("X-Action-Token") or data.get("token")
+        if not service.authorized(
+            token=token if isinstance(token, str) else None,
+            session=self._read_session_cookie(),
+        ):
+            self._write_json(HTTPStatus.FORBIDDEN, {"message": "invalid or missing action token"})
+            return
+        outcome = rescan.trigger()
+        code = HTTPStatus.ACCEPTED if outcome == RESCAN_STARTED else HTTPStatus.CONFLICT
+        payload = {"status": outcome}
+        payload.update(rescan.status().as_dict())
+        self._write_json(code, payload)
+
+    def _handle_rescan_form(self, service: ReclaimService) -> None:
+        """``POST /actions/rescan``: trigger a regeneration from the no-JS report-page
+        button. Authorization is the unlock session cookie, the hidden/typed ``session``
+        or ``token`` field; the same browser envelope (Host already gated, plus the Origin
+        check + body-size cap) as a reclaim. Renders the status page (``202`` started /
+        ``409`` already-running) and refreshes the unlock session."""
+
+        rescan = self._rescan
+        if rescan is None:
+            self._write_html(HTTPStatus.SERVICE_UNAVAILABLE, render_rescan_unavailable_html())
+            return
+        if not self._origin_ok(browser_path=True):
+            self._write_html(HTTPStatus.FORBIDDEN, self._cross_origin_page())
+            return
+        raw = self._read_body()
+        if raw is None:
+            return
+        fields = dict(parse_qsl(raw.decode("utf-8", "replace"), keep_blank_values=True))
+        session = self._read_session_cookie() or fields.get("session")
+        if not service.authorized(token=fields.get("token"), session=session):
+            self._write_html(
+                HTTPStatus.FORBIDDEN,
+                render_report_locked_html(can_unlock=self._can_unlock(), error=True),
+            )
+            return
+        outcome = rescan.trigger()
+        code = HTTPStatus.ACCEPTED if outcome == RESCAN_STARTED else HTTPStatus.CONFLICT
+        self._write_html(
+            code,
+            render_rescan_status_html(rescan.status(), triggered=outcome),
+            set_cookie=self._session_cookie_header(service),
+        )
 
     @staticmethod
     def _cross_origin_page() -> str:
@@ -2092,6 +2330,7 @@ class DuplicateReportServer:
         viewer: DuplicateReportViewer,
         *,
         reclaim_service: Optional[ReclaimService] = None,
+        rescan_service: Optional[ReportRescanService] = None,
         require_browser_origin: bool = False,
         allowed_origins: Sequence[str] = (),
         allowed_hosts: Sequence[str] = (),
@@ -2105,6 +2344,10 @@ class DuplicateReportServer:
         # ``None`` (or a service whose actions are disabled) keeps the server a
         # read-only viewer — every POST is 405.
         self._httpd.reclaim_service = reclaim_service  # type: ignore[attr-defined]
+        # Optional report-regeneration service (#77). Attached only when actions are on
+        # and Plex is configured; ``None`` leaves the rescan routes 404/405 and the
+        # "Regenerate report" control off.
+        self._httpd.rescan_service = rescan_service  # type: ignore[attr-defined]
         # CSRF/origin policy (#63). ``require_browser_origin`` (set by ``build_server``
         # for a non-loopback bind) makes a browser reclaim form prove its origin;
         # ``allowed_origins`` is the normalized allow-list for a reverse-proxy setup.
@@ -2194,6 +2437,7 @@ def build_server(
     *,
     provider: Optional[ReportProvider] = None,
     reclaim_service: Optional[ReclaimService] = None,
+    rescan_service: Optional[ReportRescanService] = None,
     action_history: Optional[ActionHistoryProvider] = None,
 ) -> DuplicateReportServer:
     """Construct a viewer server from ``config`` (tests inject a fake provider).
@@ -2214,8 +2458,12 @@ def build_server(
     if action_history is None:
         action_history = _default_action_history(config)
     actions_enabled = reclaim_service is not None and reclaim_service.enabled
+    rescan_enabled = rescan_service is not None
     viewer = DuplicateReportViewer(
-        provider, actions_enabled=actions_enabled, action_history=action_history
+        provider,
+        actions_enabled=actions_enabled,
+        rescan_enabled=rescan_enabled,
+        action_history=action_history,
     )
     allowed_origins = _normalized_allowed_origins(config.web_allowed_origins)
     # Require a browser form to prove its origin on a non-loopback bind OR whenever an
@@ -2258,6 +2506,7 @@ def build_server(
         config.web_port,
         viewer,
         reclaim_service=reclaim_service,
+        rescan_service=rescan_service,
         require_browser_origin=require_browser_origin,
         allowed_origins=allowed_origins,
         allowed_hosts=allowed_hosts,

@@ -380,6 +380,55 @@ class ConcurrencyTests(unittest.TestCase):
             blocker.close()
 
 
+class RecentWebReclaimActionsTests(unittest.TestCase):
+    """``StateStore.recent_web_reclaim_actions`` — the per-path audit lookup backing the
+    #74 staging-reconciliation disambiguation."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = StateStore(Path(self._tmp.name) / "state.sqlite3")
+
+    def tearDown(self) -> None:
+        self.store._connection.close()
+        self._tmp.cleanup()
+
+    def test_filters_by_path_and_web_reclaim_action_newest_first(self) -> None:
+        self.store.record_actions(
+            [
+                ActionRecord(path=Path("/lib/a.mkv"), action="web-reclaim:filesystem", status="error", size=5, message="older"),
+            ],
+            100.0,
+        )
+        self.store.record_actions(
+            [
+                ActionRecord(path=Path("/lib/a.mkv"), action="web-reclaim:reconcile", status="removed", size=5, message="newer"),
+                ActionRecord(path=Path("/lib/other.mkv"), action="web-reclaim:filesystem", status="deleted", size=3, message="other-path"),
+                ActionRecord(path=Path("/lib/a.mkv"), action="delete", status="deleted", size=1, message="cleaner-not-web"),
+            ],
+            200.0,
+        )
+        rows = self.store.recent_web_reclaim_actions(Path("/lib/a.mkv"))
+        # Only web-reclaim:* rows for THIS path, newest first; the cleaner "delete" row
+        # and the other path are excluded.
+        self.assertEqual([r["message"] for r in rows], ["newer", "older"])
+        self.assertTrue(all(r["path"] == "/lib/a.mkv" for r in rows))
+        self.assertTrue(all(r["action"].startswith("web-reclaim:") for r in rows))
+
+    def test_missing_path_returns_empty(self) -> None:
+        self.assertEqual(self.store.recent_web_reclaim_actions(Path("/nope.mkv")), [])
+
+    def test_limit_is_bounded(self) -> None:
+        self.store.record_actions(
+            [
+                ActionRecord(path=Path("/lib/a.mkv"), action="web-reclaim:filesystem", status="deleted", size=i, message=str(i))
+                for i in range(5)
+            ],
+            100.0,
+        )
+        self.assertEqual(len(self.store.recent_web_reclaim_actions(Path("/lib/a.mkv"), limit=2)), 2)
+        self.assertEqual(len(self.store.recent_web_reclaim_actions(Path("/lib/a.mkv"), limit=0)), 0)
+
+
 class WebActionHistoryReaderTests(unittest.TestCase):
     """The read-only history reader backing ``/api/actions`` (#62)."""
 

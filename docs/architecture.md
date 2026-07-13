@@ -206,14 +206,45 @@ real delete (or partial failure) is persisted via `ActionRecord` in the SQLite
 
 The two-phase rollback is in-process only, so two residues can outlive it: a crash
 mid-move, and a post-commit purge failure (a later part left staged after an earlier
-unlink already committed — enumerated as explicit `left staged` audit rows rather
+unlink already committed — enumerated as explicit committed-leftover audit rows rather
 than left silent). `ReclaimService.reconcile_staging` reconciles both. It runs at web
 startup (under the reclaim lock, before the socket serves) over the mapped media
-roots: a sibling whose original is missing is **restored**, one whose original is
-present is **removed** (deferred under dry-run), and an ambiguous sibling — a symlink,
-or a name near `NAME_MAX` that can't be reconstructed un-truncated — is left in place
-and audited `skipped`. Its outcomes land in the same `actions` table under a distinct
-`web-reclaim:reconcile` action.
+roots: a sibling whose original is **present** is **removed** (deferred under dry-run),
+and an ambiguous sibling — a symlink, or a name near `NAME_MAX` that can't be
+reconstructed un-truncated — is left in place and audited `skipped`. A sibling whose
+original is **missing** is disambiguated by the `actions` audit trail (#74): both the
+crash-mid-move and the post-commit purge windows land as "original missing", so the
+filesystem alone can't tell them apart. The sweep looks up the recent `web-reclaim:*`
+rows for that path and **removes** the sibling only when the trail carries a distinct
+committed-leftover marker for that exact staging path (proving an earlier part already
+committed and the marker hasn't been consumed by a prior sweep) — completing the
+interrupted delete; otherwise it **restores** the file (crash-mid-move recovery). The
+marker is deliberately distinct from the zero-commit rollback-orphan message, so the
+"left staged" case where nothing was deleted and the staged file is the only surviving
+copy is always restored, never removed. Fail-closed: no lookup wired, no/ambiguous
+evidence, or a lookup failure all fall through to restore. The lookup is a bounded,
+`ix_actions_path`-indexed read; its outcomes land in the same `actions` table under a
+distinct `web-reclaim:reconcile` action.
+
+### `web_rescan.py` (report regeneration, opt-in)
+
+Regenerating *our* duplicate report from the browser (#77) — a POST-only, authorized
+exception to "a GET never reaches Plex". `web.py` routes `POST /api/rescan` (JSON) and
+the no-JS `POST /actions/rescan` (report-page button) through the same token/unlock gate
+and origin/`Host` hardening as a reclaim, then calls `ReportRescanService.trigger`, which
+hands the (minutes-long, Plex-fanning) work to a background daemon thread and returns
+immediately — the HTTP worker is never pinned. Single-flight is two-layered: an
+in-process lock/flag collapses concurrent clicks (a second trigger is `409`), and an
+advisory `flock` on a stable `<report>.rescan.lock` sidecar (`report_generation_lock`,
+reused by the `plex-duplicates` CLI so a manual run and a web rescan never both fan out)
+serializes across processes/containers — the loser records `skipped`. The injected
+`regenerate` reuses the reporter's generate→atomic-write sequence, so a failed
+generation leaves the previous report untouched (failure-retention); it builds its
+Plex/`*arr` clients per run, so no client exists until a rescan runs (preserving the
+credential-less viewer). The service holds no reclaim lock — a long scan never blocks a
+reclaim request thread. `GET /api/rescan` / `GET /actions/rescan` return the in-memory
+status (running / last outcome) and never touch Plex; the browser status page
+auto-refreshes while a run is in flight.
 
 ## Failure Model
 

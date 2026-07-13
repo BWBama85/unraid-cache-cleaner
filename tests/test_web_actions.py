@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.config import Config
+from unraid_cache_cleaner.web_rescan import ReportRescanService
 from unraid_cache_cleaner.web import (
     DuplicateReportServer,
     DuplicateReportViewer,
@@ -34,6 +36,7 @@ from unraid_cache_cleaner.web import (
     render_report_html,
 )
 from unraid_cache_cleaner.web_actions import (
+    _COMMITTED_LEFTOVER_MARKER,
     STAGING_SUFFIX,
     STATUS_DELETED,
     STATUS_REFUSED,
@@ -221,6 +224,7 @@ def _service(payload, **overrides):
         radarr=overrides.pop("radarr", None),
         sonarr=overrides.pop("sonarr", None),
         audit=overrides.pop("audit", None),
+        audit_lookup=overrides.pop("audit_lookup", None),
         clock=lambda: 123.0,
     )
 
@@ -690,7 +694,9 @@ class FilesystemTests(unittest.TestCase):
                     media_root / "movie" / "cd2.mkv",   # the same part, now flagged left-staged
                 ],
             )
-            self.assertIn("left staged", audit.records[2].message)
+            # #74: the post-commit leftover carries the distinct committed-reclaim marker
+            # (never the zero-commit rollback wording) so the sweep can safely remove it.
+            self.assertIn("committed-reclaim leftover", audit.records[2].message)
             self.assertIn(STAGING_SUFFIX, audit.records[2].message)
             self.assertEqual(len(audit.batches), 1)       # one flush batch
 
@@ -734,8 +740,8 @@ class FilesystemTests(unittest.TestCase):
                 [Path(r.path) for r in audit.records],
                 [cd1, cd2, cd2, cd3],
             )
-            self.assertIn("left staged", audit.records[2].message)
-            self.assertIn("left staged", audit.records[3].message)
+            self.assertIn("committed-reclaim leftover", audit.records[2].message)
+            self.assertIn("committed-reclaim leftover", audit.records[3].message)
             # Both leftovers are physically present at their staging siblings.
             self.assertTrue(cd2.with_name(cd2.name + STAGING_SUFFIX).exists())
             self.assertTrue(cd3.with_name(cd3.name + STAGING_SUFFIX).exists())
@@ -1050,6 +1056,190 @@ class StagingSweepTests(unittest.TestCase):
             self.assertEqual(audit.records, [])
 
 
+class StagingAuditDisambiguationTests(unittest.TestCase):
+    """#74: a *missing-original* staging sibling is disambiguated by the audit trail —
+    a committed-purge leftover is removed (completing the delete), a crash-mid-move
+    sibling is restored, and every ambiguous/absent-evidence case falls back to the
+    safe restore."""
+
+    def _service_for(self, tmp, *, rows=None, dry_run=False, deleter=os.unlink,
+                     mover=os.rename, lookup=None):
+        media_root = Path(tmp) / "media"
+        (media_root / "movie").mkdir(parents=True)
+        config = _config(
+            web_media_path_map=((Path("/plex"), media_root),),
+            web_actions_dry_run=dry_run,
+        )
+        audit = _FakeAudit()
+        if lookup is None and rows is not None:
+            lookup = lambda _path: list(rows)  # noqa: E731 — fixed rows regardless of path
+        service = _service(
+            _report([]), config=config, audit=audit, deleter=deleter, mover=mover,
+            audit_lookup=lookup,
+        )
+        return service, media_root, audit
+
+    @staticmethod
+    def _committed_row(staged: Path, *, occurred_at=100.0):
+        """A post-commit leftover audit row naming ``staged`` (the sweep may remove it)."""
+
+        return {
+            "path": str(staged.with_name(staged.name[: -len(STAGING_SUFFIX)])),
+            "action": "web-reclaim:filesystem",
+            "status": "error",
+            "size": 5,
+            "message": (
+                f"rating_key=900 part_id=2: purge aborted after an earlier part "
+                f"committed; is a {_COMMITTED_LEFTOVER_MARKER} {staged} (reconciled)"
+            ),
+            "occurred_at": occurred_at,
+        }
+
+    def test_committed_leftover_is_removed_when_original_missing(self) -> None:
+        # Post-commit purge: an earlier part already committed, so the audit trail flags
+        # this exact sibling as a committed leftover — the sweep completes the delete.
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd2.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            service, media_root, audit = self._service_for(
+                tmp, rows=[self._committed_row(staged)]
+            )
+            staged.write_bytes(b"stale")
+            report = service.reconcile_staging()
+            self.assertEqual(
+                (report.restored, report.removed, report.would_remove, report.skipped),
+                (0, 1, 0, 0),
+            )
+            self.assertFalse(staged.exists())        # removed, delete completed
+            self.assertFalse(original.exists())      # NOT resurrected
+            self.assertEqual([r.status for r in audit.records], ["removed"])
+            self.assertIn("committed-reclaim leftover", audit.records[0].message)
+            self.assertEqual(Path(audit.records[0].path), original)
+
+    def test_crash_mid_move_restored_when_no_evidence(self) -> None:
+        # No committed evidence in the trail: a crash between stage and unlink — restore.
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd1.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            service, media_root, audit = self._service_for(tmp, rows=[])
+            staged.write_bytes(b"recovered")
+            report = service.reconcile_staging()
+            self.assertEqual(
+                (report.restored, report.removed, report.would_remove, report.skipped),
+                (1, 0, 0, 0),
+            )
+            self.assertTrue(original.exists())
+            self.assertEqual(original.read_bytes(), b"recovered")
+            self.assertFalse(staged.exists())
+            self.assertEqual([r.status for r in audit.records], ["restored"])
+
+    def test_zero_commit_rollback_orphan_message_is_not_committed_evidence(self) -> None:
+        # THE critical safety case: a zero-commit rollback failure also writes a "left
+        # staged" error row — but nothing was deleted, so the staged file is the ONLY
+        # copy. Its message lacks the committed marker, so the sweep must RESTORE it, not
+        # remove it (removing would destroy the sole surviving copy).
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd1.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            rollback_row = {
+                "path": str(original),
+                "action": "web-reclaim:filesystem",
+                "status": "error",
+                "size": 5,
+                "message": (
+                    f"rating_key=900 part_id=2: could not restore original; "
+                    f"file left staged at {staged}"
+                ),
+                "occurred_at": 100.0,
+            }
+            service, media_root, audit = self._service_for(tmp, rows=[rollback_row])
+            staged.write_bytes(b"only-copy")
+            report = service.reconcile_staging()
+            self.assertEqual(report.restored, 1)
+            self.assertEqual(report.removed, 0)
+            self.assertTrue(original.exists())               # the only copy is preserved
+            self.assertEqual(original.read_bytes(), b"only-copy")
+            self.assertEqual([r.status for r in audit.records], ["restored"])
+
+    def test_evidence_consumed_by_prior_sweep_is_restored(self) -> None:
+        # Reused-path staleness: a committed-leftover row from an OLD reclaim was already
+        # acted on (a later reconcile "removed" row exists), so a sibling present now is a
+        # fresh crash-mid-move one — the spent evidence must not trigger a wrong removal.
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd2.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            consumed = {
+                "path": str(original),
+                "action": "web-reclaim:reconcile",
+                "status": "removed",
+                "size": 5,
+                "message": "removed committed-reclaim leftover; original already deleted",
+                "occurred_at": 200.0,  # AFTER the evidence at 100.0
+            }
+            service, media_root, audit = self._service_for(
+                tmp, rows=[self._committed_row(staged, occurred_at=100.0), consumed]
+            )
+            staged.write_bytes(b"fresh-crash")
+            report = service.reconcile_staging()
+            self.assertEqual(report.restored, 1)
+            self.assertEqual(report.removed, 0)
+            self.assertTrue(original.exists())
+            self.assertEqual(original.read_bytes(), b"fresh-crash")
+
+    def test_committed_leftover_deferred_under_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd2.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            service, media_root, audit = self._service_for(
+                tmp, rows=[self._committed_row(staged)], dry_run=True
+            )
+            staged.write_bytes(b"stale")
+            report = service.reconcile_staging()
+            self.assertEqual(report.would_remove, 1)
+            self.assertEqual(report.removed, 0)
+            self.assertTrue(staged.exists())          # removal deferred
+            self.assertEqual([r.status for r in audit.records], ["skipped"])
+            self.assertIn("dry-run", audit.records[0].message)
+
+    def test_committed_leftover_remove_failure_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd2.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            service, media_root, audit = self._service_for(
+                tmp, rows=[self._committed_row(staged)], deleter=_FakeDeleter(fail=True)
+            )
+            staged.write_bytes(b"stale")
+            report = service.reconcile_staging()
+            self.assertEqual((report.removed, report.skipped), (0, 1))
+            self.assertTrue(staged.exists())          # left in place for manual recovery
+            self.assertIn("could not remove committed leftover", audit.records[0].message)
+
+    def test_no_lookup_wired_falls_back_to_restore(self) -> None:
+        # Backward-compatible: without an audit_lookup the missing-original branch keeps
+        # the pre-#74 restore behavior.
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd1.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            service, media_root, audit = self._service_for(tmp, lookup=None)
+            staged.write_bytes(b"recovered")
+            report = service.reconcile_staging()
+            self.assertEqual(report.restored, 1)
+            self.assertTrue(original.exists())
+
+    def test_broken_lookup_degrades_to_restore(self) -> None:
+        def boom(_path):
+            raise RuntimeError("db locked")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "media" / "movie" / "cd1.mkv"
+            staged = original.with_name(original.name + STAGING_SUFFIX)
+            service, media_root, audit = self._service_for(tmp, lookup=boom)
+            staged.write_bytes(b"recovered")
+            report = service.reconcile_staging()
+            self.assertEqual(report.restored, 1)      # fail-closed toward the safe action
+            self.assertTrue(original.exists())
+
+
 # --------------------------------------------------------------------------- #
 # *arr backend                                                                 #
 # --------------------------------------------------------------------------- #
@@ -1306,13 +1496,19 @@ class ActionIndexTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 @contextmanager
-def _serve(payload, service, *, require_browser_origin=False, allowed_origins=()):
-    viewer = DuplicateReportViewer(lambda: payload, actions_enabled=service.enabled)
+def _serve(payload, service, *, require_browser_origin=False, allowed_origins=(),
+           rescan_service=None):
+    viewer = DuplicateReportViewer(
+        lambda: payload,
+        actions_enabled=service.enabled,
+        rescan_enabled=rescan_service is not None,
+    )
     server = DuplicateReportServer(
         "127.0.0.1",
         0,
         viewer,
         reclaim_service=service,
+        rescan_service=rescan_service,
         require_browser_origin=require_browser_origin,
         allowed_origins=allowed_origins,
     )
@@ -2704,6 +2900,152 @@ class AnchorRoundTripTests(unittest.TestCase):
             r'href="(/#copy-[^"]+)"', render_reclaim_result_html(resp)
         ).group(1)
         self.assertEqual(urlsplit(href).fragment, anchor_id)
+
+
+# --------------------------------------------------------------------------- #
+# Rescan HTTP endpoints (#77)                                                  #
+# --------------------------------------------------------------------------- #
+
+class RescanHttpTests(unittest.TestCase):
+    """The rescan trigger + status routes, driven over real HTTP with the same token/
+    unlock gate as reclaim, and its no-JS report-page control."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.lock_path = Path(self._tmp.name) / "report.json.rescan.lock"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _rescan(self, regenerate=lambda: None, spawn=lambda t: t()):
+        return ReportRescanService(regenerate, self.lock_path, spawn=spawn)
+
+    def test_json_missing_token_is_403(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        ran = []
+        with _serve(payload, service, rescan_service=self._rescan(lambda: ran.append("x"))) as base:
+            status, _ = _post(base + "/api/rescan", b"{}", {"Content-Type": "application/json"})
+        self.assertEqual(status, 403)
+        self.assertEqual(ran, [])  # never regenerated without a token
+
+    def test_json_authorized_triggers_and_returns_202(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        ran = []
+        with _serve(payload, service, rescan_service=self._rescan(lambda: ran.append("x"))) as base:
+            status, raw = _post(
+                base + "/api/rescan", b"{}",
+                {"Content-Type": "application/json", "X-Action-Token": "tok"},
+            )
+        self.assertEqual(status, 202)
+        data = json.loads(raw)
+        self.assertEqual(data["status"], "started")
+        self.assertEqual(data["last_status"], "succeeded")  # _SYNC spawn ran it inline
+        self.assertEqual(ran, ["x"])
+
+    def test_json_cross_origin_is_403(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        with _serve(payload, service, rescan_service=self._rescan()) as base:
+            status, _ = _post(
+                base + "/api/rescan", b"{}",
+                {"Content-Type": "application/json", "X-Action-Token": "tok",
+                 "Origin": "http://evil.example"},
+            )
+        self.assertEqual(status, 403)
+
+    def test_json_single_flight_second_is_409(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        release = threading.Event()
+        started = threading.Event()
+        threads = []
+
+        def regen():
+            started.set()
+            release.wait(5)
+
+        rescan = self._rescan(
+            regen,
+            spawn=lambda t: threads.append(threading.Thread(target=t, daemon=True)) or threads[-1].start(),
+        )
+        hdr = {"Content-Type": "application/json", "X-Action-Token": "tok"}
+        with _serve(payload, service, rescan_service=rescan) as base:
+            first, _ = _post(base + "/api/rescan", b"{}", hdr)
+            self.assertTrue(started.wait(2))
+            second, raw = _post(base + "/api/rescan", b"{}", hdr)
+            release.set()
+        self.assertEqual(first, 202)
+        self.assertEqual(second, 409)  # already-running, not a 2nd fan-out
+        self.assertEqual(json.loads(raw)["status"], "already-running")
+        threads[0].join(5)
+
+    def test_json_unavailable_when_no_rescan_service_is_503(self) -> None:
+        # Actions on but no rescan service attached (Plex not configured here).
+        payload = _untracked_payload()
+        service = _service(payload)
+        with _serve(payload, service, rescan_service=None) as base:
+            status, _ = _post(
+                base + "/api/rescan", b"{}",
+                {"Content-Type": "application/json", "X-Action-Token": "tok"},
+            )
+        self.assertEqual(status, 503)
+
+    def test_get_status_requires_auth_then_returns_json(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        with _serve(payload, service, rescan_service=self._rescan()) as base:
+            unauth, _ = _post(base + "/api/rescan", None, {}, method="GET")
+            ok, raw = _post(base + "/api/rescan", None, {"X-Action-Token": "tok"}, method="GET")
+        self.assertEqual(unauth, 403)
+        self.assertEqual(ok, 200)
+        self.assertIn("running", json.loads(raw))
+
+    def test_get_status_never_calls_plex(self) -> None:
+        # The status GET is a pure in-memory read: the regenerate must never be invoked.
+        payload = _untracked_payload()
+        service = _service(payload)
+        ran = []
+        with _serve(payload, service, rescan_service=self._rescan(lambda: ran.append("x"))) as base:
+            _post(base + "/api/rescan", None, {"X-Action-Token": "tok"}, method="GET")
+            _post(base + "/actions/rescan", None, {"X-Action-Token": "tok"}, method="GET")
+        self.assertEqual(ran, [])
+
+    def test_form_authorized_triggers_and_renders_status(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        with _serve(payload, service, rescan_service=self._rescan()) as base:
+            status, body = _post(
+                base + "/actions/rescan", _form(token="tok"), _FORM_CT
+            )
+        self.assertEqual(status, 202)
+        self.assertIn(b"Report regeneration", body)
+        self.assertIn(b"Started", body)
+
+    def test_form_unauthorized_is_403_locked(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        ran = []
+        with _serve(payload, service, rescan_service=self._rescan(lambda: ran.append("x"))) as base:
+            status, _ = _post(base + "/actions/rescan", _form(token="wrong"), _FORM_CT)
+        self.assertEqual(status, 403)
+        self.assertEqual(ran, [])
+
+    def test_report_page_shows_regenerate_button_when_rescan_enabled(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        with _serve(payload, service, rescan_service=self._rescan()) as base:
+            _, body = _post(base + "/", None, {}, method="GET")
+        self.assertIn(b'action="/actions/rescan"', body)
+        self.assertIn(b"Regenerate report", body)
+
+    def test_report_page_hides_button_without_rescan(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        with _serve(payload, service, rescan_service=None) as base:
+            _, body = _post(base + "/", None, {}, method="GET")
+        self.assertNotIn(b'action="/actions/rescan"', body)
 
 
 if __name__ == "__main__":

@@ -266,6 +266,10 @@ Open `http://<host>:8080/`. Routes:
 | `/api/reclaim` | POST | Reclaim endpoint (JSON) — only when actions are enabled; `405` otherwise |
 | `/actions/preview` | POST | Browser confirmation step — previews what a reclaim would delete (only when actions are enabled) |
 | `/actions/reclaim` | POST | Browser-form reclaim (the confirm submit) — only when actions are enabled |
+| `/actions/rescan` | POST | [Regenerate the report](#regenerating-the-report-from-the-browser) from the browser (authorized, single-flight, non-blocking) |
+| `/actions/rescan` | GET | Rescan status page (auto-refreshes while a regeneration runs) — auth-gated, never touches Plex |
+| `/api/rescan` | POST | Trigger a regeneration (JSON) — `202` started / `409` already running / `403` bad token |
+| `/api/rescan` | GET | `{"running": bool, "last_status": …, …}` rescan status (auth-gated; in-memory only) |
 
 - **Read-only by default, fail-closed.** Until `WEB_ENABLE_ACTIONS=true` no
   mutation endpoint exists and every non-`GET` verb returns `405`. All
@@ -359,11 +363,14 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
   container crash mid-move, or the near-impossible post-commit purge failure, can
   strand a `*.uncc-reclaim` sibling. On every web start (when actions are enabled and
   `WEB_MEDIA_PATH_MAP` is set) the server sweeps the mapped media roots and reconciles
-  each leftover: it **restores** the file if its original is missing (recovering
-  crash-stranded media) and **removes** it if the original is already back (a
-  completed delete's residue — skipped under `WEB_ACTIONS_DRY_RUN`). Anything
-  ambiguous (a symlink, or a name too long to reconstruct) is left in place and
-  logged. These show up in the action history as `web-reclaim:reconcile` rows.
+  each leftover: it **removes** it if the original is already back (a completed
+  delete's residue — skipped under `WEB_ACTIONS_DRY_RUN`), and if the original is
+  *missing* it consults the `actions` audit trail — **removing** the sibling when the
+  trail shows the enclosing reclaim already committed (a post-commit leftover, so the
+  delete is completed) and otherwise **restoring** it (recovering genuinely
+  crash-stranded media). Anything ambiguous (a symlink, or a name too long to
+  reconstruct) is left in place and logged. These show up in the action history as
+  `web-reclaim:reconcile` rows.
 - **Audited.** Every real delete (and any partial failure) is written to the
   SQLite state store's `actions` table, so you can answer "what did the GUI delete".
 
@@ -376,6 +383,40 @@ curl -X POST http://<host>:8080/api/reclaim \
 
 Because it deletes media, keep it bound to a trusted LAN, keep a token set, and
 prefer routing tracked copies through Radarr/Sonarr over raw filesystem deletes.
+
+#### Regenerating the report from the browser
+
+The viewer never fans out to Plex on a page load — it only reads the on-disk snapshot
+that the `plex-duplicates` subcommand (or a cron) wrote. When actions are enabled **and**
+this process has Plex credentials (`PLEX_URL` + `PLEX_TOKEN`), a **Regenerate report**
+button appears on the report page so you can refresh the snapshot without waiting for the
+next scheduled scan:
+
+- **Authorized like a reclaim.** The trigger needs the same credential — the unlock
+  session you already hold after unlocking to reclaim, or `WEB_ACTION_TOKEN` (the
+  `X-Action-Token` header for `POST /api/rescan`). It reuses the same origin/`Host`
+  hardening. A regeneration reads Plex but **deletes nothing**.
+- **Non-blocking.** Report generation fans out to Plex/`*arr` and can take a minute or
+  two, so the trigger returns immediately (`202`) and the work runs in the background —
+  no HTTP worker is pinned. The browser lands on a status page that auto-refreshes until
+  it finishes; scripts can poll `GET /api/rescan` (a pure in-memory read — it never
+  touches Plex). `GET` routes therefore still never reach Plex.
+- **Single-flight.** Concurrent clicks collapse to one run (a second trigger returns
+  `409` "already running"), and an advisory lock on a `<report>.rescan.lock` sidecar
+  keeps a browser rescan and an overlapping cron `plex-duplicates` run from both fanning
+  out — the loser skips. A manual `plex-duplicates` run whose lock is held logs and
+  exits `0` rather than duplicating the scan.
+- **Failure-retention.** The report is published atomically (temp file + `os.replace`)
+  only after a successful generation, so a failed regeneration leaves the previous
+  report exactly in place — never an empty or half-written snapshot. The status page
+  shows the last outcome (`succeeded` / `failed` / `skipped`).
+
+```bash
+# Trigger a regeneration via the JSON API (returns 202 "started" or 409 "already running"):
+curl -X POST http://<host>:8080/api/rescan -H "X-Action-Token: $WEB_ACTION_TOKEN"
+# Poll status (in-memory; never hits Plex):
+curl http://<host>:8080/api/rescan -H "X-Action-Token: $WEB_ACTION_TOKEN"
+```
 
 #### Action history
 
