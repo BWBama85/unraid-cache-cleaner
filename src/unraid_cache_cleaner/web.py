@@ -1861,10 +1861,14 @@ class _Handler(BaseHTTPRequestHandler):
         if service.authorized(token=fields.get("token"), session=self._read_session_cookie()):
             self._redirect(next_path, set_cookie=self._session_cookie_header(service))
             return
+        # Re-render with the same can_unlock verdict the GET path uses, so a token-less
+        # deployment (report auth on, actions on, no WEB_ACTION_TOKEN) keeps showing the
+        # honest "unlocking unavailable" state instead of a form that can never succeed.
+        can_unlock = self._can_unlock()
         locked = (
-            render_history_locked_html(can_unlock=True, error=True)
+            render_history_locked_html(can_unlock=can_unlock, error=True)
             if next_path == "/actions"
-            else render_report_locked_html(can_unlock=True, error=True)
+            else render_report_locked_html(can_unlock=can_unlock, error=True)
         )
         self._write_html(HTTPStatus.FORBIDDEN, locked)
 

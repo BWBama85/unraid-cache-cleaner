@@ -2491,6 +2491,18 @@ class UnlockEndpointTests(unittest.TestCase):
             )
             self.assertEqual(headers2.get("Location"), "/actions")
 
+    def test_failed_unlock_reflects_unavailable_when_no_token(self) -> None:
+        # Report auth on + actions on but no WEB_ACTION_TOKEN: a failed unlock POST must
+        # render the honest "unlocking unavailable" state, not a form that can never work
+        # (parity with the GET 403 page).
+        with _serve_report(token="") as (base, _, _):
+            status, _, body = _post_resp(
+                base + "/actions/unlock", _form(next="/", token="anything"), _FORM_CT
+            )
+        self.assertEqual(status, 403)
+        self.assertIn(b"Unlocking is unavailable", body)
+        self.assertNotIn(b'action="/actions/unlock"', body)  # no dead form
+
     def test_unlock_is_405_when_actions_disabled(self) -> None:
         with _serve_report(report_auth=False, attach_service=False) as (base, _, _):
             status, _ = _post(base + "/actions/unlock", _form(next="/", token="tok"), _FORM_CT)
