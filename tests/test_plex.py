@@ -292,6 +292,99 @@ class NonObjectBodyTests(unittest.TestCase):
 
         self.assertIn("non-object JSON body from /library/sections", str(ctx.exception))
 
+    def test_fetch_sections_non_dict_media_container_raises(self) -> None:
+        # #57: a well-formed object whose MediaContainer *value* is not a dict
+        # ({"MediaContainer": []} / null, from a misbehaving proxy) passes the
+        # top-level guard but must still surface as PlexClientError naming the
+        # endpoint — not a bare AttributeError on container.get("Directory").
+        for bad in ([], None):
+            opener = _RecordingOpener(
+                lambda req, b=bad: json.dumps({"MediaContainer": b}).encode("utf-8")
+            )
+            client = _client(opener)
+            with self.assertRaises(PlexClientError) as ctx:
+                client.fetch_sections()
+            self.assertIn(
+                "non-object MediaContainer from /library/sections", str(ctx.exception)
+            )
+
+    def test_fetch_duplicates_non_dict_media_container_raises(self) -> None:
+        # #57: same nested-shape guard on the paged section endpoint; the message
+        # names the section endpoint so the failure is diagnosable.
+        for bad in ([], None):
+            opener = _RecordingOpener(
+                lambda req, b=bad: json.dumps({"MediaContainer": b}).encode("utf-8")
+            )
+            client = _client(opener)
+            with self.assertRaises(PlexClientError) as ctx:
+                client.fetch_duplicates("1", 1)
+            self.assertIn(
+                "non-object MediaContainer from /library/sections/1/all",
+                str(ctx.exception),
+            )
+
+    def test_fetch_sections_non_list_directory_raises(self) -> None:
+        # #57 (by extension): a non-list Directory would make the `for` iterate a
+        # dict's keys (or fail on a scalar); surface it as PlexClientError instead.
+        opener = _RecordingOpener(
+            lambda req: json.dumps(
+                {"MediaContainer": {"Directory": {"key": "1"}}}
+            ).encode("utf-8")
+        )
+        client = _client(opener)
+        with self.assertRaises(PlexClientError) as ctx:
+            client.fetch_sections()
+        self.assertIn("non-list Directory from /library/sections", str(ctx.exception))
+
+    def test_fetch_duplicates_non_list_metadata_raises(self) -> None:
+        opener = _RecordingOpener(
+            lambda req: json.dumps(
+                {"MediaContainer": {"Metadata": {"ratingKey": "1"}}}
+            ).encode("utf-8")
+        )
+        client = _client(opener)
+        with self.assertRaises(PlexClientError) as ctx:
+            client.fetch_duplicates("1", 1)
+        self.assertIn(
+            "non-list Metadata from /library/sections/1/all", str(ctx.exception)
+        )
+
+    def test_fetch_sections_skips_non_dict_directory_items(self) -> None:
+        # A stray non-dict Directory element is dropped, not crashed on.
+        body = json.dumps(
+            {
+                "MediaContainer": {
+                    "Directory": [
+                        {"key": "1", "type": "movie", "title": "Movies"},
+                        "garbage",
+                    ]
+                }
+            }
+        ).encode("utf-8")
+        opener = _RecordingOpener(lambda req: body)
+        client = _client(opener)
+        sections = client.fetch_sections()
+        self.assertEqual([s.key for s in sections], ["1"])
+
+    def test_fetch_duplicates_skips_non_dict_metadata_items(self) -> None:
+        # A stray non-dict Metadata item is dropped so it never reaches
+        # build_duplicate_group as a bare AttributeError.
+        body = json.dumps(
+            {"MediaContainer": {"totalSize": 2, "Metadata": [{"ratingKey": "1"}, "garbage"]}}
+        ).encode("utf-8")
+        opener = _RecordingOpener(lambda req: body)
+        client = _client(opener)
+        items = client.fetch_duplicates("1", 1)
+        self.assertEqual(items, [{"ratingKey": "1"}])
+
+    def test_missing_media_container_is_empty_not_error(self) -> None:
+        # An object body without a MediaContainer key stays "no items"
+        # (unchanged from before #57), never an error.
+        opener = _RecordingOpener(lambda req: json.dumps({}).encode("utf-8"))
+        self.assertEqual(_client(opener).fetch_sections(), [])
+        opener2 = _RecordingOpener(lambda req: json.dumps({}).encode("utf-8"))
+        self.assertEqual(_client(opener2).fetch_duplicates("1", 1), [])
+
 
 if __name__ == "__main__":
     unittest.main()
