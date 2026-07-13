@@ -491,7 +491,11 @@ def render_reclaim_result_html(response: ReclaimResponse) -> str:
 # --------------------------------------------------------------------------- #
 
 def render_reclaim_confirm_html(
-    response: ReclaimResponse, generated_at: object, *, dry_run: bool
+    response: ReclaimResponse,
+    generated_at: object,
+    *,
+    dry_run: bool,
+    session_token: Optional[str] = None,
 ) -> str:
     """Render the interstitial confirmation page for a preview (#62).
 
@@ -508,7 +512,12 @@ def render_reclaim_confirm_html(
     preview always forces to ``True``). The two diverge whenever live mode is
     configured, so the page's "removes nothing" / "permanently deletes" wording must
     track ``dry_run`` or it would tell an operator in live mode that Confirm is
-    harmless."""
+    harmless.
+
+    ``session_token`` (#79) is the minted unlock credential embedded as a hidden field so
+    the confirm authorizes without a cookie (the browser may have dropped it). It carries
+    no secret — it is the same HMAC value as the unlock cookie — so putting it in the page
+    is safe; ``None`` simply omits the field (cookie-only, as before)."""
 
     would = [r for r in response.results if r.status == STATUS_WOULD_DELETE]
     refused = [r for r in response.results if r.status != STATUS_WOULD_DELETE]
@@ -542,7 +551,7 @@ def render_reclaim_confirm_html(
             )
         body.append(f'<p class="sub">{lead}</p>')
         body.append(_confirm_targets_table(would))
-        body.append(_confirm_form(would, generated_at))
+        body.append(_confirm_form(would, generated_at, session_token))
     else:
         body.append(
             '<div class="empty">Nothing selected would be deleted &mdash; every '
@@ -577,20 +586,28 @@ def _confirm_targets_table(results: Sequence) -> str:
     )
 
 
-def _confirm_form(would: Sequence, generated_at: object) -> str:
+def _confirm_form(would: Sequence, generated_at: object, session_token: Optional[str] = None) -> str:
     """The Confirm form: hidden ``target`` fields for the would-delete copies plus the
-    freshness token, POSTing to the destructive ``/actions/reclaim``. Carries no token
-    field — authorization rides on the unlock session cookie (#68)."""
+    freshness token, POSTing to the destructive ``/actions/reclaim``. Carries no raw
+    token field — authorization rides on the unlock session cookie (#68) or, when
+    ``session_token`` is supplied, a hidden ``session`` field (the #79 cookie-less
+    fallback) holding that same signed, secret-free value."""
 
     gen = _esc("" if generated_at is None else generated_at)
     hidden = "".join(
         f'<input type="hidden" name="target" value="{_esc(f"{r.rating_key}:{r.part_id}")}">'
         for r in would
     )
+    session_field = (
+        f'<input type="hidden" name="session" value="{_esc(session_token)}">'
+        if session_token
+        else ""
+    )
     return (
         '<form method="post" action="/actions/reclaim" class="reclaim">'
         + hidden
         + f'<input type="hidden" name="report_generated_at" value="{gen}">'
+        + session_field
         + '<div class="controls"><button type="submit">'
         + f"Confirm delete of {len(would)} cop{'y' if len(would) == 1 else 'ies'}"
         + "</button></div></form>"
@@ -954,23 +971,30 @@ def _parse_targets_json(raw: object) -> List[ReclaimTarget]:
 
 
 def _parse_form_reclaim(raw: bytes) -> tuple:
-    """Parse a form-encoded reclaim body into ``(token, report_generated_at,
-    targets)``. Each ``target`` field is ``rating_key:part_id`` (split on the last
-    ``:`` so a rating_key containing a colon still parses)."""
+    """Parse a form-encoded reclaim body into ``(token, report_generated_at, targets,
+    session)``. Each ``target`` field is ``rating_key:part_id`` (split on the last
+    ``:`` so a rating_key containing a colon still parses). ``session`` is the #79
+    hidden confirm-form credential (a minted unlock token, never the raw secret) — the
+    cookie-less fallback that authorizes the confirm when the browser drops cookies;
+    it is a *distinct* field from ``token`` (the raw shared secret) so the two are
+    never conflated."""
 
     token: Optional[str] = None
     generated_at: Optional[str] = None
+    session: Optional[str] = None
     targets: List[ReclaimTarget] = []
     for key, value in parse_qsl(raw.decode("utf-8", "replace"), keep_blank_values=True):
         if key == "token":
             token = value
         elif key == "report_generated_at":
             generated_at = value
+        elif key == "session":
+            session = value
         elif key == "target":
             rating_key, sep, part_id = value.rpartition(":")
             if sep:
                 targets.append(ReclaimTarget(rating_key, _as_int(part_id)))
-    return token, generated_at, targets
+    return token, generated_at, targets, session
 
 
 # --------------------------------------------------------------------------- #
@@ -1074,6 +1098,96 @@ def _request_origin_ok(
 
 
 # --------------------------------------------------------------------------- #
+# Host-header / DNS-rebinding policy (#67) — pure, applied before routing       #
+# --------------------------------------------------------------------------- #
+
+def _host_only(value: str) -> Optional[str]:
+    """The host portion of a ``Host`` header value (``host``/``host:port``/
+    ``[ipv6]``/``[ipv6]:port``), dropping any port. ``None`` for a malformed value
+    (an unclosed IPv6 bracket) so the caller fails closed. A bare unbracketed IPv6
+    literal (multiple colons, no brackets) is passed through whole for
+    :func:`ipaddress.ip_address` to judge."""
+
+    v = value.strip()
+    if v.startswith("["):
+        end = v.find("]")
+        if end == -1:
+            return None
+        return v[1:end]
+    if v.count(":") == 1:  # host:port (a bare IPv6 has >1 colon and is left intact)
+        return v.split(":", 1)[0]
+    return v
+
+
+def _host_allowed(host_value: Optional[str], allowed_hosts: Sequence[str]) -> bool:
+    """Whether a request's ``Host`` may be served — the DNS-rebinding defense (#67).
+
+    Rebinding is a *browser* attack: the victim's browser always sends the attacker's
+    rebound **hostname** as ``Host``. So the policy accepts only what an attacker
+    cannot forge into a victim browser targeting this server:
+
+    * a missing/blank ``Host`` — a non-browser client (``curl``, an HTTP/1.0 health
+      probe); never a rebinding vector, so it is allowed (the token still gates any
+      mutation);
+    * an **IP-literal** host (v4/v6) — an IP is reached directly with no DNS lookup, so
+      it cannot be rebound; this is what keeps direct LAN-by-IP access config-free;
+    * ``localhost`` — resolves to loopback, not attacker-controllable;
+    * a hostname in ``allowed_hosts`` (from ``WEB_ALLOWED_HOSTS`` and the hostnames of
+      ``WEB_ALLOWED_ORIGINS``), pre-normalized to lowercase, dot-stripped, port-free.
+
+    Any other hostname — including one whose ``Origin`` matches it (the classic rebind,
+    where ``Origin`` and ``Host`` are the same forged name) — is refused. A malformed
+    or empty parsed host fails closed."""
+
+    if host_value is None:
+        return True
+    raw = host_value.strip()
+    if raw == "":
+        return True
+    hostname = _host_only(raw)
+    if hostname is None:
+        return False
+    hostname = hostname.strip().rstrip(".").lower()
+    if hostname == "":
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    if hostname == "localhost":
+        return True
+    return hostname in allowed_hosts
+
+
+def _effective_allowed_hosts(
+    raw_hosts: Sequence[str], allowed_origins: Sequence[str]
+) -> tuple:
+    """The normalized hostname allow-list the Host gate compares against: every
+    ``WEB_ALLOWED_HOSTS`` entry (port stripped) plus the hostname of each already-
+    normalized ``WEB_ALLOWED_ORIGINS`` entry — so a reverse-proxy operator who already
+    set ``WEB_ALLOWED_ORIGINS`` (per #63) is not locked out by the new Host check.
+    Lowercased, trailing-dot-stripped, de-duplicated; IP literals and ``localhost`` are
+    omitted (always accepted by :func:`_host_allowed`)."""
+
+    hosts: List[str] = []
+
+    def _add(name: Optional[str]) -> None:
+        if not name:
+            return
+        normalized = name.strip().rstrip(".").lower()
+        if normalized and normalized not in hosts:
+            hosts.append(normalized)
+
+    for entry in raw_hosts or ():
+        _add(_host_only(entry or ""))
+    for origin in allowed_origins or ():
+        parsed = urlparse(origin)
+        _add(parsed.hostname)
+    return tuple(hosts)
+
+
+# --------------------------------------------------------------------------- #
 # HTTP server                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -1112,6 +1226,50 @@ class _Handler(BaseHTTPRequestHandler):
     @property
     def _require_browser_origin(self) -> bool:
         return bool(getattr(self.server, "require_browser_origin", False))  # type: ignore[attr-defined]
+
+    @property
+    def _allowed_hosts(self) -> Sequence[str]:
+        return getattr(self.server, "web_allowed_hosts", ())  # type: ignore[attr-defined]
+
+    def _host_gate(self, *, body: bool = True) -> bool:
+        """Apply the DNS-rebinding Host policy (#67) *before* any routing, provider, or
+        reclaim service runs. A duplicate ``Host`` (RFC-forbidden, never sent by a real
+        browser) or a disallowed one is refused ``403``. Returns ``True`` when the
+        request may proceed."""
+
+        hosts = self.headers.get_all("Host") or []
+        ok = len(hosts) <= 1 and _host_allowed(
+            hosts[0] if hosts else None, self._allowed_hosts
+        )
+        if ok:
+            return True
+        # DEBUG, not WARNING: a rejected Host is an expected, per-request event once the
+        # defense is deployed (a scanner or rebind attempt), so a warning per request
+        # would flood the log and amplify a scan — matching the silent origin-refusal
+        # precedent. The 403 page itself tells a locked-out operator to set
+        # WEB_ALLOWED_HOSTS, so no diagnosis breadcrumb is lost.
+        LOGGER.debug(
+            "web: refusing request with unrecognized Host %r; add it to "
+            "WEB_ALLOWED_HOSTS if you reach the UI through a hostname/proxy",
+            hosts,
+        )
+        self._reject_host(body=body)
+        return False
+
+    def _reject_host(self, *, body: bool) -> None:
+        footer = _ACTION_FOOTER if self._actions_enabled else _READONLY_FOOTER
+        page = _page(
+            "Forbidden",
+            "<h1>403</h1><p>This host is not recognized. If you reach this UI through "
+            "a hostname or reverse proxy, add it to <code>WEB_ALLOWED_HOSTS</code>.</p>",
+            footer_note=footer,
+        )
+        data = page.encode("utf-8")
+        self.send_response(HTTPStatus.FORBIDDEN)
+        self._common_headers(len(data), "text/html; charset=utf-8")
+        self.end_headers()
+        if body:
+            self.wfile.write(data)
 
     def _resolve(self, path: str) -> tuple:
         """Return ``(status, content_type, body_bytes)`` for a route.
@@ -1156,6 +1314,8 @@ class _Handler(BaseHTTPRequestHandler):
             )
 
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler dispatch name)
+        if not self._host_gate():
+            return
         status, content_type, body = self._resolve(urlparse(self.path).path)
         self._respond(status, content_type, len(body))
         self.wfile.write(body)
@@ -1163,6 +1323,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         # Same headers as the equivalent GET, but no body (RFC 9110) — so a health
         # check or proxy can probe any GET route with a cheap HEAD.
+        if not self._host_gate(body=False):
+            return
         status, content_type, body = self._resolve(urlparse(self.path).path)
         self._respond(status, content_type, len(body))
 
@@ -1174,6 +1336,8 @@ class _Handler(BaseHTTPRequestHandler):
         means a server built with actions disabled stays a read-only viewer whose
         every mutating verb is refused, exactly like the plain viewer."""
 
+        if not self._host_gate():
+            return
         service = self._reclaim
         if service is None or not service.enabled:
             self._method_not_allowed()
@@ -1189,6 +1353,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._method_not_allowed()
 
     def _method_not_allowed(self) -> None:
+        # Also the direct handler for PUT/DELETE/PATCH/OPTIONS, so gate the Host here
+        # too (#67) — an unknown-Host request to any verb is refused before a 405. A
+        # request routed here from do_POST already passed the gate; the re-check is a
+        # cheap no-op that writes nothing when the Host is fine.
+        if not self._host_gate():
+            return
         # Accurate whether actions are on or off: the reclaim POST routes are
         # matched before this fires, so a request reaching here is a verb/route this
         # server does not serve (every GET route is GET/HEAD only).
@@ -1249,16 +1419,16 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self._read_body()
         if raw is None:
             return
-        token, generated_at, targets = _parse_form_reclaim(raw)
+        token, generated_at, targets, form_session = _parse_form_reclaim(raw)
         response = service.preview(
             targets,
             token=token,
             report_generated_at=generated_at,
-            session=self._read_session_cookie(),
+            session=self._read_session_cookie() or form_session,
         )
         if response.status_code != HTTPStatus.OK:
             # A gate refusal (bad/missing token → 403) or a stale report (409): show
-            # the service message, and never mint a session — the cookie is granted
+            # the service message, and never mint a session — the credential is granted
             # only to a request that actually authenticated.
             title = "Reclaim refused" if response.status_code == 403 else "Report changed"
             self._write_html(
@@ -1266,20 +1436,27 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         # Authenticated + validated: refresh the unlock session so the confirm submit
-        # (and later reclaims within the window) need not re-paste the token. The page
-        # reflects the *configured* reclaim mode (``service.dry_run``) — what the
-        # confirm will actually do — not the preview's always-forced dry-run flag.
+        # (and later reclaims within the window) need not re-paste the token. Mint it
+        # ONCE and carry it two ways so the confirm works with or without cookies (#79):
+        # the ``HttpOnly``/``SameSite=Strict`` cookie AND a hidden ``session`` field on
+        # the confirm form (the cookie-less fallback). The page reflects the *configured*
+        # reclaim mode (``service.dry_run``) — what the confirm will actually do — not the
+        # preview's always-forced dry-run flag.
+        session_value = service.mint_session()
         self._write_html(
             HTTPStatus.OK,
-            render_reclaim_confirm_html(response, generated_at, dry_run=service.dry_run),
-            set_cookie=self._session_cookie_header(service),
+            render_reclaim_confirm_html(
+                response, generated_at, dry_run=service.dry_run, session_token=session_value
+            ),
+            set_cookie=self._cookie_header_for(session_value, service.session_max_age),
         )
 
     def _handle_reclaim_form(self, service: ReclaimService) -> None:
         """``POST /actions/reclaim``: the destructive confirm submit (no-JS browser
         form). Form-encoded ``report_generated_at`` + repeated ``target=rating_key:part_id``;
-        authorization is the unlock session cookie (#68) or, for backward compatibility,
-        a ``token`` field. Renders an HTML result page and refreshes the session."""
+        authorization is the unlock session cookie (#68), the #79 hidden ``session`` field
+        (the cookie-less fallback), or, for backward compatibility, a raw ``token`` field.
+        Renders an HTML result page and refreshes the session."""
 
         if not self._origin_ok(browser_path=True):
             self._write_html(HTTPStatus.FORBIDDEN, self._cross_origin_page())
@@ -1287,12 +1464,17 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self._read_body()
         if raw is None:
             return
-        token, generated_at, targets = _parse_form_reclaim(raw)
+        token, generated_at, targets, form_session = _parse_form_reclaim(raw)
         response = service.reclaim(
             targets,
             token=token,
             report_generated_at=generated_at,
-            session=self._read_session_cookie(),
+            # Prefer the cookie; fall back to the hidden field when the browser dropped
+            # it (#79). Both are the same HMAC-signed value, validated identically — the
+            # form field is no weaker than the cookie and only obtainable from an
+            # already-authenticated preview, and the confirm re-validates every target
+            # server-side regardless, so it authorizes *being unlocked*, not a plan.
+            session=self._read_session_cookie() or form_session,
         )
         # Refresh the unlock session on a successful, authenticated reclaim so a
         # follow-up reclaim in the same window stays paste-free; a gate refusal
@@ -1399,14 +1581,20 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _session_cookie_header(self, service: ReclaimService) -> Optional[str]:
         """A ``Set-Cookie`` header carrying a freshly minted unlock session (#68), or
-        ``None`` when the service cannot mint one (no token configured). Always
-        ``HttpOnly`` + ``SameSite=Strict`` (so the browser never sends it cross-site,
-        which is what defends the destructive confirm POST against CSRF on the
-        loopback bind where the origin check is permissive); ``Secure`` is added only
-        when the request arrived over HTTPS, so the default plain-HTTP LAN deployment
-        does not set a ``Secure`` cookie the browser would drop."""
+        ``None`` when the service cannot mint one (no token configured)."""
 
-        value = service.mint_session()
+        return self._cookie_header_for(service.mint_session(), service.session_max_age)
+
+    def _cookie_header_for(self, value: Optional[str], max_age: int) -> Optional[str]:
+        """Build the unlock-session ``Set-Cookie`` for an already-minted ``value`` (so a
+        caller can reuse one minted token for both the cookie and the #79 hidden field),
+        or ``None`` when there is nothing to set. Always ``HttpOnly`` + ``SameSite=Strict``
+        (so the browser never sends it cross-site, which is what defends the destructive
+        confirm POST against CSRF on the loopback bind where the origin check is
+        permissive); ``Secure`` is added only when the request arrived over HTTPS, so the
+        default plain-HTTP LAN deployment does not set a ``Secure`` cookie the browser
+        would drop."""
+
         if value is None:
             return None
         attrs = [
@@ -1414,7 +1602,7 @@ class _Handler(BaseHTTPRequestHandler):
             "Path=/",
             "HttpOnly",
             "SameSite=Strict",
-            f"Max-Age={service.session_max_age}",
+            f"Max-Age={max_age}",
         ]
         if self._request_is_https():
             attrs.append("Secure")
@@ -1472,6 +1660,7 @@ class DuplicateReportServer:
         reclaim_service: Optional[ReclaimService] = None,
         require_browser_origin: bool = False,
         allowed_origins: Sequence[str] = (),
+        allowed_hosts: Sequence[str] = (),
     ) -> None:
         self._httpd = ThreadingHTTPServer((bind_address, port), _Handler)
         self._httpd.daemon_threads = True
@@ -1484,6 +1673,10 @@ class DuplicateReportServer:
         # ``allowed_origins`` is the normalized allow-list for a reverse-proxy setup.
         self._httpd.require_browser_origin = require_browser_origin  # type: ignore[attr-defined]
         self._httpd.web_allowed_origins = tuple(allowed_origins)  # type: ignore[attr-defined]
+        # DNS-rebinding Host allow-list (#67): the normalized hostnames a ``Host``
+        # header may carry beyond the always-accepted IP-literal/loopback set. Empty is
+        # safe (only IP/loopback hosts pass), which is the config-free direct-LAN case.
+        self._httpd.web_allowed_hosts = tuple(allowed_hosts)  # type: ignore[attr-defined]
         self._started = False
 
     @property
@@ -1583,6 +1776,10 @@ def build_server(
     # ``require_browser_origin`` off there would accept an origin-less cross-site form
     # POST through the proxy before the allow-list is ever consulted.
     require_browser_origin = bool(allowed_origins) or not _is_loopback_bind(config.web_bind_address)
+    # DNS-rebinding defense (#67): a hostname ``Host`` must be listed. Fold in the
+    # hostnames of any configured ``WEB_ALLOWED_ORIGINS`` so an existing reverse-proxy
+    # deployment (#63) keeps working without a second knob; IP/loopback hosts always pass.
+    allowed_hosts = _effective_allowed_hosts(config.web_allowed_hosts, allowed_origins)
     return DuplicateReportServer(
         config.web_bind_address,
         config.web_port,
@@ -1590,4 +1787,5 @@ def build_server(
         reclaim_service=reclaim_service,
         require_browser_origin=require_browser_origin,
         allowed_origins=allowed_origins,
+        allowed_hosts=allowed_hosts,
     )

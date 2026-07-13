@@ -128,12 +128,14 @@ _MAX_UTF8_CHAR_BYTES = 4
 
 _MISMATCH = dedupe.MISMATCH
 
-#: Lifetime of a browser "unlock" session (#68). After the operator presents the
-#: shared ``WEB_ACTION_TOKEN`` once, the web layer mints an HMAC-signed session token
-#: (keyed by that secret) so subsequent confirm submits carry authorization via a
-#: ``SameSite=Strict`` cookie instead of re-pasting the token. Bounded so a captured
-#: cookie is not valid indefinitely; rotating ``WEB_ACTION_TOKEN`` invalidates every
-#: outstanding session because the signing key changes.
+#: Default lifetime of a browser "unlock" session (#68). After the operator presents
+#: the shared ``WEB_ACTION_TOKEN`` once, the web layer mints an HMAC-signed session
+#: token (keyed by that secret) so subsequent confirm submits carry authorization via a
+#: ``SameSite=Strict`` cookie (or the #79 hidden-field fallback) instead of re-pasting
+#: the token. Bounded so a captured credential is not valid indefinitely; rotating
+#: ``WEB_ACTION_TOKEN`` invalidates every outstanding session because the signing key
+#: changes. Operator-tunable via ``WEB_ACTION_SESSION_SECONDS`` (#79); this is the
+#: fallback used when that value is unset or non-positive.
 _SESSION_TTL_SECONDS = 3600
 
 #: Version prefix for the signed session token, so its wire format can evolve without
@@ -573,22 +575,33 @@ class ReclaimService:
     # -- browser unlock session (#68) ---------------------------------------- #
 
     @property
+    def _session_ttl(self) -> int:
+        """The configured unlock-session lifetime (``WEB_ACTION_SESSION_SECONDS``, #79),
+        falling back to :data:`_SESSION_TTL_SECONDS` for a non-positive value — a zero
+        or negative TTL would mint an instantly-expired credential and break the
+        two-step confirm, so it fails closed to the working one-hour default."""
+
+        configured = self._config.web_action_session_seconds
+        return configured if configured > 0 else _SESSION_TTL_SECONDS
+
+    @property
     def session_max_age(self) -> int:
         """The ``Max-Age`` (seconds) the web layer stamps on the unlock cookie."""
 
-        return _SESSION_TTL_SECONDS
+        return self._session_ttl
 
     def mint_session(self) -> Optional[str]:
         """Mint a signed unlock-session token (``v1.<expiry>.<hmac>``), or ``None``
         when no ``WEB_ACTION_TOKEN`` is configured (nothing to sign with, so no
         session can exist). The value carries no secret — it is an HMAC of the
-        expiry keyed by the token — so it is safe to hand to the browser, and it
-        can only be minted server-side after a real token was accepted."""
+        expiry keyed by the token — so it is safe to hand to the browser (as the
+        unlock cookie or the #79 hidden confirm-form field), and it can only be
+        minted server-side after a real token was accepted."""
 
         configured = self._config.web_action_token
         if not configured:
             return None
-        expiry = int(self._clock()) + _SESSION_TTL_SECONDS
+        expiry = int(self._clock()) + self._session_ttl
         return f"{_SESSION_VERSION}.{expiry}.{self._session_sig(configured, expiry)}"
 
     def _session_valid(self, value: Optional[str]) -> bool:

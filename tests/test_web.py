@@ -25,6 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from unraid_cache_cleaner.web import (
     DuplicateReportServer,
     DuplicateReportViewer,
+    _effective_allowed_hosts,
+    _host_allowed,
+    _host_only,
     _is_loopback_bind,
     _normalize_origin,
     _normalized_allowed_origins,
@@ -511,6 +514,137 @@ class OriginPolicyTests(unittest.TestCase):
         self.assertFalse(self._ok(require_browser_origin=True, origin="http://h:999999"))
 
 
+class HostPolicyTests(unittest.TestCase):
+    """#67: the pure DNS-rebinding Host allow-list, so the whole matrix is unit-tested."""
+
+    def test_host_only_strips_port_and_brackets(self) -> None:
+        self.assertEqual(_host_only("192.168.1.5:8080"), "192.168.1.5")
+        self.assertEqual(_host_only("media.example.com"), "media.example.com")
+        self.assertEqual(_host_only("media.example.com:8443"), "media.example.com")
+        self.assertEqual(_host_only("[::1]:8080"), "::1")
+        self.assertEqual(_host_only("[fe80::1]"), "fe80::1")
+        self.assertEqual(_host_only("::1"), "::1")          # bare IPv6 passed through whole
+        self.assertIsNone(_host_only("[::1"))               # malformed → None (fail closed)
+
+    def test_missing_or_blank_host_is_allowed(self) -> None:
+        # A non-browser client (curl / HTTP-1.0 probe) is not a rebinding vector.
+        self.assertTrue(_host_allowed(None, ()))
+        self.assertTrue(_host_allowed("", ()))
+        self.assertTrue(_host_allowed("   ", ()))
+
+    def test_ip_literals_and_localhost_always_allowed(self) -> None:
+        # An IP is reached with no DNS lookup, so it cannot be rebound — this is the
+        # config-free direct-LAN-by-IP case. localhost resolves to loopback.
+        for host in ("127.0.0.1:8080", "192.168.1.218:8080", "10.0.0.5", "[::1]:8080", "::1"):
+            self.assertTrue(_host_allowed(host, ()), host)
+        self.assertTrue(_host_allowed("localhost", ()))
+        self.assertTrue(_host_allowed("LOCALHOST:8080", ()))
+
+    def test_unlisted_hostname_is_refused(self) -> None:
+        # The rebinding case: an unknown hostname is refused with no allow-list...
+        self.assertFalse(_host_allowed("evil.example", ()))
+        self.assertFalse(_host_allowed("tower.local:8080", ()))
+        # ...and permitted only once listed (case-insensitive, port- and trailing-dot-agnostic).
+        self.assertTrue(_host_allowed("evil.example", ("evil.example",)))
+        self.assertTrue(_host_allowed("Media.Example:8443", ("media.example",)))
+        self.assertTrue(_host_allowed("host.local.", ("host.local",)))
+
+    def test_malformed_or_empty_parsed_host_fails_closed(self) -> None:
+        self.assertFalse(_host_allowed("[::1", ()))     # unclosed bracket
+        self.assertFalse(_host_allowed(":8080", ()))    # empty host part
+        self.assertFalse(_host_allowed("user@evil.example", ("evil.example",)))  # userinfo
+
+    def test_effective_allowed_hosts_normalizes_and_folds_origins(self) -> None:
+        # WEB_ALLOWED_HOSTS entries (port stripped, lowercased, de-duped) plus the
+        # hostnames of the normalized WEB_ALLOWED_ORIGINS — so an existing #63 proxy
+        # setup is not locked out by the new Host check.
+        result = _effective_allowed_hosts(
+            ("Media.Example:8443", "host.local.", "media.example"),
+            ("https://proxy.example", "http://media.example"),
+        )
+        self.assertEqual(result, ("media.example", "host.local", "proxy.example"))
+
+
+def _get_host(url: str, host: str, *, method: str = "GET"):
+    """A request that forwards ``url``'s socket but forges the ``Host`` header — the
+    exact shape of a DNS-rebinding request (the browser reaches the LAN IP but sends the
+    attacker's rebound hostname)."""
+
+    req = urllib.request.Request(url, method=method, headers={"Host": host})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+@contextmanager
+def _serve_hosts(provider, allowed_hosts=()):
+    server = DuplicateReportServer(
+        "127.0.0.1", 0, DuplicateReportViewer(provider), allowed_hosts=allowed_hosts
+    )
+    server.start_background()
+    try:
+        yield f"http://127.0.0.1:{server.port}"
+    finally:
+        server.shutdown()
+
+
+class HostHeaderHttpTests(unittest.TestCase):
+    """#67: the Host gate driven over real HTTP against the read surface (every route
+    trusts the client Host for nothing but this allow-list, applied before routing)."""
+
+    def test_ip_host_is_served(self) -> None:
+        # urllib's default Host is 127.0.0.1:<port> (an IP literal) → served.
+        with _serve_hosts(lambda: _payload()) as base:
+            status, _, body = _get(base + "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Plex duplicate report", body)
+
+    def test_rebinding_hostname_is_refused_even_with_matching_origin(self) -> None:
+        # The classic rebind: Origin AND Host are the same forged hostname, so the
+        # origin check would pass — the Host allow-list is what refuses it.
+        with _serve_hosts(lambda: _payload()) as base:
+            status, body = _get_host(base + "/", "evil.example")
+            self.assertEqual(status, 403)
+            self.assertIn(b"host is not recognized", body)
+            # The read APIs (which expose deleted paths) are refused the same way.
+            self.assertEqual(_get_host(base + "/api/report", "evil.example")[0], 403)
+            self.assertEqual(_get_host(base + "/api/actions", "evil.example")[0], 403)
+
+    def test_head_with_bad_host_is_403_without_body(self) -> None:
+        with _serve_hosts(lambda: _payload()) as base:
+            status, body = _get_host(base + "/", "evil.example", method="HEAD")
+        self.assertEqual(status, 403)
+        self.assertEqual(body, b"")
+
+    def test_listed_hostname_is_served(self) -> None:
+        with _serve_hosts(lambda: _payload(), allowed_hosts=("media.example",)) as base:
+            status, body = _get_host(base + "/", "media.example:8443")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Plex duplicate report", body)
+
+    def test_x_forwarded_host_never_grants_access(self) -> None:
+        # Only the real Host header is consulted; a spoofable X-Forwarded-* is ignored.
+        with _serve_hosts(lambda: _payload()) as base:
+            req = urllib.request.Request(
+                base + "/",
+                headers={"Host": "evil.example", "X-Forwarded-Host": "127.0.0.1"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+        self.assertEqual(status, 403)
+
+    def test_mutating_verb_with_bad_host_is_403_not_405(self) -> None:
+        # The Host gate precedes the 405 for unsupported verbs on the read-only viewer.
+        with _serve_hosts(lambda: _payload()) as base:
+            status, _ = _get_host(base + "/", "evil.example", method="DELETE")
+        self.assertEqual(status, 403)
+
+
 @contextmanager
 def _serve_with_history(report, history):
     viewer = DuplicateReportViewer(lambda: report, action_history=history)
@@ -704,6 +838,7 @@ class RenderPureFunctionTests(unittest.TestCase):
             plex_duplicate_report_path = Path("/nonexistent/does-not-exist.json")
             state_db_path = Path("/nonexistent/state.sqlite3")
             web_allowed_origins = ()
+            web_allowed_hosts = ()
 
         server = build_server(_Cfg())
         server.start_background()
