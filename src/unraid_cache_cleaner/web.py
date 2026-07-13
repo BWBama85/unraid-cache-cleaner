@@ -491,7 +491,7 @@ def render_reclaim_result_html(response: ReclaimResponse) -> str:
 # --------------------------------------------------------------------------- #
 
 def render_reclaim_confirm_html(
-    response: ReclaimResponse, generated_at: object
+    response: ReclaimResponse, generated_at: object, *, dry_run: bool
 ) -> str:
     """Render the interstitial confirmation page for a preview (#62).
 
@@ -501,25 +501,46 @@ def render_reclaim_confirm_html(
     targets are carried into the confirm form as hidden fields; the confirm re-runs
     the full validation server-side, so these are a selection to re-check, never a
     trusted plan. No token field — the browser proves authorization with the unlock
-    session cookie set alongside this page (#68)."""
+    session cookie set alongside this page (#68).
+
+    ``dry_run`` is the *configured* reclaim mode (``WEB_ACTIONS_DRY_RUN``) — i.e. what
+    the confirm submit will actually do — **not** ``response.dry_run`` (which the
+    preview always forces to ``True``). The two diverge whenever live mode is
+    configured, so the page's "removes nothing" / "permanently deletes" wording must
+    track ``dry_run`` or it would tell an operator in live mode that Confirm is
+    harmless."""
 
     would = [r for r in response.results if r.status == STATUS_WOULD_DELETE]
     refused = [r for r in response.results if r.status != STATUS_WOULD_DELETE]
     total = sum(_as_int(r.reclaimed_bytes) for r in would)
 
     body: List[str] = ["<h1>Confirm reclaim</h1>"]
-    if response.dry_run:
+    if dry_run:
         body.append(
-            '<div class="warn">Dry-run mode (<code>WEB_ACTIONS_DRY_RUN</code>): '
+            '<div class="warn">Dry-run mode (<code>WEB_ACTIONS_DRY_RUN=true</code>): '
             "confirming reports what would be deleted but removes nothing.</div>"
+        )
+    elif would:
+        body.append(
+            '<div class="err">Live mode: clicking Confirm permanently deletes the '
+            "files below.</div>"
         )
 
     if would:
-        body.append(
-            f'<p class="sub">You are about to delete <strong>{len(would)}</strong> '
-            f"redundant cop{'y' if len(would) == 1 else 'ies'} totaling "
-            f"<strong>{_esc(_fmt_gib(total))}</strong>. This cannot be undone.</p>"
-        )
+        copies = f"cop{'y' if len(would) == 1 else 'ies'}"
+        if dry_run:
+            lead = (
+                f"Dry run: <strong>{len(would)}</strong> redundant {copies} "
+                f"({_esc(_fmt_gib(total))}) would be deleted &mdash; confirming "
+                "removes nothing."
+            )
+        else:
+            lead = (
+                f"You are about to delete <strong>{len(would)}</strong> redundant "
+                f"{copies} totaling <strong>{_esc(_fmt_gib(total))}</strong>. This "
+                "permanently deletes these files and cannot be undone."
+            )
+        body.append(f'<p class="sub">{lead}</p>')
         body.append(_confirm_targets_table(would))
         body.append(_confirm_form(would, generated_at))
     else:
@@ -1245,10 +1266,12 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         # Authenticated + validated: refresh the unlock session so the confirm submit
-        # (and later reclaims within the window) need not re-paste the token.
+        # (and later reclaims within the window) need not re-paste the token. The page
+        # reflects the *configured* reclaim mode (``service.dry_run``) — what the
+        # confirm will actually do — not the preview's always-forced dry-run flag.
         self._write_html(
             HTTPStatus.OK,
-            render_reclaim_confirm_html(response, generated_at),
+            render_reclaim_confirm_html(response, generated_at, dry_run=service.dry_run),
             set_cookie=self._session_cookie_header(service),
         )
 

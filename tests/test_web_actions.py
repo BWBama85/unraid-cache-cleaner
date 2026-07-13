@@ -1736,6 +1736,35 @@ class ConfirmationFlowHttpTests(unittest.TestCase):
             self.assertEqual(deleter.calls, [])    # preview never deletes
             self.assertTrue(real.exists())
 
+    def test_live_preview_page_warns_of_real_delete_not_dry_run(self) -> None:
+        # #76 review (P1): preview() always forces dry-run, but the confirmation page
+        # must reflect the CONFIGURED mode. In live mode (WEB_ACTIONS_DRY_RUN=false)
+        # it must warn of a real delete, never claim Confirm "removes nothing".
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp)  # live (dry_run False)
+            with _serve(payload, service) as base:
+                status, _, raw = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+            self.assertEqual(status, 200)
+            self.assertNotIn(b"removes nothing", raw)
+            self.assertIn(b"permanently deletes", raw)
+            self.assertIn(b"Live mode", raw)
+
+    def test_dry_run_preview_page_says_removes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                status, _, raw = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+            self.assertEqual(status, 200)
+            self.assertIn(b"removes nothing", raw)
+
     def test_preview_bad_token_is_403_and_sets_no_cookie(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             payload, service, deleter, real = self._fs_service(tmp)

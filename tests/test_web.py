@@ -640,7 +640,7 @@ class ConfirmPageRenderTests(unittest.TestCase):
         results = [
             ReclaimResult("900", 2, "would-delete", "filesystem", "1 file(s) via filesystem", 5 * GiB),
         ]
-        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0)
+        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0, dry_run=False)
         self.assertIn("Confirm reclaim", html)
         self.assertIn("You are about to delete", html)
         self.assertIn("5.0 GiB", html)
@@ -653,19 +653,32 @@ class ConfirmPageRenderTests(unittest.TestCase):
 
     def test_confirm_page_shows_refusals_and_no_form_when_nothing_deletable(self) -> None:
         results = [ReclaimResult("900", 1, "refused", "", "target is the group keeper; never deleted")]
-        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0)
+        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0, dry_run=False)
         self.assertIn("Nothing selected would be deleted", html)
         self.assertIn("keeper", html)
         self.assertNotIn('action="/actions/reclaim"', html)  # no confirm form to submit
 
     def test_confirm_page_flags_dry_run(self) -> None:
         results = [ReclaimResult("900", 2, "would-delete", "filesystem", "x", 5 * GiB)]
-        html = render_reclaim_confirm_html(self._resp(results, dry_run=True), 1_720_000_000.0)
+        html = render_reclaim_confirm_html(self._resp(results, dry_run=True), 1_720_000_000.0, dry_run=True)
         self.assertIn("Dry-run mode", html)
+        self.assertIn("removes nothing", html)
+
+    def test_confirm_page_reflects_configured_mode_not_forced_preview(self) -> None:
+        # The preview response is ALWAYS force-dry-run (response.dry_run == True), but
+        # the page must reflect the *configured* reclaim mode: in live mode it must not
+        # claim Confirm "removes nothing" when Confirm performs a real delete.
+        results = [ReclaimResult("900", 2, "would-delete", "filesystem", "x", 5 * GiB)]
+        forced_preview = self._resp(results, dry_run=True)  # what preview() always returns
+        html = render_reclaim_confirm_html(forced_preview, 1_720_000_000.0, dry_run=False)
+        self.assertNotIn("removes nothing", html)
+        self.assertNotIn("Dry-run mode", html)
+        self.assertIn("permanently deletes", html)
+        self.assertIn("Live mode", html)
 
     def test_confirm_page_escapes_hostile_message(self) -> None:
         results = [ReclaimResult("900", 2, "refused", "", "<script>alert(1)</script>")]
-        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0)
+        html = render_reclaim_confirm_html(self._resp(results), 1_720_000_000.0, dry_run=False)
         self.assertNotIn("<script>alert", html)
         self.assertIn("&lt;script&gt;", html)
 
