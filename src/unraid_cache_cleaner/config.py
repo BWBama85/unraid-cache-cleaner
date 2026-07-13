@@ -197,6 +197,22 @@ class Config:
     # scheme. Empty (the default) keeps the same-origin-vs-``Host`` check. Appended
     # with a default so existing positional Config(...) calls and from_env keep working.
     web_allowed_origins: tuple[str, ...] = ()
+    # DNS-rebinding / Host-header hardening (#67). Every route trusts the client
+    # ``Host`` header for nothing but this allow-list, applied *before* routing. An
+    # IP-literal Host and ``localhost`` are always accepted (an IP cannot be
+    # DNS-rebound, so direct LAN-by-IP access needs no config); a *hostname* Host must
+    # appear here (or be derivable from ``web_allowed_origins``) or the request is
+    # refused, which is the standard DNS-rebinding defense. Entries are bare hostnames
+    # (an optional ``:port`` is ignored — Docker remaps the external port). Empty (the
+    # default) still defends rebinding because only IP/loopback hosts pass. Appended
+    # with a default so existing positional Config(...) calls and from_env keep working.
+    web_allowed_hosts: tuple[str, ...] = ()
+    # Lifetime (seconds) of the browser unlock session (#68/#79). Drives both the
+    # cookie ``Max-Age`` and the signed-token expiry. A non-positive value falls back
+    # to the built-in one-hour default (a zero/negative TTL would mint instantly-expired
+    # credentials and break the two-step confirm). Appended with a default so existing
+    # positional Config(...) calls and from_env keep working.
+    web_action_session_seconds: int = 3600
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -255,6 +271,8 @@ class Config:
             web_action_token=os.getenv("WEB_ACTION_TOKEN", ""),
             web_media_path_map=_parse_path_map(os.getenv("WEB_MEDIA_PATH_MAP")),
             web_allowed_origins=_parse_str_list(os.getenv("WEB_ALLOWED_ORIGINS")),
+            web_allowed_hosts=_parse_str_list(os.getenv("WEB_ALLOWED_HOSTS")),
+            web_action_session_seconds=_parse_int(os.getenv("WEB_ACTION_SESSION_SECONDS"), 3600),
         )
         config.ensure_directories()
         return config

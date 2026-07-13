@@ -124,9 +124,11 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `WEB_PORT` | `8080` | TCP port the web UI listens on |
 | `WEB_ENABLE_ACTIONS` | `false` | Enable the [action layer](#reclaiming-duplicates-from-the-browser-phase-2) so an operator can delete redundant copies from the browser. Off by default; the viewer is read-only until you set this |
 | `WEB_ACTIONS_DRY_RUN` | `true` | When actions are on, report what a reclaim *would* delete and touch nothing (mirrors `DRY_RUN`). Set `false` only after reviewing a dry run |
-| `WEB_ACTION_TOKEN` | empty | Shared secret every reclaim must present (`X-Action-Token` header for the JSON API; pasted once in the browser to set a one-hour unlock cookie). **Required** to actually delete: with actions enabled but no token, every reclaim is refused |
+| `WEB_ACTION_TOKEN` | empty | Shared secret every reclaim must present (`X-Action-Token` header for the JSON API; pasted once in the browser to set an unlock cookie). **Required** to actually delete: with actions enabled but no token, every reclaim is refused |
+| `WEB_ACTION_SESSION_SECONDS` | `3600` | Lifetime (seconds) of the browser unlock session — how long after pasting `WEB_ACTION_TOKEN` a confirm can proceed without re-pasting it. Drives both the cookie `Max-Age` and the signed-token expiry. A non-positive value falls back to `3600` |
 | `WEB_MEDIA_PATH_MAP` | empty | Comma-separated `plex_prefix:container_prefix` pairs mapping Plex-reported paths to this container's mounts, e.g. `/mnt/user/Media:/media`. Needed for a filesystem delete of an *untracked* copy; an unmapped path is refused |
 | `WEB_ALLOWED_ORIGINS` | empty | Comma-separated allow-list of external origins (e.g. `https://media.example.com`) that may submit the reclaim form. Set this behind a TLS-terminating reverse proxy, where the server sees plain HTTP and can't trust `Host` to infer the external scheme. Empty uses the same-origin-vs-`Host` check (the LAN default). See [CSRF/origin hardening](#reclaiming-duplicates-from-the-browser-phase-2) |
+| `WEB_ALLOWED_HOSTS` | empty | Comma-separated allow-list of hostnames permitted in the request `Host` header, the [DNS-rebinding defense](#reclaiming-duplicates-from-the-browser-phase-2). IP-literal and `localhost` hosts are **always** accepted (an IP can't be rebound), so direct LAN-by-IP access needs no config; a request whose `Host` is an *unlisted hostname* is refused on every route. Set this if you reach the UI through a hostname (e.g. `tower.local`); hostnames of `WEB_ALLOWED_ORIGINS` are added automatically |
 
 > **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup. The optional `RADARR_*`/`SONARR_*` variables add [`*arr`-tracking annotations](#radarrsonarr-tracking-optional) to that report; each is inert unless both its URL and API key are set.
 
@@ -289,11 +291,14 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
   `WEB_ACTION_TOKEN`. Enabling actions **without** a token refuses every request —
   there is never an unauthenticated delete endpoint. In the browser you paste the
   token **once** on the report page; a successful preview then sets a signed,
-  `HttpOnly`/`SameSite=Strict` unlock cookie (valid one hour, keyed by the token so
-  rotating it invalidates every session) so the confirm submit — and later reclaims
-  in the window — need not re-paste it, and the secret never appears in page HTML.
-  The **JSON API is unchanged**: it stays token-only via the `X-Action-Token` header
-  and never accepts the cookie. (Cookies must be enabled for the browser flow.)
+  `HttpOnly`/`SameSite=Strict` unlock cookie (keyed by the token so rotating it
+  invalidates every session; lifetime `WEB_ACTION_SESSION_SECONDS`, default one hour)
+  so the confirm submit — and later reclaims in the window — need not re-paste it, and
+  the secret never appears in page HTML. **Cookies not required:** the confirm page also
+  carries the same signed unlock value as a hidden field, so the two-step flow works
+  even with cookies disabled — the field holds no secret and is only obtainable from an
+  already-authenticated preview. The **JSON API is unchanged**: it stays token-only via
+  the `X-Action-Token` header and never accepts the cookie or the hidden field.
 - **Two-step confirmation.** The report form no longer deletes on submit: it posts to
   `/actions/preview`, which shows an interstitial page listing exactly which copies
   would be deleted (and how much space they free) and which were excluded (keeper,
@@ -313,6 +318,18 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
   - **Behind a TLS reverse proxy:** the server sees plain HTTP and can't trust the
     client `Host` to infer the external `https` scheme, so set `WEB_ALLOWED_ORIGINS`
     to the external origin(s) the browser sends (e.g. `https://media.example.com`).
+- **DNS-rebinding hardened (`Host` allow-list).** Independently of the origin check,
+  every route refuses a request whose `Host` header is an *unrecognized hostname*
+  **before** it routes — the standard defense against DNS-rebinding, where an attacker
+  rebinds a hostname to your LAN IP so a victim's browser reaches the UI (including the
+  read-only report and `/actions` history, which expose absolute file paths). IP-literal
+  and `localhost` hosts are always accepted (an IP can't be rebound), so **direct LAN
+  access by IP needs no configuration**. If you reach the UI through a hostname, list it
+  in `WEB_ALLOWED_HOSTS` (the hostnames of `WEB_ALLOWED_ORIGINS` are added
+  automatically). A spoofable `X-Forwarded-*` is never trusted for this. The read
+  endpoints (`/`, `/api/report`, `/actions`, `/api/actions`) remain read-only and
+  unauthenticated under this LAN-scoped model, matching Phase 1 — the `Host` allow-list,
+  not a token, is what scopes them.
 - **Honors the report's safety signals.** The keeper is never deleted, a `mismatch`
   group (Plex merged different titles) is never reclaimed, and an `unknown`
   association is never auto-deleted. Targets are resolved against a *fresh*

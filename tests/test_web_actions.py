@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -1349,6 +1350,13 @@ def _cookie_pair(headers) -> str:
     return raw.split(";", 1)[0] if raw else ""
 
 
+def _hidden_session(html: bytes) -> str:
+    """The value of the confirm form's hidden ``session`` field (#79), or ``""``."""
+
+    match = re.search(rb'name="session" value="([^"]+)"', html)
+    return match.group(1).decode() if match else ""
+
+
 _FORM_CT = {"Content-Type": "application/x-www-form-urlencoded"}
 
 
@@ -1646,6 +1654,26 @@ class SessionTokenTests(unittest.TestCase):
         rotated = _service(_report([]), config=_config(web_action_token="different"))
         self.assertFalse(rotated._session_valid(token))
 
+    def test_session_ttl_is_configurable(self) -> None:
+        # #79: WEB_ACTION_SESSION_SECONDS drives both the cookie Max-Age and the signed
+        # expiry, in agreement.
+        now = [1000.0]
+        service = _service(_report([]), config=_config(web_action_session_seconds=7200))
+        service._clock = lambda: now[0]
+        self.assertEqual(service.session_max_age, 7200)
+        token = service.mint_session()
+        now[0] = 1000.0 + 7200 - 1
+        self.assertTrue(service._session_valid(token))    # still inside the window
+        now[0] = 1000.0 + 7200 + 1
+        self.assertFalse(service._session_valid(token))   # lapsed at the configured TTL
+
+    def test_non_positive_ttl_falls_back_to_default(self) -> None:
+        # A zero/negative TTL would mint instantly-expired credentials and break the
+        # two-step confirm, so it fails closed to the built-in one-hour default.
+        for bad in (0, -5):
+            service = _service(_report([]), config=_config(web_action_session_seconds=bad))
+            self.assertEqual(service.session_max_age, 3600)
+
     def test_non_ascii_signature_refuses_without_raising(self) -> None:
         # A hostile cookie can smuggle a non-ASCII char into the signature (a quoted
         # octal escape); hmac.compare_digest raises TypeError on a non-ASCII str, so a
@@ -1813,6 +1841,84 @@ class ConfirmationFlowHttpTests(unittest.TestCase):
             self.assertIn(b"Reclaim result", raw2)
             self.assertEqual(len(deleter.calls), 1)   # confirm ran the real delete
             self.assertFalse(real.exists())            # staged away from its media path
+
+    def test_confirm_page_carries_hidden_session_and_no_raw_secret(self) -> None:
+        # #79: the confirm page embeds the minted unlock token as a hidden `session`
+        # field (the cookie-less fallback). It is a signed v1 token, never the raw
+        # WEB_ACTION_TOKEN, and the page carries no token/password input at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, _, _ = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                _, _, raw = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+        self.assertIn(b'name="session"', raw)
+        self.assertIn(b'value="v1.', raw)          # a signed session token, not the secret
+        self.assertNotIn(b'value="tok"', raw)      # the raw shared secret is never echoed
+        self.assertNotIn(b'name="token"', raw)     # confirm page has no token/password field
+
+    def test_confirm_via_hidden_session_without_cookie_deletes(self) -> None:
+        # The #79 headline: a cookies-disabled browser confirms with only the hidden
+        # session field — no cookie, no re-pasted token — and the delete runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp)
+            with _serve(payload, service) as base:
+                s1, _, raw1 = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+                self.assertEqual(s1, 200)
+                session = _hidden_session(raw1)
+                self.assertTrue(session.startswith("v1."))
+                self.assertEqual(deleter.calls, [])   # preview deleted nothing
+                s2, _, raw2 = _post_resp(
+                    base + "/actions/reclaim",
+                    _form(report_generated_at=GEN, target="900:2", session=session),  # no cookie
+                    _FORM_CT,
+                )
+            self.assertEqual(s2, 200)
+            self.assertIn(b"Reclaim result", raw2)
+            self.assertEqual(len(deleter.calls), 1)   # confirm ran the real delete
+            self.assertFalse(real.exists())
+
+    def test_confirm_with_forged_hidden_session_is_refused(self) -> None:
+        # A forged/garbage hidden session fails the HMAC exactly like a forged cookie —
+        # the field is no weaker than the cookie.
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp)
+            with _serve(payload, service) as base:
+                status, _, _ = _post_resp(
+                    base + "/actions/reclaim",
+                    _form(report_generated_at=GEN, target="900:2", session="v1.9999999999.bad"),
+                    _FORM_CT,
+                )
+            self.assertEqual(status, 403)
+            self.assertEqual(deleter.calls, [])
+            self.assertTrue(real.exists())
+
+    def test_json_api_ignores_a_session_field(self) -> None:
+        # The JSON path stays token-only: a `session` in the JSON body authorizes
+        # nothing (only X-Action-Token / the JSON `token` do).
+        with tempfile.TemporaryDirectory() as tmp:
+            payload, service, deleter, real = self._fs_service(tmp, dry_run=True)
+            with _serve(payload, service) as base:
+                _, h1, raw1 = _post_resp(
+                    base + "/actions/preview",
+                    _form(token="tok", report_generated_at=GEN, target="900:2"),
+                    _FORM_CT,
+                )
+                session = _hidden_session(raw1)
+                body = json.dumps(
+                    {"report_generated_at": GEN, "session": session,
+                     "targets": [{"rating_key": "900", "part_id": 2}]}
+                ).encode()
+                status, _, _ = _post_resp(
+                    base + "/api/reclaim", body, {"Content-Type": "application/json"}
+                )
+        self.assertEqual(status, 403)
 
     def test_confirm_without_cookie_or_token_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

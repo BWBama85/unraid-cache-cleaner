@@ -140,15 +140,26 @@ page before `POST /actions/reclaim` performs the delete. Authorization for the
 browser is an HMAC-signed unlock session (#68) — minted by `mint_session` only after
 a real token is accepted, keyed by `WEB_ACTION_TOKEN`, carried as an
 `HttpOnly`/`SameSite=Strict` cookie so the confirm submit need not re-paste the
-token and the secret never lands in page HTML; the JSON API stays token-only via
-`X-Action-Token` and never consults the cookie. Fail-closed on every
+token and the secret never lands in page HTML; when cookies are unavailable the same
+signed value rides a hidden `session` form field on the confirm page (#79) — a
+cookie-less fallback that is no weaker (identical HMAC, only obtainable from an
+already-authenticated preview, and the confirm re-validates every target regardless).
+The session lifetime is `WEB_ACTION_SESSION_SECONDS` (#79, default one hour; a
+non-positive value falls back to that default), driving both the cookie `Max-Age` and
+the signed expiry. The JSON API stays token-only via `X-Action-Token` and never
+consults the cookie or the hidden field. Fail-closed on every
 axis: disabled + dry-run by default; a shared `WEB_ACTION_TOKEN` is required
 (enabling actions without one refuses every request); on top of the token a
 CSRF/origin check scales with the bind address — loopback stays permissive (the
 default), but a non-loopback bind requires a browser reclaim *form* to present a
 matching `Origin`/`Referer` (a cross-site form POST is refused even without
 `Origin`), while the JSON API stays token-only when no `Origin` is sent, and a
-`WEB_ALLOWED_ORIGINS` allow-list covers a TLS-terminating reverse proxy; targets
+`WEB_ALLOWED_ORIGINS` allow-list covers a TLS-terminating reverse proxy;
+independently, a `Host`-header allow-list (#67) refuses an unrecognized *hostname* on
+every route before it routes — the DNS-rebinding defense that scopes even the
+unauthenticated read surface (`/`, `/api/report`, `/actions`) — while always accepting
+IP-literal/`localhost` hosts (config-free direct-LAN-by-IP) and the hostnames of
+`WEB_ALLOWED_HOSTS` + `WEB_ALLOWED_ORIGINS` (`X-Forwarded-*` is never trusted); targets
 are resolved only against a *fresh* server-side report snapshot
 (client-supplied path/association/size/backend are never trusted) and a stale
 `generated_at` is a `409`; the keeper, `mismatch` groups, and `unknown`
