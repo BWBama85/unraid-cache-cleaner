@@ -1718,6 +1718,40 @@ class SessionTokenTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# #83 decision: the unlock session is deliberately replay-until-expiry          #
+# --------------------------------------------------------------------------- #
+
+class ReplayableSessionDecisionTests(unittest.TestCase):
+    """#83 evaluated whether the confirm credential should be single-use / target-bound.
+
+    Decision: keep the current replay-until-expiry model. The unlock session authorizes
+    *being unlocked*, not a specific plan, and is deliberately reusable within its TTL so
+    follow-up reclaims stay paste-free (#68) — a property a single-use nonce would regress,
+    at the cost of new server-side state. These tests pin the two behaviors that make
+    replay-until-expiry safe, so a future change cannot quietly weaken them."""
+
+    def test_one_session_authorizes_repeated_reclaims_within_ttl(self) -> None:
+        # The paste-free reuse a single-use credential would break: one minted session
+        # drives several successful reclaims. Empty targets keep this a pure auth/freshness
+        # check with no filesystem.
+        service = _service(_report([]))
+        session = service.mint_session()
+        for _ in range(3):
+            resp = service.reclaim([], token=None, session=session, report_generated_at=GEN)
+            self.assertEqual(resp.status_code, 200)
+
+    def test_replayed_session_still_revalidates_report_freshness(self) -> None:
+        # Replay is bounded by the freshness check: the same still-valid session against a
+        # stale generated_at is a 409, so a captured confirm cannot act on a report that
+        # changed since it was minted — the safety a target-binding nonce would add is
+        # already provided by re-validating every target against the fresh report.
+        service = _service(_report([]))
+        session = service.mint_session()
+        stale = service.reclaim([], token=None, session=session, report_generated_at=GEN + 1)
+        self.assertEqual(stale.status_code, 409)
+
+
+# --------------------------------------------------------------------------- #
 # Two-step confirmation flow + unlock cookie over real HTTP (#62 / #68)         #
 # --------------------------------------------------------------------------- #
 
@@ -2008,6 +2042,214 @@ class ConfirmationFlowHttpTests(unittest.TestCase):
                 )
         self.assertEqual(status, 403)
         self.assertIsNone(headers.get("Set-Cookie"))
+
+
+# --------------------------------------------------------------------------- #
+# Opt-in action-history auth (#82)                                             #
+# --------------------------------------------------------------------------- #
+
+from unraid_cache_cleaner.web_actions import _SESSION_VERSION
+
+_SESSION_COOKIE = "ucc_session"
+
+
+def _get_h(url, headers=None):
+    """GET returning ``(status, headers, body)`` — including the auth headers/cookie the
+    history-auth tests need. Never raises on a 4xx (returns its status/body instead)."""
+
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+def _head_status(url, headers=None):
+    req = urllib.request.Request(url, headers=headers or {}, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+class _RecordingHistory:
+    """An action-history provider that records whether it was ever called — so a test can
+    prove an unauthorized request is refused *before* the provider (and its SQLite read)
+    runs."""
+
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.called = False
+
+    def __call__(self):
+        self.called = True
+        return self.rows
+
+
+@contextmanager
+def _serve_history(
+    *,
+    history_auth=True,
+    rows=(),
+    token="tok",
+    actions_enabled=True,
+    attach_service=True,
+    history=None,
+):
+    """Serve via the real ``build_server`` (so config→wiring is exercised, not just the
+    handler) with an attached history provider. ``attach_service=False`` models the
+    actions-disabled deployment where no ``ReclaimService`` exists at all."""
+
+    config = _config(
+        web_bind_address="127.0.0.1",
+        web_port=0,
+        web_action_token=token,
+        web_actions_enabled=actions_enabled,
+        web_action_history_auth=history_auth,
+    )
+    provider = _RecordingHistory(rows) if history is None else history
+    service = _service(_untracked_payload(), config=config) if attach_service else None
+    server = build_server(
+        config,
+        provider=lambda: _untracked_payload(),
+        reclaim_service=service,
+        action_history=provider,
+    )
+    server.start_background()
+    try:
+        yield f"http://127.0.0.1:{server.port}", service, provider
+    finally:
+        server.shutdown()
+
+
+def _cookie(value: str) -> dict:
+    return {"Cookie": f"{_SESSION_COOKIE}={value}"}
+
+
+class HistoryAuthTests(unittest.TestCase):
+    """The opt-in gate for the read-only ``/actions`` + ``/api/actions`` history (#82)."""
+
+    def test_default_off_leaves_history_lan_readable(self) -> None:
+        with _serve_history(history_auth=False, rows=[_action_row_dict()]) as (base, _, _):
+            self.assertEqual(_get_h(base + "/actions")[0], 200)
+            self.assertEqual(_get_h(base + "/api/actions")[0], 200)
+
+    def test_json_requires_credential(self) -> None:
+        with _serve_history() as (base, _, prov):
+            status, _, body = _get_h(base + "/api/actions")
+        self.assertEqual(status, 403)
+        self.assertIn(b"authentication", body)
+        self.assertFalse(prov.called)  # denied before the provider/SQLite is touched
+
+    def test_json_token_header_authorizes(self) -> None:
+        with _serve_history(rows=[_action_row_dict()]) as (base, _, prov):
+            status, _, body = _get_h(base + "/api/actions", {"X-Action-Token": "tok"})
+        self.assertEqual(status, 200)
+        self.assertTrue(prov.called)
+        self.assertIn(b'"available": true', body)
+
+    def test_json_wrong_token_is_403(self) -> None:
+        with _serve_history() as (base, _, prov):
+            status, _, _ = _get_h(base + "/api/actions", {"X-Action-Token": "nope"})
+        self.assertEqual(status, 403)
+        self.assertFalse(prov.called)
+
+    def test_json_session_cookie_authorizes(self) -> None:
+        with _serve_history() as (base, service, _):
+            status, _, _ = _get_h(base + "/api/actions", _cookie(service.mint_session()))
+        self.assertEqual(status, 200)
+
+    def test_html_requires_credential(self) -> None:
+        with _serve_history() as (base, _, prov):
+            status, headers, body = _get_h(base + "/actions")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get("Content-Type"), "text/html; charset=utf-8")
+        self.assertIn(b"action history is protected", body)
+        self.assertFalse(prov.called)
+
+    def test_html_session_cookie_authorizes(self) -> None:
+        with _serve_history(rows=[_action_row_dict()]) as (base, service, _):
+            status, _, body = _get_h(base + "/actions", _cookie(service.mint_session()))
+        self.assertEqual(status, 200)
+        self.assertIn(b"Reclaim action history", body)
+
+    def test_html_token_header_also_authorizes(self) -> None:
+        # A scripted client may present the header on the HTML route too; a browser GET
+        # simply cannot, so it falls back to the cookie.
+        with _serve_history() as (base, _, _):
+            self.assertEqual(_get_h(base + "/actions", {"X-Action-Token": "tok"})[0], 200)
+
+    def test_expired_session_is_refused(self) -> None:
+        with _serve_history() as (base, service, _):
+            expiry = 100  # the fake clock is 123.0, so this is already lapsed
+            sig = service._session_sig("tok", expiry)
+            expired = f"{_SESSION_VERSION}.{expiry}.{sig}"
+            self.assertEqual(_get_h(base + "/api/actions", _cookie(expired))[0], 403)
+
+    def test_session_signed_with_rotated_token_is_refused(self) -> None:
+        # The session is a valid, unexpired token — but signed with a different secret than
+        # the server's WEB_ACTION_TOKEN, so the signature check fails closed.
+        with _serve_history(token="current") as (base, service, _):
+            forged = f"{_SESSION_VERSION}.999999999.{service._session_sig('old-token', 999999999)}"
+            self.assertEqual(_get_h(base + "/api/actions", _cookie(forged))[0], 403)
+
+    def test_malformed_cookie_is_refused_not_crashed(self) -> None:
+        with _serve_history() as (base, _, _):
+            self.assertEqual(_get_h(base + "/actions", _cookie("not-a-session"))[0], 403)
+
+    def test_head_parity_with_get(self) -> None:
+        with _serve_history() as (base, service, _):
+            # Unauthorized HEAD must mirror the 403 GET (no 200 status/length leak)...
+            self.assertEqual(_head_status(base + "/actions")[0], 403)
+            # ...and an authorized HEAD mirrors the 200 GET, with no body.
+            status, body = _head_status(base + "/actions", _cookie(service.mint_session()))
+            self.assertEqual(status, 200)
+            self.assertEqual(body, b"")
+
+    def test_report_and_api_report_stay_open(self) -> None:
+        # #82 gates only the history views; the report surface is unchanged.
+        with _serve_history() as (base, _, _):
+            self.assertEqual(_get_h(base + "/")[0], 200)
+            self.assertEqual(_get_h(base + "/api/report")[0], 200)
+
+    def test_empty_token_denies_everyone_failclosed(self) -> None:
+        # Gate on but no WEB_ACTION_TOKEN: nothing can authenticate, so the history is
+        # denied rather than silently reopened.
+        with _serve_history(token="") as (base, _, prov):
+            self.assertEqual(_get_h(base + "/actions")[0], 403)
+            self.assertEqual(_get_h(base + "/api/actions", {"X-Action-Token": ""})[0], 403)
+            self.assertFalse(prov.called)
+
+    def test_actions_disabled_denies_failclosed(self) -> None:
+        # Gate on but no ReclaimService attached (the read-only deployment): fail closed.
+        with _serve_history(attach_service=False) as (base, _, prov):
+            self.assertEqual(_get_h(base + "/actions")[0], 403)
+            self.assertEqual(_get_h(base + "/api/actions", {"X-Action-Token": "tok"})[0], 403)
+            self.assertFalse(prov.called)
+
+    def test_host_gate_precedes_history_auth(self) -> None:
+        # A disallowed Host is refused before the history-auth check even runs, so a valid
+        # token cannot smuggle a rebinding request through.
+        with _serve_history(rows=[_action_row_dict()]) as (base, _, _):
+            status, _, _ = _get_h(
+                base + "/api/actions", {"X-Action-Token": "tok", "Host": "evil.example"}
+            )
+        self.assertEqual(status, 403)
+
+
+def _action_row_dict(**overrides) -> dict:
+    row = dict(
+        path="/plex/x.mkv",
+        action="web-reclaim:filesystem",
+        status="deleted",
+        size=5 * GiB,
+        message="rating_key=900 part_id=2",
+        occurred_at=GEN,
+    )
+    row.update(overrides)
+    return row
 
 
 if __name__ == "__main__":

@@ -1231,6 +1231,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _allowed_hosts(self) -> Sequence[str]:
         return getattr(self.server, "web_allowed_hosts", ())  # type: ignore[attr-defined]
 
+    @property
+    def _history_auth_required(self) -> bool:
+        return bool(getattr(self.server, "web_action_history_auth", False))  # type: ignore[attr-defined]
+
     def _host_gate(self, *, body: bool = True) -> bool:
         """Apply the DNS-rebinding Host policy (#67) *before* any routing, provider, or
         reclaim service runs. A duplicate ``Host`` (RFC-forbidden, never sent by a real
@@ -1271,6 +1275,51 @@ class _Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(data)
 
+    def _history_view_authorized(self) -> bool:
+        """Whether the read-only action-history views may be served to this request.
+
+        The opt-in gate (#82) is off by default, so this is ``True`` and the history
+        stays LAN-readable exactly as before. When the gate is on, the request must
+        carry a valid credential — the shared ``WEB_ACTION_TOKEN`` (as an
+        ``X-Action-Token`` header, the JSON path) or a valid unlock session (the
+        ``ucc_session`` cookie a browser earns via the token→preview flow). Fail-closed:
+        with the gate on but no reclaim service attached (actions disabled) or no token
+        configured, :meth:`ReclaimService.authorized` returns ``False`` for every
+        request, so the history is *denied*, never silently reopened — ``build_server``
+        warns about that lockout at startup. Evaluated before the viewer touches the
+        state DB, so an unauthorized request never reads the audit history."""
+
+        if not self._history_auth_required:
+            return True
+        service = self._reclaim
+        if service is None or not service.enabled:
+            # Actions disabled → the reclaim endpoints are 405 and no unlock session can
+            # be minted, so there is no credential to present. Deny rather than authorize
+            # against a token that a browser could never turn into a session cookie.
+            return False
+        return service.authorized(
+            token=self.headers.get("X-Action-Token"),
+            session=self._read_session_cookie(),
+        )
+
+    def _history_auth_denied(self, path: str) -> tuple:
+        """The ``403`` for a gated history request that failed auth — JSON for the API
+        route, an HTML "unlock from the report page" page for the browser route."""
+
+        if path == "/api/actions":
+            body = json.dumps(
+                {"message": "action history requires authentication"}, sort_keys=True
+            ).encode("utf-8")
+            return HTTPStatus.FORBIDDEN, "application/json; charset=utf-8", body
+        page = _page(
+            "Forbidden",
+            "<h1>403</h1><p>The reclaim action history is protected. Unlock it from the "
+            '<a href="/">report page</a> by presenting the action token, or send it as '
+            "an <code>X-Action-Token</code> header.</p>",
+            footer_note=_ACTION_FOOTER if self._actions_enabled else _READONLY_FOOTER,
+        )
+        return HTTPStatus.FORBIDDEN, "text/html; charset=utf-8", page.encode("utf-8")
+
     def _resolve(self, path: str) -> tuple:
         """Return ``(status, content_type, body_bytes)`` for a route.
 
@@ -1280,6 +1329,11 @@ class _Handler(BaseHTTPRequestHandler):
         """
 
         try:
+            if path in ("/actions", "/api/actions") and not self._history_view_authorized():
+                # Gate the history views (#82) before any provider/SQLite read. Shared by
+                # GET and HEAD (both route through here), so a HEAD can never leak a 200
+                # status/length where the equivalent GET is 403.
+                return self._history_auth_denied(path)
             if path in ("/", "/index.html"):
                 return (
                     HTTPStatus.OK,
@@ -1661,6 +1715,7 @@ class DuplicateReportServer:
         require_browser_origin: bool = False,
         allowed_origins: Sequence[str] = (),
         allowed_hosts: Sequence[str] = (),
+        history_auth: bool = False,
     ) -> None:
         self._httpd = ThreadingHTTPServer((bind_address, port), _Handler)
         self._httpd.daemon_threads = True
@@ -1677,6 +1732,10 @@ class DuplicateReportServer:
         # header may carry beyond the always-accepted IP-literal/loopback set. Empty is
         # safe (only IP/loopback hosts pass), which is the config-free direct-LAN case.
         self._httpd.web_allowed_hosts = tuple(allowed_hosts)  # type: ignore[attr-defined]
+        # Opt-in auth for the read-only ``/actions`` + ``/api/actions`` history (#82).
+        # Off keeps the LAN-readable default; on requires the reclaim token/unlock
+        # session and fails closed when neither can be presented (no service/token).
+        self._httpd.web_action_history_auth = bool(history_auth)  # type: ignore[attr-defined]
         self._started = False
 
     @property
@@ -1780,6 +1839,19 @@ def build_server(
     # hostnames of any configured ``WEB_ALLOWED_ORIGINS`` so an existing reverse-proxy
     # deployment (#63) keeps working without a second knob; IP/loopback hosts always pass.
     allowed_hosts = _effective_allowed_hosts(config.web_allowed_hosts, allowed_origins)
+    # Opt-in history auth (#82). It authenticates against the reclaim token/unlock
+    # session, so with the gate on but no credential available (actions disabled, or no
+    # WEB_ACTION_TOKEN) the history is *denied* to everyone — fail-closed, as configured.
+    # Warn loudly so an operator who locked themselves out understands why, rather than
+    # silently reopening a surface they asked to protect.
+    if config.web_action_history_auth and not (actions_enabled and config.web_action_token):
+        LOGGER.warning(
+            "WEB_ACTION_HISTORY_AUTH is set but %s; the /actions and /api/actions "
+            "history views will be denied to every request until both are in place",
+            "web actions are disabled (set WEB_ENABLE_ACTIONS=true)"
+            if not actions_enabled
+            else "WEB_ACTION_TOKEN is not set",
+        )
     return DuplicateReportServer(
         config.web_bind_address,
         config.web_port,
@@ -1788,4 +1860,5 @@ def build_server(
         require_browser_origin=require_browser_origin,
         allowed_origins=allowed_origins,
         allowed_hosts=allowed_hosts,
+        history_auth=config.web_action_history_auth,
     )

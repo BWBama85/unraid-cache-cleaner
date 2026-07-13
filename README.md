@@ -129,6 +129,7 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `WEB_MEDIA_PATH_MAP` | empty | Comma-separated `plex_prefix:container_prefix` pairs mapping Plex-reported paths to this container's mounts, e.g. `/mnt/user/Media:/media`. Needed for a filesystem delete of an *untracked* copy; an unmapped path is refused |
 | `WEB_ALLOWED_ORIGINS` | empty | Comma-separated allow-list of external origins (e.g. `https://media.example.com`) that may submit the reclaim form. Set this behind a TLS-terminating reverse proxy, where the server sees plain HTTP and can't trust `Host` to infer the external scheme. Empty uses the same-origin-vs-`Host` check (the LAN default). See [CSRF/origin hardening](#reclaiming-duplicates-from-the-browser-phase-2) |
 | `WEB_ALLOWED_HOSTS` | empty | Comma-separated allow-list of hostnames permitted in the request `Host` header, the [DNS-rebinding defense](#reclaiming-duplicates-from-the-browser-phase-2). IP-literal and `localhost` hosts are **always** accepted (an IP can't be rebound), so direct LAN-by-IP access needs no config; a request whose `Host` is an *unlisted hostname* is refused on every route. Set this if you reach the UI through a hostname (e.g. `tower.local`); hostnames of `WEB_ALLOWED_ORIGINS` are added automatically |
+| `WEB_ACTION_HISTORY_AUTH` | `false` | Require the reclaim credential to view the [action-history](#action-history) views `/actions` + `/api/actions` (which expose previously-deleted absolute paths + sizes). Off keeps them LAN-readable like `/` and `/api/report`. When `true`, `/api/actions` needs the `X-Action-Token` header (or the unlock cookie) and `/actions` needs the browser unlock session (earned via `WEB_ACTION_TOKEN` → preview). Needs actions enabled **and** a token set, or it fails closed — the history is denied to everyone (a startup warning flags the lockout). `/` + `/api/report` are unaffected |
 
 > **Note:** the `PLEX_*` variables drive the [Plex Duplicate Report](#plex-duplicate-report) subcommand. They are unused by the `scan`/`service` cleanup commands — leave them empty if you only use qBittorrent cleanup. The optional `RADARR_*`/`SONARR_*` variables add [`*arr`-tracking annotations](#radarrsonarr-tracking-optional) to that report; each is inert unless both its URL and API key are set.
 
@@ -329,7 +330,10 @@ outside-triggered deletion of *library* media, so it is fail-closed on every axi
   automatically). A spoofable `X-Forwarded-*` is never trusted for this. The read
   endpoints (`/`, `/api/report`, `/actions`, `/api/actions`) remain read-only and
   unauthenticated under this LAN-scoped model, matching Phase 1 — the `Host` allow-list,
-  not a token, is what scopes them.
+  not a token, is what scopes them. The two audit-history views can additionally be
+  token-gated with `WEB_ACTION_HISTORY_AUTH=true` (see [Action history](#action-history))
+  when you want the deleted-path history behind the reclaim credential rather than
+  LAN-readable.
 - **Honors the report's safety signals.** The keeper is never deleted, a `mismatch`
   group (Plex merged different titles) is never reclaimed, and an `unknown`
   association is never auto-deleted. Targets are resolved against a *fresh*
@@ -388,6 +392,26 @@ migrating the database) so a page load is a pure indexed `SELECT` that never wri
 they work even after you turn actions back off, and a missing/legacy store simply
 reports `available: false`. Dry-run previews and refusals aren't deletes, so they
 are not recorded.
+
+Both views are **LAN-readable by default** (scoped by the `Host` allow-list, like the
+report itself). Because they expose previously-deleted absolute paths and sizes, you
+can require the reclaim credential to view them by setting `WEB_ACTION_HISTORY_AUTH=true`:
+`/api/actions` then needs the `X-Action-Token` header (or the unlock cookie), and
+`/actions` needs the browser unlock session you earn by presenting `WEB_ACTION_TOKEN` on
+the report page. The gate authenticates against that token, so it needs actions enabled
+**and** a token configured — otherwise it fails closed (the history is denied to
+everyone, and the server logs a startup warning about the lockout). `/` and `/api/report`
+are never affected.
+
+> **On the unlock credential's lifetime (#83).** The browser unlock session authorizes
+> *being unlocked* for `WEB_ACTION_SESSION_SECONDS`, not a single confirm — it is
+> deliberately reusable so follow-up reclaims stay paste-free. It is **not** single-use,
+> by design: a single-use nonce would need new server-side state and would break that
+> multi-reclaim flow, for near-nil gain. A captured confirm is already contained by
+> `SameSite=Strict` + the origin check + the HMAC credential + a fresh `generated_at`
+> match, and every target is re-validated against a freshly-loaded report — so a replayed
+> confirm can only ever delete a copy the *current* report still marks reclaimable, never
+> the last copy. Rotating `WEB_ACTION_TOKEN` invalidates every outstanding session.
 
 ## RAR extraction
 

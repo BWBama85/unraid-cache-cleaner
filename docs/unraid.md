@@ -163,7 +163,9 @@ section for the full contract. On Unraid specifically:
    Plex-reported path. An unmapped path is refused, never guessed.
 5. **Audit trail + history page.** Every real delete is recorded in the SQLite
    state DB under `/config`; the read-only **`/actions`** page (linked from the
-   report) lists what the UI removed, newest first.
+   report) lists what the UI removed, newest first. It is LAN-readable by default;
+   set `WEB_ACTION_HISTORY_AUTH=true` to require your reclaim token/unlock session to
+   view it (and `/api/actions`), since it exposes previously-deleted paths.
 6. **Reverse proxy? Set the allowed origin.** The template binds `0.0.0.0`, so the
    reclaim *form* requires a same-origin request (a cross-site form POST is refused
    even without an `Origin` header) — direct LAN access to `http://<tower>:8080`

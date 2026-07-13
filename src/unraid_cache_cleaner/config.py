@@ -213,6 +213,19 @@ class Config:
     # credentials and break the two-step confirm). Appended with a default so existing
     # positional Config(...) calls and from_env keep working.
     web_action_session_seconds: int = 3600
+    # Opt-in auth for the read-only reclaim *action history* views ``/actions`` +
+    # ``/api/actions`` (#82). Default False keeps today's behavior: the history is
+    # LAN-readable under the Host-allow-list model (#67), like ``/`` and ``/api/report``.
+    # When True, those two routes require the same credential a reclaim does — the shared
+    # ``WEB_ACTION_TOKEN`` (as an ``X-Action-Token`` header on ``/api/actions``) or a valid
+    # unlock session (the ``ucc_session`` cookie a browser earns via the token->preview
+    # flow). It gates *only* the audit history (which exposes previously-deleted absolute
+    # paths + sizes); ``/`` and ``/api/report`` are unchanged. Fail-closed: with the gate
+    # on but no ``WEB_ACTION_TOKEN`` set (or actions disabled), there is no credential to
+    # accept, so the history is *denied*, never silently reopened — ``build_server`` warns
+    # about the lockout at startup. Appended with a default so existing positional
+    # Config(...) calls and from_env keep working.
+    web_action_history_auth: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -273,6 +286,7 @@ class Config:
             web_allowed_origins=_parse_str_list(os.getenv("WEB_ALLOWED_ORIGINS")),
             web_allowed_hosts=_parse_str_list(os.getenv("WEB_ALLOWED_HOSTS")),
             web_action_session_seconds=_parse_int(os.getenv("WEB_ACTION_SESSION_SECONDS"), 3600),
+            web_action_history_auth=_parse_bool(os.getenv("WEB_ACTION_HISTORY_AUTH"), False),
         )
         config.ensure_directories()
         return config
