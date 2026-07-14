@@ -178,6 +178,7 @@ class ReportViewerTests(unittest.TestCase):
         payload["hash_enabled"] = True
         payload["hash_mode"] = "full"
         payload["totals"]["hash_confirmed_count"] = 0
+        payload["totals"]["hash_sample_match_count"] = 2
         payload["totals"]["hash_unhashable_count"] = 0
         payload["totals"]["different_content_count"] = 1
         payload["groups"].append(
@@ -211,9 +212,10 @@ class ReportViewerTests(unittest.TestCase):
         # Surfaced under the different-content review section.
         self.assertIn("different content (hash mismatch, excluded)", html)
         self.assertIn("Hash Differ", html)
-        # Hash totals tiles render.
+        # Hash totals tiles render, including the partial-mode Sample-match tile.
         self.assertIn("Different content (excluded)", html)
         self.assertIn("Hash-confirmed", html)
+        self.assertIn("Sample-match", html)
         # Excluded from the reclaim form: its parts are never a reclaim checkbox target.
         self.assertNotIn("300:51", html)
         self.assertNotIn("300:61", html)

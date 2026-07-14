@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -167,6 +168,18 @@ class HashCopyTests(unittest.TestCase):
             result = hasher._hash_copy((_copy(1, "a.mkv", 999),), fx.path_map, hasher.HASH_FULL)
             self.assertIsNone(result.digest)
             self.assertIn("size changed", result.error)
+
+    def test_short_read_is_unhashable(self) -> None:
+        # A file that passes the size check but yields fewer bytes than expected
+        # (truncated/replaced mid-hash) must fail closed as unhashable, never return
+        # a digest over the prefix. Force it by planning a region past EOF.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            with mock.patch.object(hasher, "hash_regions", return_value=((0, 200),)):
+                result = hasher._hash_copy((_copy(1, "a.mkv", 100),), fx.path_map, hasher.HASH_FULL)
+            self.assertIsNone(result.digest)
+            self.assertIn("short read", result.error)
 
     def test_symlinked_parent_escape_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

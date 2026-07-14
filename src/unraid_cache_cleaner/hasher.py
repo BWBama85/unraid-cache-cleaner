@@ -161,7 +161,18 @@ def _hash_copy(
                     while remaining > 0:
                         chunk = handle.read(min(_READ_BLOCK, remaining))
                         if not chunk:
-                            break
+                            # EOF before the expected bytes: the file shrank/changed
+                            # between the size check and this read (a copy still being
+                            # written or replaced). Fail closed as unhashable rather
+                            # than return a digest over the prefix, which would risk a
+                            # false confirmed/different verdict on a partial read.
+                            return CopyHash(
+                                topology=topology,
+                                digest=None,
+                                error=(
+                                    f"file changed during hashing (short read): {container_path}"
+                                ),
+                            )
                         digest.update(chunk)
                         remaining -= len(chunk)
         except OSError as exc:

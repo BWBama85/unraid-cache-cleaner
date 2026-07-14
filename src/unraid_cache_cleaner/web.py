@@ -1071,6 +1071,10 @@ def _render_totals(totals: dict, arr_enabled: bool) -> str:
     # report keeps the original four tiles unchanged.
     if "hash_confirmed_count" in totals:
         tiles.append(("Hash-confirmed", totals.get("hash_confirmed_count", 0)))
+        # Sample-match is a successful partial-mode result; without its own tile a
+        # partial run with matching samples would show no successful hash outcome at
+        # all, reading as size-only output unless the operator opens the raw JSON.
+        tiles.append(("Sample-match", totals.get("hash_sample_match_count", 0)))
         tiles.append(("Different content (excluded)", totals.get("different_content_count", 0)))
         tiles.append(("Unhashable (size-only)", totals.get("hash_unhashable_count", 0)))
     if arr_enabled:
