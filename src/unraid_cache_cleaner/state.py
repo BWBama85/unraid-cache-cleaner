@@ -291,6 +291,13 @@ class HashCache:
     def _prune(self, conn: sqlite3.Connection) -> None:
         if self._max_rows <= 0:
             return
+        # ``updated_at`` is unindexed, so the eviction sort is O(n log n) over the whole
+        # table; skip it entirely on the common path where the table is under the cap
+        # (a cheap COUNT, no sort) and only pay the sort when there is actually
+        # something to evict.
+        count = conn.execute("SELECT COUNT(*) FROM hash_cache").fetchone()[0]
+        if count <= self._max_rows:
+            return
         conn.execute(
             "DELETE FROM hash_cache WHERE rowid NOT IN "
             "(SELECT rowid FROM hash_cache ORDER BY updated_at DESC, rowid DESC LIMIT ?)",

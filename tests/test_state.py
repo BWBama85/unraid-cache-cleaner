@@ -646,6 +646,17 @@ class HashCacheTests(unittest.TestCase):
         conn.close()
         self.assertEqual(count, 5)
 
+    def test_under_cap_keeps_all_rows(self) -> None:
+        # The prune guard must not evict anything while under the cap.
+        cache = HashCache(self.path, max_rows=5)
+        for i in range(3):
+            cache.put(f"k{i}", "full", "fp", f"d{i}")
+        cache.close()
+        reopened = HashCache(self.path)
+        for i in range(3):
+            self.assertEqual(reopened.get(f"k{i}", "full", "fp"), f"d{i}")
+        reopened.close()
+
     def test_corrupt_db_disables_cache_fail_open(self) -> None:
         # A non-SQLite file: opening must not raise; the cache degrades to a no-op so
         # the report falls back to live hashing (never a wrong verdict).

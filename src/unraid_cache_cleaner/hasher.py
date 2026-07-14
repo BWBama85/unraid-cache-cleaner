@@ -183,8 +183,14 @@ def _hash_copy(
     resolved: List[Tuple[Path, int, int]] = []  # (container_path, size, mtime_ns)
     for part in parts:
         container_path, mtime_ns, error = _resolve_part(part.file, path_map, part.size)
-        if error is not None or container_path is None or mtime_ns is None:
-            return CopyHash(topology=topology, digest=None, error=error)
+        if container_path is None or mtime_ns is None:
+            # _resolve_part always pairs a failed resolution with a reason; fall back to
+            # a generic one so a warning is never formatted over a bare ``None``.
+            return CopyHash(
+                topology=topology,
+                digest=None,
+                error=error or f"could not resolve part: {part.file}",
+            )
         resolved.append((container_path, part.size, mtime_ns))
 
     copy_key = "\x00".join(str(path) for path, _size, _mtime in resolved)
