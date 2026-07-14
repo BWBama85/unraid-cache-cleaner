@@ -14,7 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from unraid_cache_cleaner import arr, dedupe
 from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.config import Config
-from unraid_cache_cleaner.models import PlexSection
+from unraid_cache_cleaner.models import (
+    DuplicateGroup,
+    DuplicateReport,
+    MediaCopy,
+    PlexSection,
+)
 from unraid_cache_cleaner.plex import build_duplicate_group
 from unraid_cache_cleaner.plex_report import PlexDuplicateReporter
 
@@ -1234,6 +1239,28 @@ class HashPassIntegrationTests(unittest.TestCase):
             # Excluded from the reclaimable section, surfaced under the review section.
             table = reporter.render_table(report)
             self.assertIn("different content (hash mismatch, excluded)", table)
+
+    def test_different_content_excluded_from_arr_tracked_count(self) -> None:
+        # Regression: a different-content group's tracked reclaim candidate must NOT
+        # be counted as arr-tracked reclaimable (it is excluded from reclaimable).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            keeper = MediaCopy(part_id=1, file=Path("/plex/a.mkv"), size=100, resolution="1080", media_id=1)
+            tracked = MediaCopy(
+                part_id=2, file=Path("/plex/b.mkv"), size=100, resolution="1080", media_id=2,
+                association="tracked", arr_tracked="radarr",
+            )
+            group = DuplicateGroup(
+                rating_key="1", kind="movie", title="Differ",
+                copies=(keeper, tracked), classification="different-content",
+                hash_status="different", keeper=keeper, reclaimable_bytes=0,
+            )
+            report = DuplicateReport(
+                generated_at=1.0, groups=[group], arr_enabled=True, hash_enabled=True
+            )
+            reporter = _reporter(tmp, FakePlexClient([], {}))
+            reporter._begin_render(report)
+            self.assertEqual(reporter._arr_reclaimable_tracked_count(report), 0)
 
     def test_unhashable_stays_size_only_with_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

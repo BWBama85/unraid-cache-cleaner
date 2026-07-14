@@ -305,11 +305,12 @@ class PlexDuplicateReporter:
     ) -> dict:
         pairs = self._ranked_pairs(group)
 
-        if group.classification == dedupe.MISMATCH:
-            # A mismatch group's copies are the *physical* files (stacks NOT
+        if not dedupe.is_reclaimable(group.classification):
+            # A protected group's copies are the *physical* files (stacks NOT
             # merged) so an operator reviewing the conflict sees each conflicting
-            # path and its true size, not one stack-merged copy at the summed
-            # size (#25). Each physical copy is its own single part.
+            # path and its true size, not one stack-merged copy at the summed size:
+            # a mismatch (#25) or a hash-proven different-content group (#9), which
+            # the CLI table also renders per physical file. Each is its own part.
             copies = [
                 _copy_json(copy, [copy], include_arr=include_arr)
                 for copy in dedupe.rank_physical_copies(group)
@@ -402,11 +403,15 @@ class PlexDuplicateReporter:
         return self._ranked_pairs(group)[1:]
 
     def _arr_reclaimable_tracked_count(self, report: DuplicateReport) -> int:
-        """Count reclaim-candidate copies an *arr tracks (delete ⇒ re-download)."""
+        """Count reclaim-candidate copies an *arr tracks (delete ⇒ re-download).
+
+        Skips every protected group (mismatch *and* hash-proven different-content),
+        so the count matches the reclaimable/arr-tracked sections — a downgraded
+        different-content group is never counted as arr-tracked reclaimable."""
 
         count = 0
         for group in report.groups:
-            if group.classification == dedupe.MISMATCH:
+            if not dedupe.is_reclaimable(group.classification):
                 continue
             count += sum(
                 1 for copy in self._reclaim_candidates(group) if copy.association == arr.TRACKED
