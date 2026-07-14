@@ -239,6 +239,32 @@ class ConfigTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {**base_env, "HASH_MODE": "full"}, clear=True):
                 self.assertEqual(Config.from_env().hash_mode, "full")
 
+    def test_hash_cache_from_env(self) -> None:
+        # #92: the persistent hash cache is on by default with a /config sidecar path;
+        # HASH_CACHE=false disables it and HASH_CACHE_PATH overrides the location.
+        with tempfile.TemporaryDirectory() as tempdir:
+            base_env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, base_env, clear=True):
+                config = Config.from_env()
+                self.assertTrue(config.hash_cache_enabled)  # default
+                self.assertEqual(config.hash_cache_path, Path("/config/hash-cache.sqlite3"))
+            override = {
+                **base_env,
+                "HASH_CACHE": "false",
+                "HASH_CACHE_PATH": str(Path(tempdir) / "hc" / "cache.sqlite3"),
+            }
+            with mock.patch.dict(os.environ, override, clear=True):
+                config = Config.from_env()
+                self.assertFalse(config.hash_cache_enabled)
+                self.assertEqual(config.hash_cache_path, Path(tempdir) / "hc" / "cache.sqlite3")
+                # ensure_directories must NOT create the cache sidecar dir (off = no I/O);
+                # it is created lazily by HashCache only when the hash pass runs.
+                self.assertFalse((Path(tempdir) / "hc").exists())
+
     def test_web_defaults_are_fail_closed(self) -> None:
         # #34: the web viewer is opt-in for `service` (web_enabled=False) and
         # binds to loopback by default (fail-closed); exposing it on the LAN is an

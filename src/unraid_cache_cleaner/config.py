@@ -284,6 +284,16 @@ class Config:
     # Appended with a default so existing positional Config(...) calls and from_env
     # keep working.
     hash_mode: str = "off"
+    # Persistent hash cache for the content-hash pass (#92). When hashing is on
+    # (``hash_mode`` != off), a copy's digest is cached keyed by each part's
+    # size + mtime, so a second report run reuses it instead of re-reading the media.
+    # Fail-open: a corrupt/locked/unwritable cache degrades to live hashing, never a
+    # wrong verdict. Inert when ``hash_mode`` == off — no DB is opened and the sidecar
+    # directory is created lazily by the cache (not ``ensure_directories``), preserving
+    # the ``HASH_MODE=off`` = no-I/O contract. Appended with defaults so existing
+    # positional Config(...) calls and from_env keep working.
+    hash_cache_enabled: bool = True
+    hash_cache_path: Path = Path("/config/hash-cache.sqlite3")
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -348,6 +358,10 @@ class Config:
             web_action_report_auth=_parse_bool(os.getenv("WEB_ACTION_REPORT_AUTH"), False),
             web_action_inline_script=_parse_bool(os.getenv("WEB_ACTION_INLINE_SCRIPT"), False),
             hash_mode=_parse_hash_mode(os.getenv("HASH_MODE"), "off"),
+            hash_cache_enabled=_parse_bool(os.getenv("HASH_CACHE"), True),
+            hash_cache_path=Path(
+                os.getenv("HASH_CACHE_PATH", "/config/hash-cache.sqlite3")
+            ),
         )
         config.ensure_directories()
         return config

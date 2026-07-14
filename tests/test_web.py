@@ -932,5 +932,62 @@ class BindFailureTests(unittest.TestCase):
             first.shutdown()
 
 
+class HashBadgeTests(unittest.TestCase):
+    """Per-row hash-status badge on reclaimable rows (#94)."""
+
+    def _reclaimable_payload(self, *, hash_status=None, hash_enabled=True) -> dict:
+        payload = _payload()
+        # Reuse the well-formed reclaimable group; make it an identical (still
+        # reclaimable) group so a hash badge is semantically valid.
+        group = payload["groups"][0]
+        group["classification"] = "identical"
+        if hash_status is not None:
+            group["hash_status"] = hash_status
+        payload["hash_enabled"] = hash_enabled
+        return payload
+
+    def test_confirmed_badge_rendered(self) -> None:
+        html = render_report_html(self._reclaimable_payload(hash_status="confirmed"))
+        self.assertIn('class="tag hash-confirmed"', html)
+        self.assertIn("hash: confirmed", html)
+
+    def test_sample_match_badge_rendered(self) -> None:
+        html = render_report_html(self._reclaimable_payload(hash_status="sample-match"))
+        self.assertIn('class="tag hash-sample"', html)
+        self.assertIn("hash: sample-match", html)
+
+    def test_unhashable_badge_rendered(self) -> None:
+        html = render_report_html(self._reclaimable_payload(hash_status="unhashable"))
+        self.assertIn('class="tag hash-unhashable"', html)
+        self.assertIn("hash: unhashable", html)
+
+    def test_off_report_has_no_badge(self) -> None:
+        # No hash_status key at all (HASH_MODE=off): the reclaimable rows render exactly
+        # as before — no badge markup anywhere.
+        payload = self._reclaimable_payload(hash_status=None, hash_enabled=False)
+        self.assertNotIn("hash_status", payload["groups"][0])
+        html = render_report_html(payload)
+        self.assertNotIn('class="tag hash-', html)
+        self.assertNotIn("hash:", html)
+
+    def test_unknown_status_renders_no_badge(self) -> None:
+        html = render_report_html(self._reclaimable_payload(hash_status="bogus"))
+        self.assertNotIn('class="tag hash-', html)
+
+    def test_empty_status_renders_no_badge(self) -> None:
+        # An upgrade group carries hash_status="" (never touched by the pass): no badge.
+        html = render_report_html(self._reclaimable_payload(hash_status=""))
+        self.assertNotIn('class="tag hash-', html)
+
+    def test_badge_does_not_disturb_reclaim_form(self) -> None:
+        # With actions enabled the badge coexists with the per-copy checkboxes; neither
+        # the badge nor the form loses anything.
+        html = render_report_html(
+            self._reclaimable_payload(hash_status="confirmed"), actions_enabled=True
+        )
+        self.assertIn('class="tag hash-confirmed"', html)
+        self.assertIn('type="checkbox"', html)
+
+
 if __name__ == "__main__":
     unittest.main()

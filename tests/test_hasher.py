@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner import dedupe, hasher
 from unraid_cache_cleaner.models import DuplicateGroup, MediaCopy
+from unraid_cache_cleaner.state import HashCache
 
 _MIB = 1024 * 1024
 
@@ -352,6 +353,132 @@ class ConfirmGroupsTests(unittest.TestCase):
             group = _identical_group(_copy(1, "a.mkv", 0), _copy(2, "b.mkv", 0))
             out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
             self.assertEqual(out[0].hash_status, hasher.CONFIRMED)
+
+
+class CacheIntegrationTests(unittest.TestCase):
+    """The persistent hash cache (#92) wired through confirm_groups.
+
+    Reads of media during ``confirm_groups`` go through the builtin ``open`` and nowhere
+    else, so counting ``open`` calls is a direct, root-proof proof of whether a copy was
+    re-read or served from cache (unlike a chmod-based read denial, which root bypasses).
+    """
+
+    def _confirm_counting_opens(self, groups, path_map, mode, cache):
+        opened: list[str] = []
+        real_open = open
+
+        def counting_open(file, *args, **kwargs):
+            opened.append(str(file))
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch("builtins.open", counting_open):
+            out, _ = hasher.confirm_groups(groups, path_map, mode, cache=cache)
+        return out, opened
+
+    def test_second_run_reuses_cache_and_skips_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            cache_path = Path(tmpdir) / "hc.sqlite3"
+            group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
+
+            c1 = HashCache(cache_path)
+            out1, opened1 = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_FULL, c1)
+            c1.close()
+            self.assertEqual(out1[0].hash_status, hasher.CONFIRMED)
+            self.assertTrue(opened1)  # cold run reads the media
+
+            # A fresh cache instance models a later report run: same files, all served
+            # from cache, so no media file is opened at all.
+            c2 = HashCache(cache_path)
+            out2, opened2 = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_FULL, c2)
+            c2.close()
+            self.assertEqual(out2[0].hash_status, hasher.CONFIRMED)
+            self.assertEqual(opened2, [])
+
+    def test_mtime_change_invalidates_and_rereads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            cache_path = Path(tmpdir) / "hc.sqlite3"
+            group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
+
+            c1 = HashCache(cache_path)
+            hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c1)
+            c1.close()
+
+            # a.mkv keeps its size and bytes but gets a new mtime — an overwrite could
+            # have happened, so its cached digest must be discarded and the file re-read;
+            # b.mkv is untouched and stays a cache hit.
+            new_ns = 1_000_000_000_000_000_000
+            os.utime(fx.root / "a.mkv", ns=(new_ns, new_ns))
+            c2 = HashCache(cache_path)
+            out, opened = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_FULL, c2)
+            c2.close()
+            self.assertEqual(out[0].hash_status, hasher.CONFIRMED)
+            self.assertIn(str(fx.root / "a.mkv"), opened)      # changed part re-read
+            self.assertNotIn(str(fx.root / "b.mkv"), opened)   # unchanged part cached
+
+    def test_full_then_partial_does_not_reuse_full_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            cache_path = Path(tmpdir) / "hc.sqlite3"
+            group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
+
+            c1 = HashCache(cache_path)
+            hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c1)
+            c1.close()
+
+            # A partial run has a distinct mode key: it must not be served the full
+            # digest, so it re-reads and reports sample-match (never full's confirmed).
+            c2 = HashCache(cache_path)
+            out, opened = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_PARTIAL, c2)
+            c2.close()
+            self.assertEqual(out[0].hash_status, hasher.SAMPLE_MATCH)
+            self.assertTrue(opened)
+
+    def test_disabled_cache_still_hashes_live(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            corrupt = Path(tmpdir) / "hc.sqlite3"
+            corrupt.write_bytes(b"not a database" * 5)
+            cache = HashCache(corrupt)
+            self.assertTrue(cache._disabled)
+            group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
+            out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=cache)
+            cache.close()
+            self.assertEqual(out[0].hash_status, hasher.CONFIRMED)
+
+    def test_cache_hit_still_enforces_safety(self) -> None:
+        # Even with a warm cache, resolution (path map, regular-file, symlink,
+        # root-escape, size) runs first: a copy swapped for a symlink is refused as
+        # unhashable, never served a cache-confirmed verdict on an unsafe path.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            cache_path = Path(tmpdir) / "hc.sqlite3"
+            group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
+            c1 = HashCache(cache_path)
+            out1, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c1)
+            c1.close()
+            self.assertEqual(out1[0].hash_status, hasher.CONFIRMED)
+
+            outside = Path(tmpdir) / "outside"
+            outside.mkdir()
+            (outside / "evil.mkv").write_bytes(b"Z" * 100)  # same size as expected
+            (fx.root / "a.mkv").unlink()
+            os.symlink(outside / "evil.mkv", fx.root / "a.mkv")
+            c2 = HashCache(cache_path)
+            out2, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c2)
+            c2.close()
+            self.assertEqual(out2[0].hash_status, hasher.UNHASHABLE)
 
 
 if __name__ == "__main__":

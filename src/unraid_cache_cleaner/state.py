@@ -6,6 +6,7 @@ import logging
 import secrets
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -63,6 +64,16 @@ _ACTION_HISTORY_MAX = 1000
 #: A single media path accrues at most a handful of reclaim/reconcile rows, so this
 #: bounds a pathological case without limiting any real trail.
 _RECONCILE_EVIDENCE_LIMIT = 50
+
+#: The content-hash cache (#92) is a cache, not a source of truth: never let a lock
+#: on it stall a read-only report for the store's 30s. A brief wait, then fail open.
+_HASH_CACHE_BUSY_TIMEOUT_SECONDS = 5.0
+
+#: Bound on the hash cache's row count. ``ON CONFLICT`` already caps a live copy to
+#: one row per mode, so the only unbounded source is copies that vanish from the
+#: library entirely; the least-recently-updated rows past this cap are pruned on
+#: close. Generous enough never to evict a real library's working set.
+_HASH_CACHE_MAX_ROWS = 500_000
 
 
 class WebActionHistoryReader:
@@ -134,6 +145,161 @@ class WebActionHistoryReader:
             return None
         self._conn = conn
         return conn
+
+
+class HashCache:
+    """Persistent, fail-open cache of content-hash digests for the Plex report (#92).
+
+    Keyed by a logical copy's ordered part identities plus a mode/algorithm
+    discriminator, so ``HASH_MODE=full``/``partial`` no longer re-reads every media
+    file on every report run. Speed is never traded for a wrong verdict:
+
+    * A hit returns a previously computed digest **only** when the copy's full
+      fingerprint (each part's ``size`` and ``mtime_ns``) still matches — any drift is
+      a miss, so a changed file is re-hashed. The hasher still repeats every safety
+      check (path map, regular-file, symlink, root-escape, on-disk size) on a hit; the
+      cache elides only the byte read, never the safety re-validation.
+    * The ``mode_key`` folds in the digest algorithm and sampled-region size (see
+      :func:`hasher._cache_mode_key`), so a future tuning of either can never serve a
+      digest computed under the old scheme, and a ``full`` digest is never served for a
+      ``partial`` request or vice-versa (distinct ``mode_key`` rows).
+    * Every failure is swallowed and disables the cache for the rest of the run
+      (fail-open): a corrupt, locked, or unwritable DB degrades to live hashing — never
+      a wrong verdict, and never a repeated multi-second lock wait.
+
+    Opened only when the hash pass actually runs (never for ``HASH_MODE=off``), on its
+    own sidecar DB so it never touches the cleaner's ``state.sqlite3`` schema. Its
+    parent directory is created lazily here, not in :meth:`Config.ensure_directories`,
+    to keep ``HASH_MODE=off`` free of all cache I/O. Writes are buffered and flushed in
+    one transaction at :meth:`close`; a single cache instance is created, used, and
+    closed within one report generation on one thread.
+    """
+
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        busy_timeout_seconds: float = _HASH_CACHE_BUSY_TIMEOUT_SECONDS,
+        max_rows: int = _HASH_CACHE_MAX_ROWS,
+    ) -> None:
+        self._db_path = db_path
+        self._max_rows = max_rows
+        self._pending: dict[tuple[str, str], tuple[str, str]] = {}
+        self._disabled = False
+        self._conn: Optional[sqlite3.Connection] = None
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(db_path, timeout=busy_timeout_seconds)
+            conn.row_factory = sqlite3.Row
+            # WAL keeps a concurrent second generation (rare, but possible: a CLI
+            # plex-duplicates alongside a web rescan) from blocking a read; if the
+            # mount rejects WAL, SQLite silently keeps the default journal mode.
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:  # pragma: no cover - mount-dependent
+                pass
+            with conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS hash_cache (
+                        copy_key TEXT NOT NULL,
+                        mode_key TEXT NOT NULL,
+                        fingerprint TEXT NOT NULL,
+                        digest TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (copy_key, mode_key)
+                    )
+                    """
+                )
+        except (sqlite3.DatabaseError, OSError) as exc:
+            LOGGER.warning("hash cache disabled (open failed) at %s: %s", db_path, exc)
+            self._disabled = True
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.DatabaseError:  # pragma: no cover - defensive
+                    pass
+            return
+        self._conn = conn
+
+    def get(self, copy_key: str, mode_key: str, fingerprint: str) -> Optional[str]:
+        """Return the cached digest for this copy+mode, or ``None`` on any miss.
+
+        A miss is: cache disabled, no row, or a row whose stored fingerprint no longer
+        matches (size/mtime drift) — the caller then hashes live. A read failure
+        disables the cache for the rest of the run.
+        """
+
+        if self._disabled or self._conn is None:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT fingerprint, digest FROM hash_cache WHERE copy_key = ? AND mode_key = ?",
+                (copy_key, mode_key),
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._disable("read failed", exc)
+            return None
+        if row is None or row["fingerprint"] != fingerprint:
+            return None
+        return row["digest"]
+
+    def put(self, copy_key: str, mode_key: str, fingerprint: str, digest: str) -> None:
+        """Buffer a freshly computed digest; persisted in one batch at :meth:`close`."""
+
+        if self._disabled:
+            return
+        self._pending[(copy_key, mode_key)] = (fingerprint, digest)
+
+    def close(self) -> None:
+        """Flush buffered digests in one transaction, prune to the cap, and close.
+
+        Idempotent and fail-open: a flush failure is logged and the buffered writes are
+        simply dropped (the next run recomputes them) — it never propagates."""
+
+        conn = self._conn
+        self._conn = None
+        if conn is None:
+            self._pending.clear()
+            return
+        try:
+            if self._pending and not self._disabled:
+                now = time.time()
+                conn.executemany(
+                    """
+                    INSERT INTO hash_cache (copy_key, mode_key, fingerprint, digest, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(copy_key, mode_key) DO UPDATE SET
+                        fingerprint = excluded.fingerprint,
+                        digest = excluded.digest,
+                        updated_at = excluded.updated_at
+                    """,
+                    [(ck, mk, fp, dg, now) for (ck, mk), (fp, dg) in self._pending.items()],
+                )
+                self._prune(conn)
+                conn.commit()
+        except sqlite3.DatabaseError as exc:
+            LOGGER.warning("hash cache flush failed at %s: %s", self._db_path, exc)
+        finally:
+            self._pending.clear()
+            try:
+                conn.close()
+            except sqlite3.DatabaseError:  # pragma: no cover - defensive
+                pass
+
+    def _prune(self, conn: sqlite3.Connection) -> None:
+        if self._max_rows <= 0:
+            return
+        conn.execute(
+            "DELETE FROM hash_cache WHERE rowid NOT IN "
+            "(SELECT rowid FROM hash_cache ORDER BY updated_at DESC, rowid DESC LIMIT ?)",
+            (self._max_rows,),
+        )
+
+    def _disable(self, why: str, exc: Exception) -> None:
+        LOGGER.warning("hash cache disabled (%s) at %s: %s", why, self._db_path, exc)
+        self._disabled = True
 
 
 class StateStore:
