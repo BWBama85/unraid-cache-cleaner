@@ -14,7 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from unraid_cache_cleaner import arr, dedupe
 from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.config import Config
-from unraid_cache_cleaner.models import PlexSection
+from unraid_cache_cleaner.models import (
+    DuplicateGroup,
+    DuplicateReport,
+    MediaCopy,
+    PlexSection,
+)
 from unraid_cache_cleaner.plex import build_duplicate_group
 from unraid_cache_cleaner.plex_report import PlexDuplicateReporter
 
@@ -1129,6 +1134,155 @@ class RankOnceTests(unittest.TestCase):
             self.assertEqual(alpha_files, {"a.4k.mkv", "a.1080.mkv"})
             self.assertEqual(beta_files, {"b.4k.mkv", "b.1080.mkv"})
             self.assertEqual(groups["Beta"]["reclaimable_bytes"], 4 * GiB)
+
+
+# --------------------------------------------------------------------------- #
+# Content-hash confirmation pass integration (#9)                             #
+# --------------------------------------------------------------------------- #
+
+class HashPassIntegrationTests(unittest.TestCase):
+    """End-to-end: the reporter runs the hash pass and surfaces it in JSON + table."""
+
+    def _client(self, *files_and_sizes) -> FakePlexClient:
+        # One movie with two same-size single-part copies under /plex, so it
+        # classifies ``identical`` and the hash pass decides its fate.
+        medias = [
+            _media(i + 1, "1080", 1000, [_part(10 + i, f"/plex/{name}", size)])
+            for i, (name, size) in enumerate(files_and_sizes)
+        ]
+        movie = _movie("100", "Dup", medias)
+        return FakePlexClient(
+            [PlexSection(key="1", type="movie", title="Movies")],
+            {("1", 1): [movie]},
+        )
+
+    def _hash_config(self, tmp: Path, media: Path, mode: str) -> Config:
+        return _config(
+            tmp,
+            hash_mode=mode,
+            web_media_path_map=((Path("/plex"), media),),
+        )
+
+    def _run(self, tmp: Path, media: Path, mode: str, *files):
+        for name, data in files:
+            (media / name).write_bytes(data)
+        client = self._client(*[(name, len(data)) for name, data in files])
+        reporter = PlexDuplicateReporter(
+            self._hash_config(tmp, media, mode), client, clock=lambda: 1234.5
+        )
+        report = reporter.generate()
+        return reporter, report
+
+    def test_off_keeps_report_shape_and_reads_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            # Files intentionally NOT written: an ``off`` run must not touch them.
+            client = self._client(("a.mkv", 100), ("b.mkv", 100))
+            reporter = PlexDuplicateReporter(
+                self._hash_config(tmp, media, "off"), client, clock=lambda: 1234.5
+            )
+            payload = reporter.build_payload(reporter.generate())
+            self.assertNotIn("hash_enabled", payload)
+            self.assertNotIn("hash_mode", payload)
+            self.assertNotIn("hash_confirmed_count", payload["totals"])
+            self.assertNotIn("different_content_count", payload["totals"])
+            for group in payload["groups"]:
+                self.assertNotIn("hash_status", group)
+
+    def test_full_confirms_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run(
+                tmp, media, "full", ("a.mkv", b"X" * 100), ("b.mkv", b"X" * 100)
+            )
+            payload = reporter.build_payload(report)
+            self.assertTrue(payload["hash_enabled"])
+            self.assertEqual(payload["hash_mode"], "full")
+            self.assertEqual(payload["totals"]["hash_confirmed_count"], 1)
+            self.assertEqual(payload["totals"]["different_content_count"], 0)
+            group = payload["groups"][0]
+            self.assertEqual(group["classification"], "identical")
+            self.assertEqual(group["hash_status"], "confirmed")
+            self.assertGreater(group["reclaimable_bytes"], 0)
+            self.assertIn("[hash:confirmed]", reporter.render_table(report))
+
+    def test_partial_reports_sample_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run(
+                tmp, media, "partial", ("a.mkv", b"X" * 100), ("b.mkv", b"X" * 100)
+            )
+            group = reporter.build_payload(report)["groups"][0]
+            self.assertEqual(group["hash_status"], "sample-match")
+
+    def test_different_content_excluded_and_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run(
+                tmp, media, "full", ("a.mkv", b"X" * 100), ("b.mkv", b"Y" * 100)
+            )
+            payload = reporter.build_payload(report)
+            group = payload["groups"][0]
+            self.assertEqual(group["classification"], "different-content")
+            self.assertEqual(group["hash_status"], "different")
+            self.assertEqual(group["reclaimable_bytes"], 0)
+            self.assertEqual(payload["totals"]["different_content_count"], 1)
+            self.assertEqual(payload["totals"]["reclaimable_bytes"], 0)
+            # Excluded from the reclaimable section, surfaced under the review section.
+            table = reporter.render_table(report)
+            self.assertIn("different content (hash mismatch, excluded)", table)
+
+    def test_different_content_excluded_from_arr_tracked_count(self) -> None:
+        # Regression: a different-content group's tracked reclaim candidate must NOT
+        # be counted as arr-tracked reclaimable (it is excluded from reclaimable).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            keeper = MediaCopy(part_id=1, file=Path("/plex/a.mkv"), size=100, resolution="1080", media_id=1)
+            tracked = MediaCopy(
+                part_id=2, file=Path("/plex/b.mkv"), size=100, resolution="1080", media_id=2,
+                association="tracked", arr_tracked="radarr",
+            )
+            group = DuplicateGroup(
+                rating_key="1", kind="movie", title="Differ",
+                copies=(keeper, tracked), classification="different-content",
+                hash_status="different", keeper=keeper, reclaimable_bytes=0,
+            )
+            report = DuplicateReport(
+                generated_at=1.0, groups=[group], arr_enabled=True, hash_enabled=True
+            )
+            reporter = _reporter(tmp, FakePlexClient([], {}))
+            reporter._begin_render(report)
+            self.assertEqual(reporter._arr_reclaimable_tracked_count(report), 0)
+
+    def test_unhashable_stays_size_only_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            # Only a.mkv written; b.mkv missing => unhashable.
+            reporter, report = self._run(tmp, media, "full", ("a.mkv", b"X" * 100))
+            # Re-run with b.mkv referenced but absent: build a two-copy client manually.
+            (media / "a.mkv").write_bytes(b"X" * 100)
+            client = self._client(("a.mkv", 100), ("b.mkv", 100))
+            reporter = PlexDuplicateReporter(
+                self._hash_config(tmp, media, "full"), client, clock=lambda: 1234.5
+            )
+            report = reporter.generate()
+            payload = reporter.build_payload(report)
+            group = payload["groups"][0]
+            self.assertEqual(group["classification"], "identical")
+            self.assertEqual(group["hash_status"], "unhashable")
+            self.assertGreater(group["reclaimable_bytes"], 0)  # unchanged, size-only
+            self.assertEqual(payload["totals"]["hash_unhashable_count"], 1)
+            self.assertTrue(any("unhashable" in w for w in report.warnings))
 
 
 if __name__ == "__main__":

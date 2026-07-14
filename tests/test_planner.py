@@ -13,10 +13,41 @@ from unraid_cache_cleaner.models import TorrentRecord
 from unraid_cache_cleaner.planner import (
     build_protection_plan,
     find_orphan_candidates,
+    map_media_path,
     normalize_path,
     with_protected_files,
 )
 from unraid_cache_cleaner.scanner import scan_filesystem
+
+
+class MapMediaPathTests(unittest.TestCase):
+    """The shared Plex->container mapper reused by the reclaim path and hash pass."""
+
+    def test_maps_under_prefix(self) -> None:
+        path_map = ((Path("/mnt/user/Media"), Path("/media")),)
+        result = map_media_path(Path("/mnt/user/Media/Movies/x.mkv"), path_map)
+        self.assertEqual(result, (Path("/media/Movies/x.mkv"), Path("/media")))
+
+    def test_unmapped_returns_none(self) -> None:
+        path_map = ((Path("/mnt/user/Media"), Path("/media")),)
+        self.assertIsNone(map_media_path(Path("/elsewhere/x.mkv"), path_map))
+
+    def test_component_aware_prefix_not_substring(self) -> None:
+        # /mnt/user/Media must not match /mnt/user/Media2 (a substring prefix).
+        path_map = ((Path("/mnt/user/Media"), Path("/media")),)
+        self.assertIsNone(map_media_path(Path("/mnt/user/Media2/x.mkv"), path_map))
+
+    def test_longest_prefix_wins(self) -> None:
+        path_map = (
+            (Path("/mnt/user"), Path("/all")),
+            (Path("/mnt/user/Media"), Path("/media")),
+        )
+        result = map_media_path(Path("/mnt/user/Media/x.mkv"), path_map)
+        self.assertEqual(result, (Path("/media/x.mkv"), Path("/media")))
+
+    def test_traversal_in_remainder_refused(self) -> None:
+        path_map = ((Path("/mnt/user/Media"), Path("/media")),)
+        self.assertIsNone(map_media_path(Path("/mnt/user/Media/../etc/x"), path_map))
 
 
 class PlannerTests(unittest.TestCase):

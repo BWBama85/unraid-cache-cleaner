@@ -311,6 +311,20 @@ class SafetyRefusalTests(unittest.TestCase):
         self.assertIn("mismatch", response.results[0].message)
         self.assertEqual(deleter.calls, [])
 
+    def test_refuses_different_content_group(self) -> None:
+        # #9: the content-hash pass proved these same-size copies differ byte-for-byte,
+        # so the group is ``different-content`` — never reclaimable, like a mismatch.
+        keeper = _keeper()
+        group = _group(
+            [keeper, _copy("/lib/old.mkv", 8, media_id=21, association="untracked")],
+            keeper=keeper,
+            classification="different-content",
+        )
+        response, deleter = self._run(group)
+        self.assertEqual(response.results[0].status, "refused")
+        self.assertIn("different-content", response.results[0].message)
+        self.assertEqual(deleter.calls, [])
+
     def test_refuses_unknown_association(self) -> None:
         keeper = _keeper()
         group = _group([keeper, _copy("/lib/old.mkv", 8, media_id=21, association="unknown")], keeper=keeper)

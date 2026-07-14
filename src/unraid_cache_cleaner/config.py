@@ -36,6 +36,29 @@ def _parse_int(value: Optional[str], default: int) -> int:
     return int(value)
 
 
+#: Accepted ``HASH_MODE`` values for the content-hash confirmation pass (#9).
+HASH_MODES = ("off", "partial", "full")
+
+
+def _parse_hash_mode(value: Optional[str], default: str = "off") -> str:
+    """Parse ``HASH_MODE`` into ``off`` / ``partial`` / ``full`` (fail-closed).
+
+    An unset/blank value keeps the safe default (``off``, pass skipped). An
+    unrecognized value raises rather than silently downgrading — a typo in
+    ``HASH_MODE`` should surface loudly, not quietly disable the confirmation the
+    operator asked for (mirrors ``_parse_bool``).
+    """
+
+    if value is None or value.strip() == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized not in HASH_MODES:
+        raise ValueError(
+            f"Invalid HASH_MODE value: {value!r} (expected one of {', '.join(HASH_MODES)})"
+        )
+    return normalized
+
+
 def _parse_path_list(value: Optional[str]) -> tuple[Path, ...]:
     if value is None or value.strip() == "":
         return ()
@@ -249,6 +272,18 @@ class Config:
     # submits deletes). Appended with a default so existing positional Config(...) calls and
     # from_env keep working.
     web_action_inline_script: bool = False
+    # Optional content-hash confirmation pass for the Plex duplicate report (#9).
+    # ``off`` (default) skips it entirely — the report is unchanged and no media is
+    # read. ``partial`` samples size + first/last 4 MiB per copy (constant cost
+    # regardless of file size); ``full`` streams whole files for a byte-for-byte
+    # ``hash-confirmed`` verdict. Either mode *downgrades* an ``identical`` group
+    # whose copies prove different to ``different-content`` (never reclaimable).
+    # It reads Plex-reported paths translated through :attr:`web_media_path_map`,
+    # so a hash run needs that map set and the media mounted (read-only) — an
+    # unmapped/unreadable copy is marked ``unhashable`` and never called safe.
+    # Appended with a default so existing positional Config(...) calls and from_env
+    # keep working.
+    hash_mode: str = "off"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -312,6 +347,7 @@ class Config:
             web_action_history_auth=_parse_bool(os.getenv("WEB_ACTION_HISTORY_AUTH"), False),
             web_action_report_auth=_parse_bool(os.getenv("WEB_ACTION_REPORT_AUTH"), False),
             web_action_inline_script=_parse_bool(os.getenv("WEB_ACTION_INLINE_SCRIPT"), False),
+            hash_mode=_parse_hash_mode(os.getenv("HASH_MODE"), "off"),
         )
         config.ensure_directories()
         return config

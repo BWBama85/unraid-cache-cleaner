@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 from urllib.parse import parse_qsl, urlparse
 
+from . import dedupe
 from .config import Config
 from .state import WebActionHistoryReader
 from .web_actions import (
@@ -494,8 +495,13 @@ def render_report_html(
         )
         return _page("Plex duplicate report", "".join(parts), footer_note=footer)
 
-    reclaimable = [g for g in groups if g.get("classification") != "mismatch"]
-    mismatches = [g for g in groups if g.get("classification") == "mismatch"]
+    # The reclaimable set is every group the shared predicate permits — excluding
+    # both ``mismatch`` (different titles) and, when the content-hash pass ran,
+    # ``different-content`` (hash-proven different bytes). Excluding the latter here
+    # is what keeps a downgraded group out of the reclaim form's checkboxes.
+    reclaimable = [g for g in groups if dedupe.is_reclaimable(g.get("classification", ""))]
+    mismatches = [g for g in groups if g.get("classification") == dedupe.MISMATCH]
+    different = [g for g in groups if g.get("classification") == dedupe.DIFFERENT]
 
     reclaimable_html = _render_reclaimable(reclaimable, actions_enabled=actions_enabled)
     if actions_enabled:
@@ -504,6 +510,8 @@ def render_report_html(
         )
     parts.append(reclaimable_html)
     parts.append(_render_mismatches(mismatches))
+    if different:
+        parts.append(_render_different_content(different))
     parts.append(_render_arr_tracked(reclaimable, arr_enabled))
     return _page("Plex duplicate report", "".join(parts), footer_note=footer)
 
@@ -1058,6 +1066,17 @@ def _render_totals(totals: dict, arr_enabled: bool) -> str:
         ("Reclaimable (keep smallest)", _fmt_gib(totals.get("reclaimable_bytes_keep_smallest", 0))),
         ("Mismatches (excluded)", totals.get("mismatch_count", 0)),
     ]
+    # The content-hash tallies (#9) ride only on a hashed report, so the tiles
+    # appear only when the pass ran (``hash_confirmed_count`` present) — an ``off``
+    # report keeps the original four tiles unchanged.
+    if "hash_confirmed_count" in totals:
+        tiles.append(("Hash-confirmed", totals.get("hash_confirmed_count", 0)))
+        # Sample-match is a successful partial-mode result; without its own tile a
+        # partial run with matching samples would show no successful hash outcome at
+        # all, reading as size-only output unless the operator opens the raw JSON.
+        tiles.append(("Sample-match", totals.get("hash_sample_match_count", 0)))
+        tiles.append(("Different content (excluded)", totals.get("different_content_count", 0)))
+        tiles.append(("Unhashable (size-only)", totals.get("hash_unhashable_count", 0)))
     if arr_enabled:
         tiles.append(("*arr-tracked reclaimable", totals.get("arr_tracked_reclaimable_count", 0)))
     cells = "".join(
@@ -1253,6 +1272,39 @@ def _render_mismatches(groups: List[dict]) -> str:
         + "<p class=\"sub\">Plex merged different titles under one item; a delete here "
         "would destroy a different film/episode. Check each by hand.</p>"
         "<table><thead><tr><th>Kind</th><th>Title &amp; conflicting files</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _render_different_content(groups: List[dict]) -> str:
+    """Render groups the content-hash pass (#9) proved hold different bytes.
+
+    Plex reported these as same-size copies of one item, but hashing found they are
+    not byte-identical — so they are excluded from reclaimable (never in the reclaim
+    form) and shown here for manual review, exactly like a mismatch."""
+
+    header = (
+        "<h2>Review &mdash; different content (hash mismatch, excluded) &mdash; "
+        f"{len(groups)} groups</h2>"
+    )
+    if not groups:
+        return header + '<div class="empty">None.</div>'
+    rows: List[str] = []
+    for group in sorted(groups, key=lambda g: (g.get("kind", ""), g.get("title", ""))):
+        copies = group.get("copies") or []
+        files = "".join(_file_li(c) for c in copies)
+        rows.append(
+            "<tr>"
+            f'<td>{_esc(group.get("kind", "?"))}</td>'
+            f'<td>{_esc(group.get("title", "?"))}<ul class="parts">{files}</ul></td>'
+            "</tr>"
+        )
+    return (
+        header
+        + "<p class=\"sub\">These same-size copies are <strong>not</strong> byte-for-byte "
+        "identical (content-hash pass). One is not a redundant copy of the other, so they "
+        "are excluded from reclaim &mdash; review each by hand.</p>"
+        "<table><thead><tr><th>Kind</th><th>Title &amp; differing files</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
 

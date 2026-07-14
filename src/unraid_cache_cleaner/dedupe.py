@@ -21,6 +21,28 @@ from .models import DedupeSummary, DuplicateGroup, MediaCopy, SectionSummary
 IDENTICAL = "identical"
 UPGRADE = "upgrade"
 MISMATCH = "mismatch"
+#: A group the content-hash pass (#9) proved holds different-content copies (Plex
+#: grouped same-size files that are not byte-identical). Set only by that pass, never
+#: by :func:`classify`. Treated exactly like ``mismatch`` for reclaim: never counted,
+#: never actionable.
+DIFFERENT = "different-content"
+
+#: Classifications a reclaim must never touch — the single source of truth every
+#: consumer (dedupe math, the printer, the web viewer, the web action layer) checks
+#: so a new protected class can't slip through as "safe" anywhere.
+PROTECTED_CLASSIFICATIONS = frozenset({MISMATCH, DIFFERENT})
+
+
+def is_reclaimable(classification: str) -> bool:
+    """True when a group's classification permits reclaiming its redundant copies.
+
+    The one predicate every consumer shares: ``mismatch`` (different titles) and
+    ``different-content`` (hash-proven different bytes) are protected; everything
+    else is reclaimable. Keeping this in one place is what makes adding
+    ``different-content`` safe — no consumer can forget to exclude it.
+    """
+
+    return classification not in PROTECTED_CLASSIFICATIONS
 
 #: Non-numeric Plex ``videoResolution`` labels -> sortable rank. Purely numeric
 #: labels ("1080", "2160", "576", …) are ranked by their integer value instead,
@@ -200,9 +222,9 @@ def classify(group: DuplicateGroup) -> str:
 
 
 def reclaimable_bytes(group: DuplicateGroup) -> int:
-    """Bytes freed by keeping the best copy (``0`` for a mismatch)."""
+    """Bytes freed by keeping the best copy (``0`` for a protected group)."""
 
-    if classify(group) == MISMATCH:
+    if group.classification == DIFFERENT or classify(group) == MISMATCH:
         return 0
     logical = rank_copies(group)
     if len(logical) < 2:
@@ -213,10 +235,11 @@ def reclaimable_bytes(group: DuplicateGroup) -> int:
 def reclaimable_keep_smallest(group: DuplicateGroup) -> int:
     """Max-reclaim view: bytes freed by keeping the smallest copy.
 
-    Still ``0`` for a mismatch — the safety rule applies to every reclaim view.
+    Still ``0`` for a protected group (mismatch or hash-proven different-content) —
+    the safety rule applies to every reclaim view.
     """
 
-    if classify(group) == MISMATCH:
+    if group.classification == DIFFERENT or classify(group) == MISMATCH:
         return 0
     logical = _merge_stacks(group.copies)
     if len(logical) < 2:
@@ -256,15 +279,51 @@ def analyze(groups: List[DuplicateGroup]) -> List[DuplicateGroup]:
     return analyzed
 
 
+#: Classification -> the ``SectionSummary`` count field it increments. A
+#: classification absent here (should not happen) is simply not counted, so a
+#: stray value can never raise a ``KeyError`` mid-summary.
+_CLASSIFICATION_COUNT_KEY = {
+    IDENTICAL: "identical_count",
+    UPGRADE: "upgrade_count",
+    MISMATCH: "mismatch_count",
+    DIFFERENT: "different_count",
+}
+
+#: ``DuplicateGroup.hash_status`` -> the count field it increments (#9). ``""`` and
+#: ``"different"`` are intentionally absent: the former is "pass did not run" and the
+#: latter is already counted via the ``different-content`` classification.
+_HASH_STATUS_COUNT_KEY = {
+    "confirmed": "hash_confirmed_count",
+    "sample-match": "hash_sample_match_count",
+    "unhashable": "hash_unhashable_count",
+}
+
+
 def summarize(groups: List[DuplicateGroup]) -> DedupeSummary:
     """Aggregate per-section (by ``kind``) and overall duplicate totals.
 
     Accepts raw or already-analyzed groups: it runs :func:`analyze` internally,
     so non-duplicates are dropped and reclaimable figures are recomputed from the
     copies. Reclaimable totals exclude ``mismatch`` groups by construction.
+
+    This re-analysis is why the content-hash pass (#9) must not be summarized
+    through here — :func:`analyze` reclassifies from the copies and would wipe a
+    hash downgrade. The reporter calls :func:`summarize_analyzed` on already-hashed
+    groups instead, which trusts each group's stored fields.
     """
 
-    analyzed = analyze(groups)
+    return summarize_analyzed(analyze(groups))
+
+
+def summarize_analyzed(analyzed: List[DuplicateGroup]) -> DedupeSummary:
+    """Aggregate totals from groups that already carry their final fields.
+
+    Unlike :func:`summarize` this does **not** re-run :func:`analyze`: it sums each
+    group's stored ``classification`` / ``reclaimable_*`` / ``hash_status``, so a
+    content-hash downgrade (``different-content``, ``reclaimable_bytes = 0``) or an
+    ``unhashable`` tag survives into the totals. Callers pass the output of
+    :func:`analyze` (optionally post-processed by the hasher).
+    """
 
     order: List[str] = []
     buckets: Dict[str, Dict[str, int]] = {}
@@ -277,6 +336,10 @@ def summarize(groups: List[DuplicateGroup]) -> DedupeSummary:
                 "identical_count": 0,
                 "upgrade_count": 0,
                 "mismatch_count": 0,
+                "different_count": 0,
+                "hash_confirmed_count": 0,
+                "hash_sample_match_count": 0,
+                "hash_unhashable_count": 0,
                 "reclaimable_bytes": 0,
                 "reclaimable_keep_smallest": 0,
             }
@@ -284,7 +347,12 @@ def summarize(groups: List[DuplicateGroup]) -> DedupeSummary:
             order.append(group.kind)
         bucket["group_count"] += 1
         bucket["copy_count"] += len(_merge_stacks(group.copies))
-        bucket[f"{group.classification}_count"] += 1
+        count_key = _CLASSIFICATION_COUNT_KEY.get(group.classification)
+        if count_key is not None:
+            bucket[count_key] += 1
+        hash_key = _HASH_STATUS_COUNT_KEY.get(group.hash_status)
+        if hash_key is not None:
+            bucket[hash_key] += 1
         bucket["reclaimable_bytes"] += group.reclaimable_bytes
         bucket["reclaimable_keep_smallest"] += group.reclaimable_keep_smallest
 
@@ -298,6 +366,14 @@ def summarize(groups: List[DuplicateGroup]) -> DedupeSummary:
         identical_count=sum(section.identical_count for section in sections),
         upgrade_count=sum(section.upgrade_count for section in sections),
         mismatch_count=sum(section.mismatch_count for section in sections),
+        different_count=sum(section.different_count for section in sections),
+        hash_confirmed_count=sum(section.hash_confirmed_count for section in sections),
+        hash_sample_match_count=sum(
+            section.hash_sample_match_count for section in sections
+        ),
+        hash_unhashable_count=sum(
+            section.hash_unhashable_count for section in sections
+        ),
         reclaimable_bytes=sum(section.reclaimable_bytes for section in sections),
         reclaimable_keep_smallest=sum(
             section.reclaimable_keep_smallest for section in sections

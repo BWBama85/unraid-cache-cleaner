@@ -164,6 +164,16 @@ class DuplicateGroup:
     classification: str = ""
     reclaimable_bytes: int = 0
     reclaimable_keep_smallest: int = 0
+    # Outcome of the optional content-hash confirmation pass (#9), populated only
+    # when ``HASH_MODE`` != ``off`` and the group was an ``identical`` candidate.
+    # ``""`` = pass did not run / not applicable; ``"confirmed"`` = every copy is
+    # byte-for-byte identical (``full`` mode only); ``"sample-match"`` = the sampled
+    # regions (size + first/last 4 MiB) agree but the middle was not read
+    # (``partial`` mode — a strong signal, never proof); ``"unhashable"`` = at least
+    # one copy could not be read/mapped, so the group stays size-only and is never
+    # upgraded to confirmed. A group whose copies proved *different* is reclassified
+    # ``different-content`` (see :mod:`dedupe`) and carries ``hash_status="different"``.
+    hash_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,6 +188,16 @@ class SectionSummary:
     mismatch_count: int
     reclaimable_bytes: int
     reclaimable_keep_smallest: int
+    # Content-hash pass tallies (#9), all ``0`` unless ``HASH_MODE`` != ``off``:
+    # groups reclassified different-content (excluded from reclaimable like a
+    # mismatch), and — among the ``identical`` groups — how many were byte-for-byte
+    # confirmed, sample-matched (partial), or left size-only because a copy was
+    # unhashable. Appended with defaults so existing ``SectionSummary(...)`` calls
+    # keep working.
+    different_count: int = 0
+    hash_confirmed_count: int = 0
+    hash_sample_match_count: int = 0
+    hash_unhashable_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -186,7 +206,9 @@ class DedupeSummary:
 
     Reclaimable figures exclude ``mismatch`` groups by construction — the hard
     safety rule is that a group Plex merged from different titles is never
-    counted as reclaimable.
+    counted as reclaimable. The optional content-hash pass (#9) extends that rule
+    to ``different-content`` groups (copies proven to differ) and never inflates
+    reclaimable from an unconfirmed size-only group.
     """
 
     sections: tuple[SectionSummary, ...]
@@ -197,6 +219,12 @@ class DedupeSummary:
     mismatch_count: int
     reclaimable_bytes: int
     reclaimable_keep_smallest: int
+    # Aggregate content-hash tallies mirroring the per-section fields above (#9);
+    # appended with defaults so existing ``DedupeSummary(...)`` calls keep working.
+    different_count: int = 0
+    hash_confirmed_count: int = 0
+    hash_sample_match_count: int = 0
+    hash_unhashable_count: int = 0
 
 
 @dataclass
@@ -215,3 +243,7 @@ class DuplicateReport:
     # True when the Radarr/Sonarr association layer (#8) ran. Gates whether the
     # per-copy association fields are serialized, so a Plex-only run omits them.
     arr_enabled: bool = False
+    # True when the content-hash confirmation pass (#9) ran (``HASH_MODE`` != off).
+    # Gates whether the per-group ``hash_status`` and the hash totals are
+    # serialized, so an ``off`` run keeps the existing report shape byte-for-byte.
+    hash_enabled: bool = False
