@@ -112,6 +112,33 @@ class PlexDuplicatesCliTests(unittest.TestCase):
             code, _, _, _ = _run(["plex-duplicates"], fake)
             self.assertEqual(code, 3)
 
+    def test_generate_and_publish_skips_write_when_generate_fails(self) -> None:
+        # Failure-retention (#77): the report is written only AFTER a successful generate,
+        # so a generate failure never reaches write_report — the prior report survives.
+        reporter = mock.Mock()
+        reporter.generate.side_effect = RuntimeError("plex down")
+        with self.assertRaises(RuntimeError):
+            cli._generate_and_publish(reporter)
+        reporter.write_report.assert_not_called()
+
+    def test_plex_duplicates_skips_when_regeneration_lock_busy(self) -> None:
+        # Cross-process single-flight (#77): a manual run whose regeneration lock is held
+        # (by a concurrent web rescan or another CLI run) skips with exit 0 and writes no
+        # report, rather than fanning out to Plex a second time.
+        from unraid_cache_cleaner.web_rescan import (
+            report_generation_lock,
+            report_generation_lock_path,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir, _env(Path(tmpdir)):
+            tmp = Path(tmpdir)
+            lock = report_generation_lock_path(tmp / "plex-duplicates.json")
+            with report_generation_lock(lock) as acquired:
+                self.assertTrue(acquired)  # the "other process" holds the lock
+                code, _, _, _ = _run(["plex-duplicates"], FakePlexClient())
+            self.assertEqual(code, 0)
+            self.assertFalse((tmp / "plex-duplicates.json").exists())  # nothing written
+
 
 class _FakeArr:
     def __init__(self, index, *, raises=None) -> None:
@@ -304,6 +331,7 @@ class ReconcileWebStagingTests(unittest.TestCase):
         order = []
         with mock.patch.object(cli.web, "file_report_provider", return_value=lambda: None), \
                 mock.patch.object(cli, "_build_reclaim_service", return_value=mock.Mock()), \
+                mock.patch.object(cli, "_build_rescan_service", return_value=None), \
                 mock.patch.object(
                     cli.web, "build_server",
                     side_effect=lambda *a, **k: order.append("build") or mock.Mock(),
@@ -321,6 +349,7 @@ class ReconcileWebStagingTests(unittest.TestCase):
         swept = []
         with mock.patch.object(cli.web, "file_report_provider", return_value=lambda: None), \
                 mock.patch.object(cli, "_build_reclaim_service", return_value=mock.Mock()), \
+                mock.patch.object(cli, "_build_rescan_service", return_value=None), \
                 mock.patch.object(
                     cli.web, "build_server", side_effect=OSError("port in use")
                 ), \

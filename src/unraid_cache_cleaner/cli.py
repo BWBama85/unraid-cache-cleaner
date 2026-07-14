@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple
 from .arr import ArrClientError, RadarrClient, SonarrClient
 from .config import Config
 from .extractor import Extractor, ExtractorError, summarize
+from .models import DuplicateReport
 from .planner import collapse_roots
 from .plex import PlexClient, PlexClientError
 from .plex_report import PlexDuplicateReporter
@@ -20,6 +21,11 @@ from .service import CleanerService
 from .state import StateExtractionLedger, StateStore
 from . import web
 from .web_actions import ReclaimService
+from .web_rescan import (
+    ReportRescanService,
+    report_generation_lock,
+    report_generation_lock_path,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -189,13 +195,39 @@ def _build_web_server(config: Config) -> "web.DuplicateReportServer":
 
     provider = web.file_report_provider(config.plex_duplicate_report_path)
     reclaim_service = _build_reclaim_service(config, provider)
+    rescan_service = _build_rescan_service(config)
     # Bind the socket BEFORE reconciling: a bad bind address, an in-use port, or an
     # unwritable audit DB must fail the start without the staging sweep having mutated
     # the media tree. The server is bound but not yet serving here, so the sweep still
     # runs before any request is accepted.
-    server = web.build_server(config, provider=provider, reclaim_service=reclaim_service)
+    server = web.build_server(
+        config,
+        provider=provider,
+        reclaim_service=reclaim_service,
+        rescan_service=rescan_service,
+    )
     _reconcile_web_staging(reclaim_service, config)
     return server
+
+
+def _build_rescan_service(config: Config) -> Optional[ReportRescanService]:
+    """Build the report-regeneration service (#77), or ``None`` when it cannot run here.
+
+    Requires the action layer (it is authorized by the same ``WEB_ACTION_TOKEN`` the
+    reclaim path uses) *and* Plex credentials (a rescan fans out to Plex). When either is
+    missing the rescan routes stay 404/405 and the "Regenerate report" button is hidden —
+    a report generated elsewhere (cron/CLI) is still served read-only. The regeneration
+    closure builds its Plex/``*arr`` clients per run, so none is created until a rescan
+    actually runs."""
+
+    if not config.web_actions_enabled:
+        return None
+    if not (config.plex_url and config.plex_token):
+        return None
+    lock_path = report_generation_lock_path(config.plex_duplicate_report_path)
+    return ReportRescanService(
+        lambda: _generate_and_publish(_build_reporter(config)), lock_path
+    )
 
 
 def _reconcile_web_staging(
@@ -247,6 +279,9 @@ def _build_reclaim_service(
         radarr=_build_radarr(config),
         sonarr=_build_sonarr(config),
         audit=audit_store.record_actions,
+        # The staging sweep (#74) reads the audit trail off the same store to tell a
+        # committed-purge leftover (remove) from a crash-mid-move sibling (restore).
+        audit_lookup=audit_store.recent_web_reclaim_actions,
     )
 
 
@@ -359,8 +394,13 @@ def _build_sonarr(config: Config) -> Optional[SonarrClient]:
     return None
 
 
-def run_plex_duplicates(config: Config, args: argparse.Namespace) -> int:
-    """Run the read-only Plex duplicate report."""
+def _build_reporter(config: Config) -> PlexDuplicateReporter:
+    """Construct the Plex duplicate reporter (Plex + optional ``*arr`` clients).
+
+    Built lazily by both the ``plex-duplicates`` command and the web rescan job (#77),
+    so no Plex client is created until a report is actually generated — preserving the
+    credential-less read-only viewer deployment and the "a GET never reaches Plex"
+    guarantee."""
 
     client = PlexClient(
         config.plex_url,
@@ -369,17 +409,51 @@ def run_plex_duplicates(config: Config, args: argparse.Namespace) -> int:
         verify_tls=config.plex_verify_tls,
         max_attempts=config.http_max_attempts,
     )
-    reporter = PlexDuplicateReporter(
+    return PlexDuplicateReporter(
         config,
         client,
         radarr_client=_build_radarr(config),
         sonarr_client=_build_sonarr(config),
     )
-    report = reporter.generate(section_overrides=args.section or None)
+
+
+def _generate_and_publish(
+    reporter: PlexDuplicateReporter,
+    section_overrides: Optional[List[str]] = None,
+) -> DuplicateReport:
+    """Generate the report, publish it atomically, and log the summary.
+
+    The reporter's ``write_report`` is atomic (temp file + ``os.replace``), so a failure
+    anywhere in ``generate`` leaves the previous report on disk untouched — the
+    failure-retention guarantee the web rescan (#77) relies on."""
+
+    report = reporter.generate(section_overrides=section_overrides)
     reporter.write_report(report)
     reporter.log_report(report)
-    if not args.json_only:
-        _safe_print(reporter.render_table(report, limit=args.limit))
+    return report
+
+
+def run_plex_duplicates(config: Config, args: argparse.Namespace) -> int:
+    """Run the read-only Plex duplicate report.
+
+    Holds the shared cross-process regeneration lock (#77) so a manual run and a
+    concurrent web-triggered rescan never both fan out to Plex; if another regeneration
+    already holds it, this run logs and skips (exit 0) rather than duplicating the work —
+    the atomic writer would make a double-run harmless, but skipping avoids the wasted
+    Plex/``*arr`` load."""
+
+    logger = logging.getLogger(__name__)
+    lock_path = report_generation_lock_path(config.plex_duplicate_report_path)
+    with report_generation_lock(lock_path) as acquired:
+        if not acquired:
+            logger.info(
+                "Another report regeneration is already in progress; skipping this run."
+            )
+            return 0
+        reporter = _build_reporter(config)
+        report = _generate_and_publish(reporter, section_overrides=args.section or None)
+        if not args.json_only:
+            _safe_print(reporter.render_table(report, limit=args.limit))
     return 0
 
 

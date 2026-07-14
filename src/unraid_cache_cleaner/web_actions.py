@@ -95,6 +95,14 @@ FilesystemMover = Callable[[Path, Path], None]
 #: passed directly; the timestamp comes from the service's injected clock.
 AuditSink = Callable[[List[ActionRecord], float], None]
 
+#: A read-only audit lookup returns the recent ``web-reclaim:*`` rows (newest first) for
+#: one media path, as dicts with ``path``/``action``/``status``/``message``/``occurred_at``
+#: keys. Injected so the startup staging sweep (#74) can consult the trail to tell a
+#: committed-purge leftover (→ remove) from a crash-mid-move sibling (→ restore); shaped
+#: exactly like ``StateStore.recent_web_reclaim_actions`` so the store method passes
+#: directly. ``None`` (no lookup wired) keeps the pre-#74 filesystem-only behavior.
+AuditLookup = Callable[[Path], List[dict]]
+
 STATUS_DELETED = "deleted"
 STATUS_WOULD_DELETE = "would-delete"
 STATUS_REFUSED = "refused"
@@ -125,6 +133,18 @@ STAGING_SUFFIX = ".uncc-reclaim"
 #: :meth:`ReclaimService._staging_path` can drop up to 3 trailing bytes — the slack
 #: :meth:`ReclaimService._original_for_staging` must treat as possibly-truncated.
 _MAX_UTF8_CHAR_BYTES = 4
+
+#: Stable marker embedded in a *post-commit* staging-leftover audit message (#72): a
+#: part left staged after an earlier part of the *same* reclaim already committed its
+#: unlink, so the reclaim is irreversible and the leftover is safe for the startup
+#: sweep (#74) to **remove** — completing the operator's delete. Deliberately worded so
+#: it is NEVER a substring of the zero-commit rollback-failure message
+#: (:meth:`ReclaimService._stage_failure_result`, which says "could not restore
+#: original; file left staged at …") — there nothing was deleted and the staged file is
+#: the *only* surviving copy, so it must be **restored**, never removed. The sweep keys
+#: on this exact marker immediately followed by the sibling's own staging path, so the
+#: two "left staged" cases can never be confused.
+_COMMITTED_LEFTOVER_MARKER = "committed-reclaim leftover, safe to remove; staged at"
 
 _MISMATCH = dedupe.MISMATCH
 
@@ -404,6 +424,16 @@ def _as_int(value: object) -> int:
         return 0
 
 
+def _as_float(value: object) -> Optional[float]:
+    """Parse an audit ``occurred_at`` to ``float``, or ``None`` for a missing/malformed
+    value (used by the reconciliation evidence check, #74)."""
+
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 def _as_opt_int(value: object) -> Optional[int]:
     """Parse a serialized ``*arr`` file id to a *positive* ``int``, or ``None``.
 
@@ -452,6 +482,7 @@ class ReclaimService:
         radarr: Optional[object] = None,
         sonarr: Optional[object] = None,
         audit: Optional[AuditSink] = None,
+        audit_lookup: Optional[AuditLookup] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._config = config
@@ -461,6 +492,7 @@ class ReclaimService:
         self._radarr = radarr
         self._sonarr = sonarr
         self._audit = audit
+        self._audit_lookup = audit_lookup
         self._clock = clock
         self._lock = threading.Lock()
 
@@ -781,7 +813,153 @@ class ReclaimService:
         if original_present:
             self._remove_leftover(sibling, original, records, report)
         else:
+            self._reconcile_missing_original(sibling, original, records, report)
+
+    def _reconcile_missing_original(
+        self,
+        sibling: Path,
+        original: Path,
+        records: List[ActionRecord],
+        report: StagingSweepReport,
+    ) -> None:
+        """Decide a *missing-original* sibling: remove it (the enclosing reclaim
+        committed, so this is a post-commit leftover and the delete should complete) or
+        restore it (a crash mid-move, nothing committed) — using the ``actions`` audit
+        trail to disambiguate the two windows the filesystem alone cannot (#74).
+
+        Both strand a sibling with its original gone, so filesystem state is identical.
+        The trail is the tiebreaker: a committed purge writes a leftover row carrying
+        :data:`_COMMITTED_LEFTOVER_MARKER` for this exact sibling (:meth:`_execute_deletes`),
+        which a zero-commit rollback orphan never does. Fail-closed: with no lookup wired,
+        no such evidence, or evidence a prior sweep already consumed, it falls through to
+        the original **restore** behavior — the sweep only *removes* on unambiguous,
+        unconsumed proof the reclaim committed."""
+
+        if self._committed_leftover_evidence(sibling, original):
+            self._remove_committed_leftover(sibling, original, records, report)
+        else:
             self._restore_crash_staged(sibling, original, records, report)
+
+    def _committed_leftover_evidence(self, sibling: Path, original: Path) -> bool:
+        """Whether the audit trail proves ``sibling`` is a *committed*-reclaim leftover
+        (safe to remove), not a crash-mid-move staging file (must restore).
+
+        Reads the recent ``web-reclaim:*`` rows for ``original`` (newest first) and looks
+        for an ``error`` row whose message carries :data:`_COMMITTED_LEFTOVER_MARKER`
+        immediately followed by *this* sibling's path — written only when an earlier part
+        of the same reclaim already committed its unlink. The evidence is honored only if
+        it has not been *consumed* by a later ``web-reclaim:reconcile`` removal of the same
+        path (a prior sweep already completed this delete), which defeats a stale row
+        matching a fresh crash-mid-move sibling at a re-used path. Any lookup failure is
+        swallowed and read as "no evidence" — fail-closed toward restore."""
+
+        if self._audit_lookup is None:
+            return False
+        try:
+            rows = self._audit_lookup(original)
+        except Exception:  # noqa: BLE001 — a broken lookup must degrade to restore, not crash
+            LOGGER.warning(
+                "reconcile: audit lookup for %s failed; treating as no evidence",
+                original,
+                exc_info=True,
+            )
+            return False
+        marker = f"{_COMMITTED_LEFTOVER_MARKER} {sibling}"
+        evidence_at: Optional[float] = None
+        latest_reconcile_removed_at: Optional[float] = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            action = str(row.get("action") or "")
+            status = str(row.get("status") or "")
+            occurred = _as_float(row.get("occurred_at"))
+            if (
+                action == "web-reclaim:filesystem"
+                and status == STATUS_ERROR
+                and marker in str(row.get("message") or "")
+            ):
+                if occurred is not None and (evidence_at is None or occurred > evidence_at):
+                    evidence_at = occurred
+            elif (
+                action == RECONCILE_ACTION
+                and status == STATUS_REMOVED
+                and occurred is not None
+                and (latest_reconcile_removed_at is None or occurred > latest_reconcile_removed_at)
+            ):
+                latest_reconcile_removed_at = occurred
+        if evidence_at is None:
+            return False
+        # Consumed: a prior sweep already removed a leftover for this path *after* the
+        # evidence was written, so a sibling present now is a fresh (crash-mid-move) one —
+        # restore it rather than acting on the spent evidence.
+        if latest_reconcile_removed_at is not None and latest_reconcile_removed_at >= evidence_at:
+            return False
+        return True
+
+    def _remove_committed_leftover(
+        self,
+        sibling: Path,
+        original: Path,
+        records: List[ActionRecord],
+        report: StagingSweepReport,
+    ) -> None:
+        """Remove a sibling the audit trail proves is a *committed*-reclaim leftover — its
+        original was already deleted by the reclaim, so completing the delete finishes the
+        operator's intent (#74). Same deleting action as :meth:`_remove_leftover`
+        (dry-run-suppressed, audited distinctly), but the original is *absent* here, so the
+        audit message says so rather than "original present"."""
+
+        size = self._sibling_size(sibling)
+        if self.dry_run:
+            report.would_remove += 1
+            LOGGER.info(
+                "web reclaim: staging sweep would remove committed leftover %s "
+                "(dry-run; original %s already deleted)",
+                sibling,
+                original,
+            )
+            records.append(
+                ActionRecord(
+                    path=original,
+                    action=RECONCILE_ACTION,
+                    status=STATUS_SKIPPED,
+                    size=size,
+                    message=(
+                        f"dry-run: committed-reclaim leftover {sibling} left in place "
+                        "(original already deleted)"
+                    ),
+                )
+            )
+            return
+        try:
+            self._filesystem_deleter(sibling)
+        except OSError as exc:
+            self._skip_sibling(
+                sibling,
+                records,
+                report,
+                f"could not remove committed leftover (original {original} deleted): {exc}",
+            )
+            return
+        report.removed += 1
+        LOGGER.info(
+            "web reclaim: staging sweep removed committed leftover %s "
+            "(original %s already deleted; completing the reclaim)",
+            sibling,
+            original,
+        )
+        records.append(
+            ActionRecord(
+                path=original,
+                action=RECONCILE_ACTION,
+                status=STATUS_REMOVED,
+                size=size,
+                message=(
+                    f"removed committed-reclaim leftover {sibling}; original already "
+                    "deleted (completed an interrupted reclaim)"
+                ),
+            )
+        )
 
     @staticmethod
     def _original_for_staging(sibling: Path) -> Optional[Path]:
@@ -1017,11 +1195,7 @@ class ReclaimService:
                 ),
                 staged_path=staged_path,
                 leftover_message=(
-                    lambda sp, p=original: (
-                        f"rating_key={target.rating_key} part_id={target.part_id}: "
-                        f"purge aborted; {p} left staged at {sp} "
-                        "(reconciled on next startup)"
-                    )
+                    lambda sp, p=original: self._committed_leftover_message(target, p, sp)
                 ),
             )
             for original, staged_path, size in staged
@@ -1478,6 +1652,23 @@ class ReclaimService:
             for job in remaining
             if job.staged_path is not None and job.leftover_message is not None
         ]
+
+    @staticmethod
+    def _committed_leftover_message(
+        target: ReclaimTarget, original: Path, staged: Path
+    ) -> str:
+        """The audit message for a *post-commit* staging leftover (#72).
+
+        Carries the stable :data:`_COMMITTED_LEFTOVER_MARKER` immediately before the
+        staged path, so the startup sweep (#74) can positively identify a
+        committed-reclaim leftover for that exact sibling — distinct from a zero-commit
+        rollback orphan (which is restored, never removed)."""
+
+        return (
+            f"rating_key={target.rating_key} part_id={target.part_id}: "
+            f"purge aborted after an earlier part committed; {original} is a "
+            f"{_COMMITTED_LEFTOVER_MARKER} {staged} (reconciled on next startup)"
+        )
 
     # -- helpers ------------------------------------------------------------- #
 
