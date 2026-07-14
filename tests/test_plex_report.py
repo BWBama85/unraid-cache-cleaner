@@ -240,6 +240,8 @@ def _config(tmp: Path, **overrides) -> Config:
         plex_timeout_seconds=30,
         plex_verify_tls=True,
         plex_duplicate_report_path=tmp / "plex-duplicates.json",
+        # Keep the #92 hash cache inside the temp dir so no test touches /config.
+        hash_cache_path=tmp / "hash-cache.sqlite3",
     )
     base.update(overrides)
     return Config(**base)
@@ -1209,6 +1211,51 @@ class HashPassIntegrationTests(unittest.TestCase):
             self.assertEqual(group["hash_status"], "confirmed")
             self.assertGreater(group["reclaimable_bytes"], 0)
             self.assertIn("[hash:confirmed]", reporter.render_table(report))
+
+    def test_cache_created_and_reused_across_generations(self) -> None:
+        # #92 end-to-end: the reporter opens the sidecar cache, persists digests, and a
+        # second generation reuses them (and still confirms) — proving the cache is
+        # wired into generate() and survives across runs.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run(
+                tmp, media, "full", ("a.mkv", b"X" * 100), ("b.mkv", b"X" * 100)
+            )
+            self.assertEqual(report.groups[0].hash_status, "confirmed")
+            cache_path = tmp / "hash-cache.sqlite3"
+            self.assertTrue(cache_path.exists())  # sidecar created by the run
+            import sqlite3
+
+            conn = sqlite3.connect(cache_path)
+            rows = conn.execute("SELECT COUNT(*) FROM hash_cache").fetchone()[0]
+            conn.close()
+            self.assertEqual(rows, 2)  # one digest per logical copy
+
+            # A second generation with the warm cache still confirms.
+            report2 = reporter.generate()
+            self.assertEqual(report2.groups[0].hash_status, "confirmed")
+
+    def test_cache_disabled_still_confirms(self) -> None:
+        # HASH_CACHE=false: the pass runs live, no sidecar is created.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            for name, data in (("a.mkv", b"X" * 100), ("b.mkv", b"X" * 100)):
+                (media / name).write_bytes(data)
+            client = self._client(("a.mkv", 100), ("b.mkv", 100))
+            config = _config(
+                tmp,
+                hash_mode="full",
+                hash_cache_enabled=False,
+                web_media_path_map=((Path("/plex"), media),),
+            )
+            reporter = PlexDuplicateReporter(config, client, clock=lambda: 1234.5)
+            report = reporter.generate()
+            self.assertEqual(report.groups[0].hash_status, "confirmed")
+            self.assertFalse((tmp / "hash-cache.sqlite3").exists())
 
     def test_partial_reports_sample_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

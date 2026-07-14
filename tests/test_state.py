@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.extractor import CLAIM_BUSY, CLAIM_DONE, CLAIM_NEW
 from unraid_cache_cleaner.models import ActionRecord
-from unraid_cache_cleaner.state import StateStore, WebActionHistoryReader
+from unraid_cache_cleaner.state import HashCache, StateStore, WebActionHistoryReader
 
 
 class ExtractionLedgerTests(unittest.TestCase):
@@ -571,6 +571,111 @@ class WebActionHistoryReaderTests(unittest.TestCase):
         names = {row[1] for row in conn.execute("PRAGMA index_list('actions')")}
         conn.close()
         self.assertIn("ix_actions_occurred_at", names)
+
+
+class HashCacheTests(unittest.TestCase):
+    """The persistent content-hash digest cache (#92)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "cache" / "hash-cache.sqlite3"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_put_persists_across_instances(self) -> None:
+        cache = HashCache(self.path)
+        self.assertIsNone(cache.get("k", "full", "fp"))  # cold miss
+        cache.put("k", "full", "fp", "digest-abc")
+        cache.close()
+        # A fresh instance (new report run) reads the persisted digest.
+        reopened = HashCache(self.path)
+        self.assertEqual(reopened.get("k", "full", "fp"), "digest-abc")
+        reopened.close()
+
+    def test_creates_sidecar_dir_lazily(self) -> None:
+        # The parent dir does not exist until the cache is opened (#92: HASH_MODE=off
+        # never opens the cache, so this creation stays out of ensure_directories).
+        self.assertFalse(self.path.parent.exists())
+        HashCache(self.path).close()
+        self.assertTrue(self.path.exists())
+
+    def test_fingerprint_drift_is_a_miss(self) -> None:
+        cache = HashCache(self.path)
+        cache.put("k", "full", "size=100:m=1", "digest-old")
+        cache.close()
+        reopened = HashCache(self.path)
+        # Same key + mode, different fingerprint (file changed) => miss, not stale hit.
+        self.assertIsNone(reopened.get("k", "full", "size=100:m=2"))
+        # The original fingerprint still hits.
+        self.assertEqual(reopened.get("k", "full", "size=100:m=1"), "digest-old")
+        reopened.close()
+
+    def test_mode_isolation_full_vs_partial(self) -> None:
+        cache = HashCache(self.path)
+        cache.put("k", "full", "fp", "full-digest")
+        cache.close()
+        reopened = HashCache(self.path)
+        # A partial lookup must never be served the full digest, and vice-versa.
+        self.assertIsNone(reopened.get("k", "partial", "fp"))
+        self.assertEqual(reopened.get("k", "full", "fp"), "full-digest")
+        reopened.close()
+
+    def test_upsert_replaces_row_no_growth(self) -> None:
+        cache = HashCache(self.path)
+        cache.put("k", "full", "fp1", "d1")
+        cache.close()
+        cache2 = HashCache(self.path)
+        cache2.put("k", "full", "fp2", "d2")  # same (key, mode) => UPDATE, not a new row
+        cache2.close()
+        conn = sqlite3.connect(self.path)
+        count = conn.execute("SELECT COUNT(*) FROM hash_cache").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+        reopened = HashCache(self.path)
+        self.assertEqual(reopened.get("k", "full", "fp2"), "d2")
+        reopened.close()
+
+    def test_row_count_bounded_by_max_rows(self) -> None:
+        cache = HashCache(self.path, max_rows=5)
+        for i in range(12):
+            cache.put(f"k{i}", "full", "fp", f"d{i}")
+        cache.close()
+        conn = sqlite3.connect(self.path)
+        count = conn.execute("SELECT COUNT(*) FROM hash_cache").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 5)
+
+    def test_under_cap_keeps_all_rows(self) -> None:
+        # The prune guard must not evict anything while under the cap.
+        cache = HashCache(self.path, max_rows=5)
+        for i in range(3):
+            cache.put(f"k{i}", "full", "fp", f"d{i}")
+        cache.close()
+        reopened = HashCache(self.path)
+        for i in range(3):
+            self.assertEqual(reopened.get(f"k{i}", "full", "fp"), f"d{i}")
+        reopened.close()
+
+    def test_corrupt_db_disables_cache_fail_open(self) -> None:
+        # A non-SQLite file: opening must not raise; the cache degrades to a no-op so
+        # the report falls back to live hashing (never a wrong verdict).
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(b"this is not a sqlite database" * 10)
+        cache = HashCache(self.path)
+        self.assertTrue(cache._disabled)
+        self.assertIsNone(cache.get("k", "full", "fp"))
+        cache.put("k", "full", "fp", "d")  # no-op, no raise
+        cache.close()  # no raise
+
+    def test_read_failure_disables_for_run(self) -> None:
+        cache = HashCache(self.path)
+        cache._conn.close()  # simulate a broken connection mid-run
+        self.assertIsNone(cache.get("k", "full", "fp"))
+        self.assertTrue(cache._disabled)
+        # Once disabled, puts are dropped and close stays quiet.
+        cache.put("k", "full", "fp", "d")
+        cache.close()
 
 
 if __name__ == "__main__":

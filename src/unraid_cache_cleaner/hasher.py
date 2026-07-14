@@ -37,11 +37,14 @@ import os
 import stat as stat_mod
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 from . import dedupe
 from .models import DuplicateGroup, MediaCopy
 from .planner import map_media_path
+
+if TYPE_CHECKING:  # only for the type annotation; no runtime coupling to state.py
+    from .state import HashCache
 
 LOGGER = logging.getLogger(__name__)
 
@@ -63,6 +66,24 @@ _SAMPLE = 4 * 1024 * 1024
 #: Streaming block for whole-file reads, so ``full`` mode never loads a large file
 #: into memory at once.
 _READ_BLOCK = 1024 * 1024
+
+#: Hash-cache scheme version (#92). Bump when the digest algorithm or the semantics of
+#: what bytes a digest covers change, so a persisted digest is never served under a new
+#: scheme. It rides inside the cache ``mode_key`` alongside the algorithm name and the
+#: sample size, which changes automatically if :data:`_SAMPLE` changes.
+_HASH_CACHE_VERSION = 1
+
+
+def _cache_mode_key(mode: str) -> str:
+    """The cache-key discriminator for ``mode`` (#92).
+
+    Folds in the digest algorithm, the sampled-region size, and a scheme version so a
+    cached digest is only ever reused for an identical hashing scheme — a ``partial``
+    row never satisfies a ``full`` lookup, and re-tuning :data:`_SAMPLE` or the digest
+    invalidates every prior row.
+    """
+
+    return f"sha256|{mode}|sample={_SAMPLE}|v{_HASH_CACHE_VERSION}"
 
 
 def hash_regions(size: int, mode: str) -> Tuple[Tuple[int, int], ...]:
@@ -100,62 +121,125 @@ class CopyHash:
 
 def _resolve_part(
     plex_path: Path, path_map: Sequence[Tuple[Path, Path]], expected_size: int
-) -> Tuple[Optional[Path], Optional[str]]:
+) -> Tuple[Optional[Path], Optional[Tuple[int, int, int, int]], Optional[str]]:
     """Translate + safety-check one Plex part path, mirroring the reclaim path.
 
-    Returns ``(container_path, None)`` when the file is a real, in-root regular file
-    whose on-disk size matches what Plex reported, else ``(None, reason)``. Fail-closed
-    on every branch: unmapped path, missing/unreadable file, symlink or non-regular
-    file, a realpath that escapes the mapped root, or a size that drifted since the
-    report.
+    Returns ``(container_path, identity, None)`` when the file is a real, in-root
+    regular file whose on-disk size matches what Plex reported, else
+    ``(None, None, reason)``. Fail-closed on every branch: unmapped path,
+    missing/unreadable file, symlink or non-regular file, a realpath that escapes the
+    mapped root, or a size that drifted since the report.
+
+    ``identity`` is ``(size, mtime_ns, ctime_ns, ino)`` and feeds the hash-cache
+    fingerprint (#92). It deliberately includes **``ctime_ns`` and ``ino``** on top of
+    size/mtime: an overwrite that preserves size *and* mtime (``cp -p``, ``rsync -t``,
+    a restore, or a coarse-mtime filesystem) still bumps ``ctime`` — which userspace
+    cannot forge — and an atomic replace-by-rename changes the inode, so a stale digest
+    is not served for genuinely different bytes. All four fields come free from the
+    single ``lstat`` already performed here.
     """
 
     mapped = map_media_path(plex_path, path_map)
     if mapped is None:
-        return None, f"path not mapped by WEB_MEDIA_PATH_MAP: {plex_path}"
+        return None, None, f"path not mapped by WEB_MEDIA_PATH_MAP: {plex_path}"
     container_path, container_prefix = mapped
 
     try:
         info = os.lstat(container_path)
     except OSError as exc:
-        return None, f"not readable: {container_path} ({exc.__class__.__name__})"
+        return None, None, f"not readable: {container_path} ({exc.__class__.__name__})"
     if not stat_mod.S_ISREG(info.st_mode):
-        return None, f"not a regular file (symlink or directory?): {container_path}"
+        return None, None, f"not a regular file (symlink or directory?): {container_path}"
 
     real_path = Path(os.path.realpath(container_path))
     real_root = Path(os.path.realpath(container_prefix))
     try:
         real_path.relative_to(real_root)
     except ValueError:
-        return None, f"resolved path escapes the media root: {container_path}"
+        return None, None, f"resolved path escapes the media root: {container_path}"
 
     if info.st_size != expected_size:
-        return None, (
+        return None, None, (
             f"size changed since the report ({info.st_size} on disk != {expected_size} "
             f"reported): {container_path}"
         )
-    return container_path, None
+    identity = (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino)
+    return container_path, identity, None
+
+
+def _verify_readable(resolved: Sequence[Tuple[Path, Tuple[int, int, int, int]]]) -> Optional[str]:
+    """Confirm every resolved part is still openable, or return a fail-closed reason.
+
+    Used only on a cache hit (#92): it opens and immediately closes each part so a copy
+    whose bytes are no longer readable is refused as unhashable — mirroring the
+    uncached read path's ``open()`` — while reading **zero** content bytes, so the
+    whole-file read the cache exists to avoid stays skipped.
+    """
+
+    for container_path, _identity in resolved:
+        try:
+            with open(container_path, "rb"):
+                pass
+        except OSError as exc:
+            return f"read failed: {container_path} ({exc.__class__.__name__})"
+    return None
 
 
 def _hash_copy(
-    parts: Sequence[MediaCopy], path_map: Sequence[Tuple[Path, Path]], mode: str
+    parts: Sequence[MediaCopy],
+    path_map: Sequence[Tuple[Path, Path]],
+    mode: str,
+    cache: Optional["HashCache"] = None,
 ) -> CopyHash:
     """Hash one logical copy: its ordered parts fed into a single digest.
 
     The digest is over content bytes only (no framing), so a single-part ``full``
     digest equals a plain ``sha256`` of the file — a clean, testable property. Any
     part that fails :func:`_resolve_part` makes the whole copy unhashable.
+
+    Every part is resolved and safety-checked (path map, regular-file, symlink,
+    root-escape, on-disk size) up front. With a ``cache`` (#92), the resolved
+    fingerprint (each part's on-disk path plus ``size``/``mtime_ns``/``ctime_ns``/``ino``)
+    is looked up before the file is read end-to-end: a hit returns the stored digest,
+    skipping the expensive byte read but **not** the safety checks — including a fresh
+    ``open()`` per part so a copy that has become unreadable (an ancestor-dir/ACL/LSM
+    permission change that left size/mtime/ctime untouched) fails closed to unhashable
+    exactly as the uncached path would, rather than being trusted as confirmed. A miss
+    reads and hashes as before, then stores the result.
     """
 
     topology = tuple(part.size for part in parts)
-    digest = hashlib.sha256()
+    resolved: List[Tuple[Path, Tuple[int, int, int, int]]] = []  # (path, identity)
     for part in parts:
-        container_path, error = _resolve_part(part.file, path_map, part.size)
-        if error is not None or container_path is None:
-            return CopyHash(topology=topology, digest=None, error=error)
+        container_path, identity, error = _resolve_part(part.file, path_map, part.size)
+        if container_path is None or identity is None:
+            # _resolve_part always pairs a failed resolution with a reason; fall back to
+            # a generic one so a warning is never formatted over a bare ``None``.
+            return CopyHash(
+                topology=topology,
+                digest=None,
+                error=error or f"could not resolve part: {part.file}",
+            )
+        resolved.append((container_path, identity))
+
+    copy_key = "\x00".join(str(path) for path, _identity in resolved)
+    fingerprint = "\x00".join(
+        ":".join(str(field) for field in identity) for _path, identity in resolved
+    )
+    mode_key = _cache_mode_key(mode)
+    if cache is not None:
+        cached = cache.get(copy_key, mode_key, fingerprint)
+        if cached is not None:
+            readability_error = _verify_readable(resolved)
+            if readability_error is not None:
+                return CopyHash(topology=topology, digest=None, error=readability_error)
+            return CopyHash(topology=topology, digest=cached, error=None)
+
+    digest = hashlib.sha256()
+    for container_path, (size, _mtime, _ctime, _ino) in resolved:
         try:
             with open(container_path, "rb") as handle:
-                for offset, length in hash_regions(part.size, mode):
+                for offset, length in hash_regions(size, mode):
                     handle.seek(offset)
                     remaining = length
                     while remaining > 0:
@@ -181,7 +265,10 @@ def _hash_copy(
                 digest=None,
                 error=f"read failed: {container_path} ({exc.__class__.__name__})",
             )
-    return CopyHash(topology=topology, digest=digest.hexdigest(), error=None)
+    result = digest.hexdigest()
+    if cache is not None:
+        cache.put(copy_key, mode_key, fingerprint, result)
+    return CopyHash(topology=topology, digest=result, error=None)
 
 
 def _roots_mounted(path_map: Sequence[Tuple[Path, Path]]) -> bool:
@@ -204,12 +291,15 @@ def _confirm_status(mode: str) -> str:
 
 
 def _confirm_one(
-    group: DuplicateGroup, path_map: Sequence[Tuple[Path, Path]], mode: str
+    group: DuplicateGroup,
+    path_map: Sequence[Tuple[Path, Path]],
+    mode: str,
+    cache: Optional["HashCache"] = None,
 ) -> Tuple[DuplicateGroup, Optional[str]]:
     """Hash one ``identical`` group and return it re-tagged plus an optional warning."""
 
     pairs = dedupe.rank_copies_with_parts(group)
-    hashes = [_hash_copy(parts, path_map, mode) for _logical, parts in pairs]
+    hashes = [_hash_copy(parts, path_map, mode, cache) for _logical, parts in pairs]
 
     unreadable = [h.error for h in hashes if h.digest is None]
     if unreadable:
@@ -254,6 +344,7 @@ def confirm_groups(
     groups: Sequence[DuplicateGroup],
     path_map: Sequence[Tuple[Path, Path]],
     mode: str,
+    cache: Optional["HashCache"] = None,
 ) -> Tuple[List[DuplicateGroup], List[str]]:
     """Run the content-hash pass over analyzed groups.
 
@@ -265,6 +356,11 @@ def confirm_groups(
     roots are all unmounted, the pass is skipped whole (one warning) and the report
     is served from Plex data alone — never crashing a read-only report over a missing
     mount.
+
+    An optional ``cache`` (#92) is consulted per copy so an unchanged file is not
+    re-read on a subsequent run. It is fail-open (a broken cache degrades to live
+    hashing) and never opened for ``HASH_MODE=off`` — this function short-circuits
+    before touching it.
     """
 
     if mode == HASH_OFF:
@@ -286,7 +382,7 @@ def confirm_groups(
         if group.classification != dedupe.IDENTICAL:
             result.append(group)
             continue
-        confirmed, warning = _confirm_one(group, path_map, mode)
+        confirmed, warning = _confirm_one(group, path_map, mode, cache)
         result.append(confirmed)
         if warning is not None:
             warnings.append(warning)

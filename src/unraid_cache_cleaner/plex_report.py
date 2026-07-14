@@ -24,13 +24,16 @@ import stat
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import arr, dedupe, hasher
 from .arr import ArrClientError, RadarrClient, SonarrClient
 from .config import Config
 from .models import DuplicateGroup, DuplicateReport, MediaCopy, PlexSection
 from .plex import PlexClient, build_duplicate_group
+
+if TYPE_CHECKING:  # annotation only; HashCache is imported lazily in _open_hash_cache
+    from .state import HashCache
 
 LOGGER = logging.getLogger(__name__)
 
@@ -194,9 +197,17 @@ class PlexDuplicateReporter:
         # so re-analysis does not wipe the hash verdicts.
         hash_enabled = self.config.hash_mode != hasher.HASH_OFF
         if hash_enabled:
-            analyzed, hash_warnings = hasher.confirm_groups(
-                analyzed, self.config.web_media_path_map, self.config.hash_mode
-            )
+            cache = self._open_hash_cache()
+            try:
+                analyzed, hash_warnings = hasher.confirm_groups(
+                    analyzed,
+                    self.config.web_media_path_map,
+                    self.config.hash_mode,
+                    cache=cache,
+                )
+            finally:
+                if cache is not None:
+                    cache.close()
             warnings.extend(hash_warnings)
 
         analyzed.sort(key=self._group_sort_key)
@@ -219,6 +230,20 @@ class PlexDuplicateReporter:
             arr_enabled=self._arr_enabled,
             hash_enabled=hash_enabled,
         )
+
+    def _open_hash_cache(self) -> Optional["HashCache"]:
+        """Open the persistent hash cache for this run, or ``None`` when disabled (#92).
+
+        Called only when the hash pass runs, so the sidecar DB is never created for
+        ``HASH_MODE=off``. Construction is fail-open — a broken/unwritable cache yields
+        a disabled instance that behaves as a no-op — so the caller can always close it.
+        """
+
+        if not self.config.hash_cache_enabled:
+            return None
+        from .state import HashCache
+
+        return HashCache(self.config.hash_cache_path)
 
     def _build_arr_indexes(
         self, warnings: List[str]

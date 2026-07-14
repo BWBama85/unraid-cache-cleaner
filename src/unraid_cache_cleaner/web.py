@@ -359,6 +359,9 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: now
 .tag.tracked { background: #fdecec; color: #b3261e; }
 .tag.unknown { background: #fff4e5; color: #8a5300; }
 .tag.keep { background: #e7f5ec; color: #1b6b39; }
+.tag.hash-confirmed { background: #e7f5ec; color: #1b6b39; }
+.tag.hash-sample { background: #e8eefc; color: #274bb5; }
+.tag.hash-unhashable { background: #fff4e5; color: #8a5300; }
 .empty { background: #fff; border: 1px dashed #cfd4da; border-radius: 8px; padding: 1.5rem; color: #555; }
 .warn { background: #fff4e5; border: 1px solid #f0d9b0; border-radius: 8px; padding: .6rem .9rem; margin: .4rem 0; }
 .err { background: #fdecec; border: 1px solid #f0b3ae; border-radius: 8px; padding: .6rem .9rem; margin: .4rem 0; }
@@ -1211,6 +1214,37 @@ def _checkbox(group: dict, copy: dict, actions_enabled: bool) -> str:
     )
 
 
+#: Allowlisted ``hash_status`` -> (badge label, css modifier, tooltip) for the
+#: reclaimable rows (#94), mirroring the CLI table's ``[hash:…]`` tags. Any value not
+#: listed — ``""`` on an ``HASH_MODE=off`` or ``upgrade`` group, or an unknown status —
+#: renders no badge, so an off report is byte-for-byte unchanged. ``different`` is
+#: absent by design: those groups are excluded from reclaimable (shown in their own
+#: review section), so they never reach a reclaimable row.
+_HASH_BADGES = {
+    "confirmed": ("hash: confirmed", "hash-confirmed", "Byte-for-byte identical (full hash)"),
+    "sample-match": (
+        "hash: sample-match",
+        "hash-sample",
+        "Head and tail samples match (partial hash) — a strong signal, not proof",
+    ),
+    "unhashable": (
+        "hash: unhashable",
+        "hash-unhashable",
+        "Contents could not be verified — reclaimable on size alone",
+    ),
+}
+
+
+def _hash_badge(group: dict) -> str:
+    """A small inline hash-status badge for a reclaimable row, or ``""`` (#94)."""
+
+    badge = _HASH_BADGES.get(str(group.get("hash_status") or ""))
+    if badge is None:
+        return ""
+    label, css, title = badge
+    return f' <span class="tag {css}" title="{_esc(title)}">{_esc(label)}</span>'
+
+
 def _render_reclaimable(groups: List[dict], *, actions_enabled: bool = False) -> str:
     groups = sorted(groups, key=lambda g: -_as_int(g.get("reclaimable_bytes")))
     total = sum(_as_int(g.get("reclaimable_bytes")) for g in groups)
@@ -1235,7 +1269,7 @@ def _render_reclaimable(groups: List[dict], *, actions_enabled: bool = False) ->
         rows.append(
             "<tr>"
             f'<td class="num">{_esc(_fmt_gib(group.get("reclaimable_bytes", 0)))}</td>'
-            f'<td>{_esc(group.get("classification", "?"))}</td>'
+            f'<td>{_esc(group.get("classification", "?"))}{_hash_badge(group)}</td>'
             f'<td>{_esc(group.get("kind", "?"))}</td>'
             f'<td><span class="tag keep">keep {keep_res}</span></td>'
             f'<td class="num">{len(copies)}</td>'
