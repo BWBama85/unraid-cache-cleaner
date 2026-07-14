@@ -114,7 +114,12 @@ _ACTION_HISTORY_LIMIT = 200
 _SESSION_COOKIE = "ucc_session"
 
 
-def _csp(actions_enabled: bool, *, script_nonce: Optional[str] = None) -> str:
+def _csp(
+    actions_enabled: bool,
+    *,
+    script_nonce: Optional[str] = None,
+    connect_self: bool = False,
+) -> str:
     """The Content-Security-Policy. Nothing loads by default; the only relaxations
     are the page's own inline ``<style>`` and — only when the action form is
     served — a same-origin ``form-action`` so the reclaim POST is permitted. No
@@ -126,7 +131,12 @@ def _csp(actions_enabled: bool, *, script_nonce: Optional[str] = None) -> str:
     'nonce-…'`` — still no ``'unsafe-inline'`` for scripts and no external ``src``,
     so only that exact inline block (which the same response emits with a matching
     ``nonce``) can run. ``None`` keeps scripts fully blocked by ``default-src
-    'none'``."""
+    'none'``.
+
+    ``connect_self`` (#90) adds ``connect-src 'self'`` — the *only* response that
+    sets it is the in-flight rescan status page, whose opt-in live-poll script
+    ``fetch``\\es same-origin ``/api/rescan``. Every other response leaves it off, so
+    ``default-src 'none'`` still blocks all fetch/XHR/WebSocket by default."""
 
     form_action = "'self'" if actions_enabled else "'none'"
     policy = (
@@ -135,6 +145,8 @@ def _csp(actions_enabled: bool, *, script_nonce: Optional[str] = None) -> str:
     )
     if script_nonce:
         policy += f"; script-src 'nonce-{script_nonce}'"
+    if connect_self:
+        policy += "; connect-src 'self'"
     return policy
 
 
@@ -901,6 +913,29 @@ def render_reclaim_notice_html(title: str, message: str) -> str:
 _RESCAN_POLL_SECONDS = 4
 
 
+#: The opt-in JS live-poll (#90), admitted only under a matching ``script-src 'nonce-…'``
+#: and a scoped ``connect-src 'self'``. Pure progressive enhancement over the no-JS
+#: ``<meta http-equiv="refresh">`` fallback: while a run is in flight it silently GETs
+#: ``/api/rescan`` (same-origin, carrying the unlock-session cookie) every
+#: :data:`_RESCAN_POLL_SECONDS`; when the run leaves ``running`` it navigates to the
+#: report (``/``) on success or back to the status page (which then shows the failed/
+#: skipped result block) — so the operator lands on fresh data without a manual reload
+#: and without the full-page meta-refresh. Read-only: it only ever GETs the status API,
+#: never triggers a scan or submits anything. Kept tiny and self-contained.
+_RESCAN_POLL_SCRIPT = (
+    "(function(){"
+    "var ms=" + str(_RESCAN_POLL_SECONDS * 1000) + ";"
+    "var poll=function(){"
+    "fetch('/api/rescan',{credentials:'same-origin'}).then(function(r){"
+    "return r.ok?r.json():null;}).then(function(s){"
+    "if(!s||s.running){setTimeout(poll,ms);return;}"
+    "window.location.assign(s.last_status==='succeeded'?'/':'/actions/rescan');"
+    "}).catch(function(){setTimeout(poll,ms);});};"
+    "setTimeout(poll,ms);"
+    "})();"
+)
+
+
 def render_rescan_unavailable_html() -> str:
     """The page shown when a rescan is requested but no rescan service is attached —
     actions are on but ``PLEX_URL``/``PLEX_TOKEN`` are not configured, so this process
@@ -915,21 +950,34 @@ def render_rescan_unavailable_html() -> str:
     return _page("Report regeneration unavailable", body, footer_note=_ACTION_FOOTER)
 
 
-def render_rescan_status_html(status: RescanStatus, *, triggered: Optional[str] = None) -> str:
+def render_rescan_status_html(
+    status: RescanStatus, *, triggered: Optional[str] = None, script_nonce: Optional[str] = None
+) -> str:
     """The rescan status page (#77): a pure in-memory view of the regeneration state.
 
     While a run is in flight the page carries a ``<meta http-equiv="refresh">`` so a
     no-JS browser polls itself until the scan finishes (no script, no fetch — the strict
     CSP is untouched). ``triggered`` is the just-submitted :meth:`ReportRescanService.trigger`
     outcome (``started``/``already-running``) when this page is the POST response, so the
-    operator sees whether their click launched a run or joined one already going."""
+    operator sees whether their click launched a run or joined one already going.
+
+    ``script_nonce`` (#90): supplied only when the opt-in ``WEB_ACTION_INLINE_SCRIPT``
+    enhancement is on *and* a run is in flight. It admits the single :data:`_RESCAN_POLL_SCRIPT`
+    live-poll under a matching ``script-src 'nonce-…'`` (with a scoped ``connect-src 'self'``
+    on the same response) and wraps the meta-refresh in ``<noscript>`` so a JS browser
+    updates via ``fetch`` instead of a full-page reload while a scripts-off browser still
+    polls. Purely additive: with the enhancement off (``None``) the plain no-JS meta-refresh
+    is the sole updater, exactly as before."""
 
     running = status.running
-    head_extra = (
-        f'<meta http-equiv="refresh" content="{_RESCAN_POLL_SECONDS}; url=/actions/rescan">'
-        if running
-        else ""
-    )
+    head_extra = ""
+    if running:
+        meta = f'<meta http-equiv="refresh" content="{_RESCAN_POLL_SECONDS}; url=/actions/rescan">'
+        # Under the JS enhancement, gate the meta-refresh behind <noscript>: a JS-enabled
+        # browser never full-page-reloads (the poll script drives updates), while a
+        # scripts-off browser still applies the meta and polls. Without the enhancement the
+        # meta is emitted bare, unchanged from #77.
+        head_extra = f"<noscript>{meta}</noscript>" if script_nonce else meta
     parts: List[str] = ["<h1>Report regeneration</h1>"]
     if triggered == RESCAN_STARTED:
         parts.append('<div class="ok">Started a report regeneration.</div>')
@@ -945,6 +993,8 @@ def render_rescan_status_html(status: RescanStatus, *, triggered: Optional[str] 
     else:
         parts.append(_rescan_result_block(status))
     parts.append('<p class="nav"><a href="/">&larr; Back to the report</a></p>')
+    if running and script_nonce:
+        parts.append(f'<script nonce="{_esc(script_nonce)}">{_RESCAN_POLL_SCRIPT}</script>')
     return _page("Report regeneration", "".join(parts), footer_note=_ACTION_FOOTER, head_extra=head_extra)
 
 
@@ -1905,10 +1955,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/rescan":
             body = json.dumps(status.as_dict(), sort_keys=True).encode("utf-8")
             return HTTPStatus.OK, "application/json; charset=utf-8", body
+        nonce = self._rescan_script_nonce(status)
         return (
             HTTPStatus.OK,
             "text/html; charset=utf-8",
-            render_rescan_status_html(status).encode("utf-8"),
+            render_rescan_status_html(status, script_nonce=nonce).encode("utf-8"),
         )
 
     #: The per-response CSP script nonce (#80). Defaults to ``None`` (scripts fully
@@ -1917,14 +1968,38 @@ class _Handler(BaseHTTPRequestHandler):
     #: header always carry the same nonce and every other response stays script-free.
     _csp_nonce: Optional[str] = None
 
+    #: Whether this response's CSP adds ``connect-src 'self'`` (#90). Off for every
+    #: response except an in-flight rescan status page carrying the live-poll script, so
+    #: the fetch relaxation never leaks onto the report page or any other route.
+    _csp_connect_self: bool = False
+
     def _begin_request(self) -> None:
         """Reset per-request response state. A ``ThreadingHTTPServer`` reuses a handler
-        instance across keep-alive requests on one connection, so a stale nonce from a
-        prior GET must never linger onto a later response."""
+        instance across keep-alive requests on one connection, so a stale nonce (or the
+        connect-src relaxation) from a prior GET must never linger onto a later response."""
 
         self._csp_nonce = (
             secrets.token_urlsafe(16) if self._inline_script_enabled else None
         )
+        self._csp_connect_self = False
+
+    def _rescan_script_nonce(self, status: RescanStatus) -> Optional[str]:
+        """Wire the opt-in JS live-poll (#90) into a rescan status response.
+
+        Returns the nonce to hand :func:`render_rescan_status_html` — non-``None`` only
+        when the ``WEB_ACTION_INLINE_SCRIPT`` enhancement is on *and* a run is in flight,
+        the sole case where the poll script is emitted. As a side effect it pins the
+        per-response nonce (reusing the one ``_begin_request`` minted on a GET, or minting
+        one on the POST path where nonces are cleared) and flips on ``connect-src 'self'``
+        so the script may ``fetch('/api/rescan')``. Returns ``None`` otherwise, leaving the
+        strict no-script/no-connect CSP and the no-JS meta-refresh as the only updater."""
+
+        if not (self._inline_script_enabled and status.running):
+            return None
+        nonce = self._csp_nonce or secrets.token_urlsafe(16)
+        self._csp_nonce = nonce
+        self._csp_connect_self = True
+        return nonce
 
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler dispatch name)
         self._begin_request()
@@ -1952,9 +2027,11 @@ class _Handler(BaseHTTPRequestHandler):
         every mutating verb is refused, exactly like the plain viewer."""
 
         # POST responses (confirm/result/unlock/notice pages) never carry the inline
-        # enhancement script, so they stay script-free — clear any nonce a keep-alive GET
-        # on this reused handler instance may have left set.
+        # enhancement script, so they stay script-free — clear any nonce/connect-src a
+        # keep-alive GET on this reused handler instance may have left set. The rescan
+        # POST re-mints its own nonce (via ``_rescan_script_nonce``) when it enhances.
         self._csp_nonce = None
+        self._csp_connect_self = False
         if not self._host_gate():
             return
         service = self._reclaim
@@ -1983,9 +2060,11 @@ class _Handler(BaseHTTPRequestHandler):
         # request routed here from do_POST already passed the gate; the re-check is a
         # cheap no-op that writes nothing when the Host is fine.
         #
-        # Clear any nonce a prior keep-alive GET on this reused handler set, so a 405
-        # (which carries no script) never echoes a stale per-response nonce in its CSP.
+        # Clear any nonce/connect-src a prior keep-alive GET on this reused handler set, so
+        # a 405 (which carries no script) never echoes a stale per-response nonce or the
+        # connect-src relaxation in its CSP.
         self._csp_nonce = None
+        self._csp_connect_self = False
         if not self._host_gate():
             return
         # Accurate whether actions are on or off: the reclaim POST routes are
@@ -2221,9 +2300,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         outcome = rescan.trigger()
         code = HTTPStatus.ACCEPTED if outcome == RESCAN_STARTED else HTTPStatus.CONFLICT
+        status = rescan.status()
+        nonce = self._rescan_script_nonce(status)
         self._write_html(
             code,
-            render_rescan_status_html(rescan.status(), triggered=outcome),
+            render_rescan_status_html(status, triggered=outcome, script_nonce=nonce),
             set_cookie=self._session_cookie_header(service),
         )
 
@@ -2381,7 +2462,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header(
             "Content-Security-Policy",
-            _csp(self._actions_enabled, script_nonce=self._csp_nonce),
+            _csp(
+                self._actions_enabled,
+                script_nonce=self._csp_nonce,
+                connect_self=self._csp_connect_self,
+            ),
         )
         # Never let a shared cache/proxy store a response: a gated report (#85) is served
         # only to a cookie/token-authorized request, so a cached copy could otherwise be
