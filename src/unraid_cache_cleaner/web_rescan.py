@@ -106,12 +106,25 @@ def report_generation_lock(lock_path: Path) -> Iterator[bool]:
         yield True
         return
     try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        # Open read-only, NOT read-write: ``flock(LOCK_EX)`` works on a read-only fd, and
+        # a world-readable (``0644``) lock must be openable by *every* UID that runs a
+        # regeneration. The web server and the scheduled ``plex-duplicates`` can run as
+        # different Unix users against the same report dir; an ``O_RDWR`` open of a lock
+        # another UID created ``0644`` would ``EACCES`` and fall through to "proceed
+        # unlocked", letting both fan out to Plex and defeating the cross-process guard.
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDONLY, 0o644)
     except OSError as exc:
-        # Can't even create the sidecar (unwritable dir): degrade rather than block.
+        # Can't even create/open the sidecar (unwritable dir): degrade rather than block.
         LOGGER.debug("could not open rescan lock %s (%s); proceeding unlocked", lock_path, exc)
         yield True
         return
+    try:
+        # Force the world-readable mode past a restrictive umask (e.g. 077 would create it
+        # 0600, re-breaking cross-UID access). Best-effort: harmless if already 0644, and
+        # a non-owner that opened it read-only already has the access this guarantees.
+        os.fchmod(fd, 0o644)
+    except OSError:
+        pass
     acquired = False
     degraded = False
     try:

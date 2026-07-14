@@ -168,6 +168,18 @@ class ReportGenerationLockTests(unittest.TestCase):
             Path("/config/plex-duplicates.json.rescan.lock"),
         )
 
+    def test_lock_file_is_world_readable_for_cross_uid_open(self) -> None:
+        # The sidecar must be world-readable (0644) so a process running as a different
+        # UID (e.g. the cron plex-duplicates vs the web server) can open it and contend on
+        # the flock, instead of EACCES'ing and proceeding unlocked.
+        import os
+        import stat
+
+        with report_generation_lock(self.lock_path) as acquired:
+            self.assertTrue(acquired)
+            mode = stat.S_IMODE(os.stat(self.lock_path).st_mode)
+        self.assertEqual(mode & 0o044, 0o044)  # group- and other-readable
+
     def test_second_holder_sees_busy_then_released(self) -> None:
         with report_generation_lock(self.lock_path) as first:
             self.assertTrue(first)
