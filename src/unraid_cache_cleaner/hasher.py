@@ -121,16 +121,22 @@ class CopyHash:
 
 def _resolve_part(
     plex_path: Path, path_map: Sequence[Tuple[Path, Path]], expected_size: int
-) -> Tuple[Optional[Path], Optional[int], Optional[str]]:
+) -> Tuple[Optional[Path], Optional[Tuple[int, int, int, int]], Optional[str]]:
     """Translate + safety-check one Plex part path, mirroring the reclaim path.
 
-    Returns ``(container_path, mtime_ns, None)`` when the file is a real, in-root
+    Returns ``(container_path, identity, None)`` when the file is a real, in-root
     regular file whose on-disk size matches what Plex reported, else
     ``(None, None, reason)``. Fail-closed on every branch: unmapped path,
     missing/unreadable file, symlink or non-regular file, a realpath that escapes the
-    mapped root, or a size that drifted since the report. ``mtime_ns`` feeds the hash
-    cache fingerprint (#92) so a byte-for-byte overwrite with a new timestamp is
-    re-hashed rather than served a stale digest.
+    mapped root, or a size that drifted since the report.
+
+    ``identity`` is ``(size, mtime_ns, ctime_ns, ino)`` and feeds the hash-cache
+    fingerprint (#92). It deliberately includes **``ctime_ns`` and ``ino``** on top of
+    size/mtime: an overwrite that preserves size *and* mtime (``cp -p``, ``rsync -t``,
+    a restore, or a coarse-mtime filesystem) still bumps ``ctime`` — which userspace
+    cannot forge — and an atomic replace-by-rename changes the inode, so a stale digest
+    is not served for genuinely different bytes. All four fields come free from the
+    single ``lstat`` already performed here.
     """
 
     mapped = map_media_path(plex_path, path_map)
@@ -157,7 +163,26 @@ def _resolve_part(
             f"size changed since the report ({info.st_size} on disk != {expected_size} "
             f"reported): {container_path}"
         )
-    return container_path, info.st_mtime_ns, None
+    identity = (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino)
+    return container_path, identity, None
+
+
+def _verify_readable(resolved: Sequence[Tuple[Path, Tuple[int, int, int, int]]]) -> Optional[str]:
+    """Confirm every resolved part is still openable, or return a fail-closed reason.
+
+    Used only on a cache hit (#92): it opens and immediately closes each part so a copy
+    whose bytes are no longer readable is refused as unhashable — mirroring the
+    uncached read path's ``open()`` — while reading **zero** content bytes, so the
+    whole-file read the cache exists to avoid stays skipped.
+    """
+
+    for container_path, _identity in resolved:
+        try:
+            with open(container_path, "rb"):
+                pass
+        except OSError as exc:
+            return f"read failed: {container_path} ({exc.__class__.__name__})"
+    return None
 
 
 def _hash_copy(
@@ -174,16 +199,20 @@ def _hash_copy(
 
     Every part is resolved and safety-checked (path map, regular-file, symlink,
     root-escape, on-disk size) up front. With a ``cache`` (#92), the resolved
-    fingerprint (each part's on-disk path, size, and ``mtime_ns``) is looked up before
-    a single byte is read: a hit returns the stored digest, skipping the read but never
-    the safety checks; a miss reads and hashes as before, then stores the result.
+    fingerprint (each part's on-disk path plus ``size``/``mtime_ns``/``ctime_ns``/``ino``)
+    is looked up before the file is read end-to-end: a hit returns the stored digest,
+    skipping the expensive byte read but **not** the safety checks — including a fresh
+    ``open()`` per part so a copy that has become unreadable (an ancestor-dir/ACL/LSM
+    permission change that left size/mtime/ctime untouched) fails closed to unhashable
+    exactly as the uncached path would, rather than being trusted as confirmed. A miss
+    reads and hashes as before, then stores the result.
     """
 
     topology = tuple(part.size for part in parts)
-    resolved: List[Tuple[Path, int, int]] = []  # (container_path, size, mtime_ns)
+    resolved: List[Tuple[Path, Tuple[int, int, int, int]]] = []  # (path, identity)
     for part in parts:
-        container_path, mtime_ns, error = _resolve_part(part.file, path_map, part.size)
-        if container_path is None or mtime_ns is None:
+        container_path, identity, error = _resolve_part(part.file, path_map, part.size)
+        if container_path is None or identity is None:
             # _resolve_part always pairs a failed resolution with a reason; fall back to
             # a generic one so a warning is never formatted over a bare ``None``.
             return CopyHash(
@@ -191,18 +220,23 @@ def _hash_copy(
                 digest=None,
                 error=error or f"could not resolve part: {part.file}",
             )
-        resolved.append((container_path, part.size, mtime_ns))
+        resolved.append((container_path, identity))
 
-    copy_key = "\x00".join(str(path) for path, _size, _mtime in resolved)
-    fingerprint = "\x00".join(f"{size}:{mtime}" for _path, size, mtime in resolved)
+    copy_key = "\x00".join(str(path) for path, _identity in resolved)
+    fingerprint = "\x00".join(
+        ":".join(str(field) for field in identity) for _path, identity in resolved
+    )
     mode_key = _cache_mode_key(mode)
     if cache is not None:
         cached = cache.get(copy_key, mode_key, fingerprint)
         if cached is not None:
+            readability_error = _verify_readable(resolved)
+            if readability_error is not None:
+                return CopyHash(topology=topology, digest=None, error=readability_error)
             return CopyHash(topology=topology, digest=cached, error=None)
 
     digest = hashlib.sha256()
-    for container_path, size, _mtime in resolved:
+    for container_path, (size, _mtime, _ctime, _ino) in resolved:
         try:
             with open(container_path, "rb") as handle:
                 for offset, length in hash_regions(size, mode):

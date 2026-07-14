@@ -358,22 +358,24 @@ class ConfirmGroupsTests(unittest.TestCase):
 class CacheIntegrationTests(unittest.TestCase):
     """The persistent hash cache (#92) wired through confirm_groups.
 
-    Reads of media during ``confirm_groups`` go through the builtin ``open`` and nowhere
-    else, so counting ``open`` calls is a direct, root-proof proof of whether a copy was
-    re-read or served from cache (unlike a chmod-based read denial, which root bypasses).
+    ``hasher.hash_regions`` is invoked once per part **only on the read path**, so
+    counting its calls is a direct, root-proof proof of whether a copy's bytes were
+    actually read or served from cache. (A warm hit still ``open()``s each part for the
+    fail-closed readability re-check, so counting ``open`` no longer distinguishes a hit
+    from a miss — counting reads does.)
     """
 
-    def _confirm_counting_opens(self, groups, path_map, mode, cache):
-        opened: list[str] = []
-        real_open = open
+    def _confirm_counting_reads(self, groups, path_map, mode, cache):
+        reads: list[int] = []
+        real = hasher.hash_regions
 
-        def counting_open(file, *args, **kwargs):
-            opened.append(str(file))
-            return real_open(file, *args, **kwargs)
+        def counting(size, m):
+            reads.append(size)
+            return real(size, m)
 
-        with mock.patch("builtins.open", counting_open):
+        with mock.patch.object(hasher, "hash_regions", counting):
             out, _ = hasher.confirm_groups(groups, path_map, mode, cache=cache)
-        return out, opened
+        return out, reads
 
     def test_second_run_reuses_cache_and_skips_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -384,20 +386,20 @@ class CacheIntegrationTests(unittest.TestCase):
             group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
 
             c1 = HashCache(cache_path)
-            out1, opened1 = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_FULL, c1)
+            out1, reads1 = self._confirm_counting_reads([group], fx.path_map, hasher.HASH_FULL, c1)
             c1.close()
             self.assertEqual(out1[0].hash_status, hasher.CONFIRMED)
-            self.assertTrue(opened1)  # cold run reads the media
+            self.assertTrue(reads1)  # cold run reads the media
 
-            # A fresh cache instance models a later report run: same files, all served
-            # from cache, so no media file is opened at all.
+            # A fresh cache instance models a later report run: same files, every copy
+            # served from cache, so not a single content byte is read.
             c2 = HashCache(cache_path)
-            out2, opened2 = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_FULL, c2)
+            out2, reads2 = self._confirm_counting_reads([group], fx.path_map, hasher.HASH_FULL, c2)
             c2.close()
             self.assertEqual(out2[0].hash_status, hasher.CONFIRMED)
-            self.assertEqual(opened2, [])
+            self.assertEqual(reads2, [])
 
-    def test_mtime_change_invalidates_and_rereads(self) -> None:
+    def test_changed_bytes_invalidate_and_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fx = _MediaFixture(Path(tmpdir))
             fx.write("a.mkv", b"X" * 100)
@@ -406,20 +408,78 @@ class CacheIntegrationTests(unittest.TestCase):
             group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
 
             c1 = HashCache(cache_path)
-            hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c1)
+            out1, _ = self._confirm_counting_reads([group], fx.path_map, hasher.HASH_FULL, c1)
             c1.close()
+            self.assertEqual(out1[0].hash_status, hasher.CONFIRMED)
 
-            # a.mkv keeps its size and bytes but gets a new mtime — an overwrite could
-            # have happened, so its cached digest must be discarded and the file re-read;
-            # b.mkv is untouched and stays a cache hit.
-            new_ns = 1_000_000_000_000_000_000
-            os.utime(fx.root / "a.mkv", ns=(new_ns, new_ns))
+            # a.mkv is overwritten with different bytes (its mtime naturally moves): the
+            # stale cached digest must be discarded and the file re-read, catching the
+            # difference and downgrading the group — never a stale 'confirmed'.
+            (fx.root / "a.mkv").write_bytes(b"Y" * 100)
             c2 = HashCache(cache_path)
-            out, opened = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_FULL, c2)
+            out2, _ = self._confirm_counting_reads([group], fx.path_map, hasher.HASH_FULL, c2)
             c2.close()
-            self.assertEqual(out[0].hash_status, hasher.CONFIRMED)
-            self.assertIn(str(fx.root / "a.mkv"), opened)      # changed part re-read
-            self.assertNotIn(str(fx.root / "b.mkv"), opened)   # unchanged part cached
+            self.assertEqual(out2[0].classification, dedupe.DIFFERENT)
+            self.assertEqual(out2[0].hash_status, hasher.DIFFERENT)
+
+    def test_same_size_and_mtime_changed_bytes_is_reread(self) -> None:
+        # The P1 case a (size, mtime) fingerprint alone misses: an overwrite (cp -p /
+        # rsync -t / coarse-mtime FS) that preserves size AND mtime but changes bytes.
+        # ctime (which userspace cannot forge) still moves, so the group is re-read and
+        # downgraded rather than served a stale 'confirmed'.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            cache_path = Path(tmpdir) / "hc.sqlite3"
+            group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
+
+            c1 = HashCache(cache_path)
+            out1, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c1)
+            c1.close()
+            self.assertEqual(out1[0].hash_status, hasher.CONFIRMED)
+
+            orig = os.stat(fx.root / "a.mkv")
+            (fx.root / "a.mkv").write_bytes(b"Y" * 100)  # different bytes, same size
+            os.utime(fx.root / "a.mkv", ns=(orig.st_atime_ns, orig.st_mtime_ns))  # restore mtime
+            after = os.stat(fx.root / "a.mkv")
+            self.assertEqual(after.st_size, orig.st_size)          # size unchanged
+            self.assertEqual(after.st_mtime_ns, orig.st_mtime_ns)  # mtime restored
+
+            c2 = HashCache(cache_path)
+            out2, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c2)
+            c2.close()
+            self.assertEqual(out2[0].classification, dedupe.DIFFERENT)
+            self.assertEqual(out2[0].hash_status, hasher.DIFFERENT)
+
+    def test_cache_hit_reverifies_readability(self) -> None:
+        # The P2 case: a warm hit must not skip the readability check. If the media
+        # became unopenable while its size/mtime/ctime stayed intact (an ancestor-dir,
+        # ACL, or LSM change), the hit fails closed to unhashable, never confirmed.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = _MediaFixture(Path(tmpdir))
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            cache_path = Path(tmpdir) / "hc.sqlite3"
+            group = _identical_group(_copy(1, "a.mkv", 100), _copy(2, "b.mkv", 100))
+
+            c1 = HashCache(cache_path)
+            out1, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c1)
+            c1.close()
+            self.assertEqual(out1[0].hash_status, hasher.CONFIRMED)
+
+            c2 = HashCache(cache_path)
+            real_open = open
+
+            def deny_media(file, *args, **kwargs):
+                if str(fx.root) in str(file):
+                    raise PermissionError(13, "Permission denied")
+                return real_open(file, *args, **kwargs)
+
+            with mock.patch("builtins.open", deny_media):
+                out2, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL, cache=c2)
+            c2.close()
+            self.assertEqual(out2[0].hash_status, hasher.UNHASHABLE)
 
     def test_full_then_partial_does_not_reuse_full_digest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -434,12 +494,12 @@ class CacheIntegrationTests(unittest.TestCase):
             c1.close()
 
             # A partial run has a distinct mode key: it must not be served the full
-            # digest, so it re-reads and reports sample-match (never full's confirmed).
+            # digest, so it re-reads (reads > 0) and reports sample-match.
             c2 = HashCache(cache_path)
-            out, opened = self._confirm_counting_opens([group], fx.path_map, hasher.HASH_PARTIAL, c2)
+            out, reads = self._confirm_counting_reads([group], fx.path_map, hasher.HASH_PARTIAL, c2)
             c2.close()
             self.assertEqual(out[0].hash_status, hasher.SAMPLE_MATCH)
-            self.assertTrue(opened)
+            self.assertTrue(reads)
 
     def test_disabled_cache_still_hashes_live(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

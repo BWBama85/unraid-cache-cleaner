@@ -112,7 +112,7 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `PLEX_VERIFY_TLS` | `true` | Verify TLS certificates (set `false` for a self-signed reverse proxy) |
 | `PLEX_DUPLICATE_REPORT_PATH` | `/config/plex-duplicates.json` | JSON duplicate report output path |
 | `HASH_MODE` | `off` | Opt into the [content-hash confirmation pass](#content-hash-confirmation-hash_mode): `off` (default, no media read), `partial` (size + first/last 4 MiB per copy, constant cost), or `full` (whole-file `sha256`). Confirms `identical` groups are truly byte-identical and downgrades any that aren't to *different-content* (never reclaimable). Reads Plex paths via `WEB_MEDIA_PATH_MAP`, so that map must be set and the media mounted (read-only) |
-| `HASH_CACHE` | `true` | Cache content-hash digests between runs so `HASH_MODE=partial`/`full` doesn't re-read every media file each report. Keyed by each copy's size + mtime (a changed file is re-hashed); fail-open (a corrupt/locked cache just re-hashes, never a wrong verdict). Inert when `HASH_MODE=off` (no cache DB is opened). Set `false` to always hash live |
+| `HASH_CACHE` | `true` | Cache content-hash digests between runs so `HASH_MODE=partial`/`full` doesn't re-read every media file each report. Keyed by each copy's size, mtime, ctime, and inode (a changed file — even a same-size/same-mtime overwrite — is re-hashed); fail-open (a corrupt/locked cache just re-hashes, never a wrong verdict). Inert when `HASH_MODE=off` (no cache DB is opened). Set `false` to always hash live |
 | `HASH_CACHE_PATH` | `/config/hash-cache.sqlite3` | Location of the hash-cache SQLite sidecar (created only when the hash pass runs). Keep it on persistent storage (e.g. `/config`) so the cache survives restarts |
 | `RADARR_URL` | empty | Radarr base URL (e.g. `http://192.168.1.10:7878`); enables movie `*arr`-tracking |
 | `RADARR_API_KEY` | empty | Radarr API key (sent as `X-Api-Key`, never in the URL) |
@@ -249,11 +249,15 @@ each reclaimable row also carries a small `hash: confirmed` / `sample-match` /
 
 To avoid re-reading the whole library on every report, digests are cached between
 runs (`HASH_CACHE=true`, on by default) in a SQLite sidecar at `HASH_CACHE_PATH`
-(`/config/hash-cache.sqlite3`). Each copy's digest is keyed by its size + mtime, so a
-changed file is re-hashed and a `partial` digest is never reused for a `full` run (or
-vice-versa). The cache is fail-open — a corrupt, locked, or unwritable cache silently
-degrades to live hashing, never a wrong verdict — and is never opened for
-`HASH_MODE=off`. Set `HASH_CACHE=false` to always hash live.
+(`/config/hash-cache.sqlite3`). Each copy's digest is keyed by its size, mtime, ctime,
+and inode, so any changed file is re-hashed — even an overwrite that preserves size and
+mtime (`cp -p`, `rsync -t`, a restore, or a coarse-mtime filesystem), because ctime
+still moves and cannot be forged from userspace — and a `partial` digest is never
+reused for a `full` run (or vice-versa). A cache hit still re-opens each file, so a copy
+that has become unreadable is reported `unhashable` rather than trusted as confirmed.
+The cache is fail-open — a corrupt, locked, or unwritable cache silently degrades to
+live hashing, never a wrong verdict — and is never opened for `HASH_MODE=off`. Set
+`HASH_CACHE=false` to always hash live.
 
 Getting your token: open any item in Plex Web → **⋯ → Get Info → View XML**, and
 copy the `X-Plex-Token` value from the URL. It travels as a request header, never
