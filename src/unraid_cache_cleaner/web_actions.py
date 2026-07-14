@@ -70,7 +70,7 @@ from . import arr, dedupe
 from .arr import ArrClientError
 from .config import Config
 from .models import ActionRecord
-from .planner import collapse_roots, is_within
+from .planner import collapse_roots, is_within, map_media_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1120,10 +1120,17 @@ class ReclaimService:
 
         if not entry.group_has_keeper:
             return self._refused(target, "", "group has no authoritative keeper; not reclaimable")
-        if entry.classification == _MISMATCH:
-            return self._refused(
-                target, "", "mismatch group: Plex merged different titles; never reclaimed"
+        if not dedupe.is_reclaimable(entry.classification):
+            # Protected classifications are never reclaimed: ``mismatch`` (Plex merged
+            # different titles) and ``different-content`` (the #9 hash pass proved these
+            # same-size copies differ byte-for-byte, so one is not redundant). Sharing
+            # dedupe's predicate keeps a new protected class from slipping through here.
+            reason = (
+                "mismatch group: Plex merged different titles; never reclaimed"
+                if entry.classification == _MISMATCH
+                else "different-content group: copies are not byte-identical (hash pass); never reclaimed"
             )
+            return self._refused(target, "", reason)
         if entry.is_keeper:
             return self._refused(target, "", "target is the group keeper; never deleted")
         if any(part.plex_path in entry.keeper_paths for part in entry.parts):
@@ -1400,26 +1407,10 @@ class ReclaimService:
 
     def _map_path(self, plex_path: Path) -> Optional[Tuple[Path, Path]]:
         """Longest-prefix, component-aware map of a Plex path to ``(container_path,
-        container_prefix)``. Component-aware so ``/mnt/user/Media`` never matches
-        ``/mnt/user/Media2``; a ``..`` in the remainder is refused (never joined)."""
+        container_prefix)`` — delegates to the shared :func:`planner.map_media_path`
+        so the reclaim path and the content-hash pass (#9) translate paths identically."""
 
-        plex_parts = plex_path.parts
-        best: Optional[Tuple[int, Path, Path]] = None
-        for plex_prefix, container_prefix in self._config.web_media_path_map:
-            prefix_parts = plex_prefix.parts
-            if len(prefix_parts) > len(plex_parts):
-                continue
-            if tuple(plex_parts[: len(prefix_parts)]) != prefix_parts:
-                continue
-            remainder = plex_parts[len(prefix_parts):]
-            if any(component == ".." for component in remainder):
-                continue
-            candidate = container_prefix.joinpath(*remainder)
-            if best is None or len(prefix_parts) > best[0]:
-                best = (len(prefix_parts), candidate, container_prefix)
-        if best is None:
-            return None
-        return best[1], best[2]
+        return map_media_path(plex_path, self._config.web_media_path_map)
 
     # -- *arr backend -------------------------------------------------------- #
 

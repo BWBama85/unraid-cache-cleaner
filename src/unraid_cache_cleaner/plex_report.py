@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import arr, dedupe
+from . import arr, dedupe, hasher
 from .arr import ArrClientError, RadarrClient, SonarrClient
 from .config import Config
 from .models import DuplicateGroup, DuplicateReport, MediaCopy, PlexSection
@@ -186,13 +186,26 @@ class PlexDuplicateReporter:
                     raw_groups.append(group)
 
         analyzed = dedupe.analyze(raw_groups)
+
+        # Optional content-hash pass (#9): confirm/downgrade the ``identical`` groups
+        # BEFORE sorting and summarizing, so a downgrade (different-content ⇒
+        # reclaimable 0) reorders the table and is reflected in the totals. The
+        # summary is computed with ``summarize_analyzed`` (not ``summarize``) precisely
+        # so re-analysis does not wipe the hash verdicts.
+        hash_enabled = self.config.hash_mode != hasher.HASH_OFF
+        if hash_enabled:
+            analyzed, hash_warnings = hasher.confirm_groups(
+                analyzed, self.config.web_media_path_map, self.config.hash_mode
+            )
+            warnings.extend(hash_warnings)
+
         analyzed.sort(key=self._group_sort_key)
 
         if self._arr_enabled:
             radarr_index, sonarr_index = self._build_arr_indexes(warnings)
             analyzed = arr.annotate(analyzed, radarr_index, sonarr_index)
 
-        summary = dedupe.summarize(analyzed)
+        summary = dedupe.summarize_analyzed(analyzed)
 
         return DuplicateReport(
             generated_at=self.clock(),
@@ -204,6 +217,7 @@ class PlexDuplicateReporter:
             summary=summary,
             warnings=warnings,
             arr_enabled=self._arr_enabled,
+            hash_enabled=hash_enabled,
         )
 
     def _build_arr_indexes(
@@ -233,11 +247,15 @@ class PlexDuplicateReporter:
         return radarr_index, sonarr_index
 
     def _summary(self, report: DuplicateReport):
-        """The report's precomputed summary, recomputed only if absent."""
+        """The report's precomputed summary, recomputed only if absent.
+
+        Recomputes with ``summarize_analyzed`` (the report's groups are already
+        analyzed and possibly hash-tagged), so a fallback recompute never re-runs
+        ``analyze`` and wipes a content-hash downgrade."""
 
         if report.summary is not None:
             return report.summary
-        return dedupe.summarize(report.groups)
+        return dedupe.summarize_analyzed(report.groups)
 
     @staticmethod
     def _group_sort_key(group: DuplicateGroup) -> Tuple[int, str, str]:
@@ -282,7 +300,9 @@ class PlexDuplicateReporter:
         self._rank_cache[id(group)] = (group, pairs)
         return pairs
 
-    def _group_json(self, group: DuplicateGroup, *, include_arr: bool = False) -> dict:
+    def _group_json(
+        self, group: DuplicateGroup, *, include_arr: bool = False, include_hash: bool = False
+    ) -> dict:
         pairs = self._ranked_pairs(group)
 
         if group.classification == dedupe.MISMATCH:
@@ -308,7 +328,7 @@ class PlexDuplicateReporter:
         if group.keeper is not None and pairs:
             keeper_json = _copy_json(group.keeper, pairs[0][1], include_arr=include_arr)
 
-        return {
+        payload = {
             "rating_key": group.rating_key,
             "title": group.title,
             "kind": group.kind,
@@ -317,6 +337,11 @@ class PlexDuplicateReporter:
             "keeper": keeper_json,
             "copies": copies,
         }
+        # ``hash_status`` rides only on a hashed report, so an ``HASH_MODE=off`` report
+        # keeps its exact prior shape (the key is absent, not empty).
+        if include_hash:
+            payload["hash_status"] = group.hash_status
+        return payload
 
     def build_payload(self, report: DuplicateReport) -> dict:
         """Return the stable JSON payload for ``report`` (also used by tests)."""
@@ -324,6 +349,7 @@ class PlexDuplicateReporter:
         self._begin_render(report)
         summary = self._summary(report)
         include_arr = report.arr_enabled
+        include_hash = report.hash_enabled
         payload: dict = {
             "generated_at": report.generated_at,
             "plex_url": self.config.plex_url,
@@ -338,7 +364,8 @@ class PlexDuplicateReporter:
                 "mismatch_count": summary.mismatch_count,
             },
             "groups": [
-                self._group_json(group, include_arr=include_arr) for group in report.groups
+                self._group_json(group, include_arr=include_arr, include_hash=include_hash)
+                for group in report.groups
             ],
             "warnings": report.warnings,
             "errors": report.errors,
@@ -350,6 +377,15 @@ class PlexDuplicateReporter:
             payload["totals"]["arr_tracked_reclaimable_count"] = self._arr_reclaimable_tracked_count(
                 report
             )
+        # The hash totals/flag ride only on a hashed report, so an ``HASH_MODE=off``
+        # report keeps its exact prior shape.
+        if include_hash:
+            payload["hash_enabled"] = True
+            payload["hash_mode"] = self.config.hash_mode
+            payload["totals"]["hash_confirmed_count"] = summary.hash_confirmed_count
+            payload["totals"]["hash_sample_match_count"] = summary.hash_sample_match_count
+            payload["totals"]["hash_unhashable_count"] = summary.hash_unhashable_count
+            payload["totals"]["different_content_count"] = summary.different_count
         return payload
 
     def _reclaim_candidates(self, group: DuplicateGroup) -> List[MediaCopy]:
@@ -436,12 +472,22 @@ class PlexDuplicateReporter:
         arr_note = ""
         if report.arr_enabled:
             arr_note = f" arr_tracked={self._arr_reclaimable_tracked_count(report)}"
+        hash_note = ""
+        if report.hash_enabled:
+            hash_note = (
+                f" hash={self.config.hash_mode}"
+                f" confirmed={summary.hash_confirmed_count}"
+                f" sample_match={summary.hash_sample_match_count}"
+                f" different={summary.different_count}"
+                f" unhashable={summary.hash_unhashable_count}"
+            )
         LOGGER.info(
-            "Plex duplicates: sections=%s groups=%s reclaimable=%s mismatches=%s%s",
+            "Plex duplicates: sections=%s groups=%s reclaimable=%s mismatches=%s%s%s",
             len(report.sections),
             summary.group_count,
             _fmt_gib(summary.reclaimable_bytes),
             summary.mismatch_count,
+            hash_note,
             arr_note,
         )
 
@@ -473,11 +519,12 @@ class PlexDuplicateReporter:
         lines.extend(f"  warning: {warning}" for warning in report.warnings)
         lines.append("")
 
-        # Every non-mismatch group is listed, including any whose reclaimable
-        # bytes are 0 (e.g. copies Plex reports without a size) — so the section
-        # rows always account for every group the header counts.
+        # Every reclaimable group is listed, including any whose reclaimable bytes
+        # are 0 (e.g. copies Plex reports without a size) — so the section rows always
+        # account for every group the header counts. The predicate excludes both
+        # ``mismatch`` and (when the hash pass ran) ``different-content``.
         reclaimable = [
-            group for group in report.groups if group.classification != dedupe.MISMATCH
+            group for group in report.groups if dedupe.is_reclaimable(group.classification)
         ]
         reclaimable.sort(key=self._group_sort_key)
         total = sum(group.reclaimable_bytes for group in reclaimable)
@@ -485,7 +532,9 @@ class PlexDuplicateReporter:
             f"Reclaimable (safe) - {_fmt_gib(total)} across {len(reclaimable)} groups"
         )
         lines.extend(
-            self._render_reclaimable_rows(reclaimable, limit, arr_enabled=report.arr_enabled)
+            self._render_reclaimable_rows(
+                reclaimable, limit, arr_enabled=report.arr_enabled, hash_enabled=report.hash_enabled
+            )
         )
         lines.append("")
 
@@ -498,6 +547,20 @@ class PlexDuplicateReporter:
         )
         lines.extend(self._render_mismatch_rows(mismatches, limit))
         lines.append("")
+
+        # Different-content review section, only when the content-hash pass ran (#9):
+        # groups Plex reported as same-size copies that hashing proved differ. Excluded
+        # from reclaimable above; surfaced here so the exclusion is never silent.
+        if report.hash_enabled:
+            different = [
+                group for group in report.groups if group.classification == dedupe.DIFFERENT
+            ]
+            different.sort(key=lambda group: (group.kind, group.title, group.rating_key))
+            lines.append(
+                f"Review - different content (hash mismatch, excluded) - {len(different)} groups"
+            )
+            lines.extend(self._render_mismatch_rows(different, limit))
+            lines.append("")
 
         lines.append("[!] arr-tracked (Radarr/Sonarr)")
         lines.extend(self._render_arr_rows(report, reclaimable, limit))
@@ -524,6 +587,7 @@ class PlexDuplicateReporter:
         limit: Optional[int],
         *,
         arr_enabled: bool = False,
+        hash_enabled: bool = False,
     ) -> List[str]:
         if not groups:
             return ["  (none)"]
@@ -532,15 +596,29 @@ class PlexDuplicateReporter:
         for group in shown:
             pairs = self._ranked_pairs(group)
             keeper_res = (group.keeper.resolution or "?") if group.keeper else "?"
-            tag = self._group_arr_tag(group) if arr_enabled else ""
+            hash_tag = self._hash_tag(group) if hash_enabled else ""
+            arr_tag = self._group_arr_tag(group) if arr_enabled else ""
             rows.append(
                 f"  {_fmt_gib(group.reclaimable_bytes):>10}  "
                 f"{group.classification:<9} {group.kind:<7} "
-                f"keep={keeper_res:<5} copies={len(pairs)}  {group.title}{tag}"
+                f"keep={keeper_res:<5} copies={len(pairs)}  {group.title}{hash_tag}{arr_tag}"
             )
             rows.extend(self._reclaimable_part_rows(pairs, arr_enabled=arr_enabled))
         rows.extend(self._truncation_note(len(groups), len(shown)))
         return rows
+
+    @staticmethod
+    def _hash_tag(group: DuplicateGroup) -> str:
+        """Per-row content-hash verdict tag (#9): confirmed / sampled / unverified.
+
+        Empty for a group the pass did not tag (e.g. an ``upgrade``), so only the
+        ``identical`` candidates carry a marker."""
+
+        return {
+            hasher.CONFIRMED: "  [hash:confirmed]",
+            hasher.SAMPLE_MATCH: "  [hash:sample-match]",
+            hasher.UNHASHABLE: "  [hash:unhashable]",
+        }.get(group.hash_status, "")
 
     @staticmethod
     def _reclaimable_part_rows(

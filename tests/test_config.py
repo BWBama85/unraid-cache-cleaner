@@ -15,6 +15,7 @@ from unraid_cache_cleaner.config import (
     DEFAULT_EXCLUDED_GLOBS,
     Config,
     _parse_glob_list,
+    _parse_hash_mode,
     _parse_str_list,
 )
 
@@ -211,6 +212,32 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.extract_owner, "99:100")
                 self.assertEqual(config.extract_min_age_seconds, 60)
                 self.assertEqual(config.extract_protect_seconds, 3600)
+
+    def test_hash_mode_defaults_off(self) -> None:
+        self.assertEqual(_parse_hash_mode(None), "off")
+        self.assertEqual(_parse_hash_mode(""), "off")
+        self.assertEqual(_parse_hash_mode("   "), "off")
+
+    def test_hash_mode_parses_case_insensitively(self) -> None:
+        self.assertEqual(_parse_hash_mode("PARTIAL"), "partial")
+        self.assertEqual(_parse_hash_mode(" Full "), "full")
+        self.assertEqual(_parse_hash_mode("off"), "off")
+
+    def test_hash_mode_invalid_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            _parse_hash_mode("sometimes")
+
+    def test_hash_mode_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            base_env = {
+                "STATE_DB_PATH": str(Path(tempdir) / "state" / "db.sqlite3"),
+                "REPORT_PATH": str(Path(tempdir) / "reports" / "last-run.json"),
+                "PLEX_DUPLICATE_REPORT_PATH": str(Path(tempdir) / "plex" / "dupes.json"),
+            }
+            with mock.patch.dict(os.environ, base_env, clear=True):
+                self.assertEqual(Config.from_env().hash_mode, "off")  # default
+            with mock.patch.dict(os.environ, {**base_env, "HASH_MODE": "full"}, clear=True):
+                self.assertEqual(Config.from_env().hash_mode, "full")
 
     def test_web_defaults_are_fail_closed(self) -> None:
         # #34: the web viewer is opt-in for `service` (web_enabled=False) and

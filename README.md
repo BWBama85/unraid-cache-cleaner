@@ -111,6 +111,7 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `PLEX_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Plex |
 | `PLEX_VERIFY_TLS` | `true` | Verify TLS certificates (set `false` for a self-signed reverse proxy) |
 | `PLEX_DUPLICATE_REPORT_PATH` | `/config/plex-duplicates.json` | JSON duplicate report output path |
+| `HASH_MODE` | `off` | Opt into the [content-hash confirmation pass](#content-hash-confirmation-hash_mode): `off` (default, no media read), `partial` (size + first/last 4 MiB per copy, constant cost), or `full` (whole-file `sha256`). Confirms `identical` groups are truly byte-identical and downgrades any that aren't to *different-content* (never reclaimable). Reads Plex paths via `WEB_MEDIA_PATH_MAP`, so that map must be set and the media mounted (read-only) |
 | `RADARR_URL` | empty | Radarr base URL (e.g. `http://192.168.1.10:7878`); enables movie `*arr`-tracking |
 | `RADARR_API_KEY` | empty | Radarr API key (sent as `X-Api-Key`, never in the URL) |
 | `RADARR_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Radarr |
@@ -180,6 +181,10 @@ sections:
   tracks; see below. Shows a "not configured" hint until you set `RADARR_*` /
   `SONARR_*`.
 
+With `HASH_MODE` enabled (see below) a fourth section, **Review — different
+content (hash mismatch, excluded)**, lists any `identical` group the hash pass
+proved is *not* byte-identical; those are excluded from reclaimable.
+
 For a **stacked multi-part copy** — one release Plex splits across several files
 (`cd1.mkv` + `cd2.mkv`) that share a `media_id` — the report keeps it as one
 logical copy (its size is the sum of the parts, the unit you keep or reclaim) but
@@ -199,6 +204,44 @@ Flags:
 | `--json-only` | Write the JSON report only; suppress the printed table |
 | `--limit N` | Cap printed rows per section (the JSON report is unaffected) |
 | `--section ID` | Scan a specific library section ID; repeatable; overrides `PLEX_SECTIONS` |
+
+### Content-hash confirmation (`HASH_MODE`)
+
+Plex groups duplicates by metadata and size, **not** content — so two same-size
+files it calls duplicates could actually be different bytes (a botched encode, a
+different cut). The optional content-hash pass reads the files and settles it. It
+is **off by default** and read-only; it never changes what a reclaim deletes, only
+which copies are labelled safe.
+
+```bash
+HASH_MODE=full \
+WEB_MEDIA_PATH_MAP=/mnt/user/Media:/media \
+PLEX_URL=… PLEX_TOKEN=… \
+PYTHONPATH=src python3 -m unraid_cache_cleaner plex-duplicates
+```
+
+- `HASH_MODE=partial` reads size + the **first and last 4 MiB** of each copy — a
+  strong identity signal at constant cost, so a 60 GB remux is not read end-to-end.
+  A partial match is labelled `sample-match` (a strong signal, **never** proof,
+  because the middle is unread); a partial *mismatch* still proves the copies differ.
+- `HASH_MODE=full` streams the whole file for a byte-for-byte verdict, labelled
+  `hash-confirmed`.
+- Either mode **downgrades** an `identical` group whose copies prove different to
+  `different-content` with `reclaimable_bytes = 0` — it is removed from the
+  reclaimable set and the browser reclaim form, and refused by the action layer, so
+  a genuinely-different file is never mistaken for a redundant copy.
+- A copy that can't be located or read (unmapped path, missing file, size drift,
+  symlink) is marked `unhashable`: the group stays size-only reclaimable exactly as
+  it was, but is never labelled confirmed — an unverified copy is never silently
+  called safe.
+
+Because the pass reads the media, it must run **where the media is mounted**
+(usually the Unraid container, not a dev box), and it translates Plex-reported
+paths through the same `WEB_MEDIA_PATH_MAP` the browser reclaim uses. With no map,
+or with the media not mounted, the pass is skipped with a warning and the report
+falls back to size-only. Mount the media **read-only** — the pass never writes. The
+JSON gains a per-group `hash_status` and hash totals only when `HASH_MODE` is on, so
+an `off` report is byte-for-byte unchanged.
 
 Getting your token: open any item in Plex Web → **⋯ → Get Info → View XML**, and
 copy the `X-Plex-Token` value from the URL. It travels as a request header, never

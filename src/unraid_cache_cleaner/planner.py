@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, Sequence, Union
+from typing import Iterable, Optional, Sequence, Tuple, Union
 
 from .models import FileRecord, ProtectionPlan, TorrentRecord
 
@@ -13,6 +13,41 @@ def normalize_path(path: Union[Path, str]) -> Path:
     """Normalize a path without dereferencing symlinks."""
 
     return Path(os.path.abspath(os.path.normpath(str(path))))
+
+
+def map_media_path(
+    plex_path: Path, path_map: Sequence[Tuple[Path, Path]]
+) -> Optional[Tuple[Path, Path]]:
+    """Map a Plex-reported path to ``(container_path, container_prefix)`` via ``path_map``.
+
+    Longest-prefix and **component-aware**, so ``/mnt/user/Media`` never matches
+    ``/mnt/user/Media2``; a ``..`` in the remainder is refused (never joined) so a
+    crafted Plex path cannot escape its mapped root. Returns ``None`` when no prefix
+    matches — the caller must treat an unmapped path as fail-closed (a filesystem
+    delete is refused, a hash is marked unhashable), never guess.
+
+    Shared by the web action layer's filesystem reclaim (#34) and the content-hash
+    confirmation pass (#9): both translate the same Plex ``Part.file`` to this
+    container's mounts, so the mapping lives here rather than being duplicated.
+    """
+
+    plex_parts = plex_path.parts
+    best: Optional[Tuple[int, Path, Path]] = None
+    for plex_prefix, container_prefix in path_map:
+        prefix_parts = plex_prefix.parts
+        if len(prefix_parts) > len(plex_parts):
+            continue
+        if tuple(plex_parts[: len(prefix_parts)]) != prefix_parts:
+            continue
+        remainder = plex_parts[len(prefix_parts):]
+        if any(component == ".." for component in remainder):
+            continue
+        candidate = container_prefix.joinpath(*remainder)
+        if best is None or len(prefix_parts) > best[0]:
+            best = (len(prefix_parts), candidate, container_prefix)
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 def is_within(path: Path, root: Path) -> bool:

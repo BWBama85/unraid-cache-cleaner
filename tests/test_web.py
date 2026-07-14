@@ -170,6 +170,54 @@ class ReportViewerTests(unittest.TestCase):
         self.assertIn("2024-07-03", body.decode("utf-8"))
         self.assertIn("UTC", body.decode("utf-8"))
 
+    def test_different_content_group_excluded_and_reviewed(self) -> None:
+        # #9: a hashed report with a different-content group must surface it in the
+        # review section (never silently dropped) and keep it out of the reclaimable
+        # form, while the hash tiles render.
+        payload = _payload()
+        payload["hash_enabled"] = True
+        payload["hash_mode"] = "full"
+        payload["totals"]["hash_confirmed_count"] = 0
+        payload["totals"]["hash_unhashable_count"] = 0
+        payload["totals"]["different_content_count"] = 1
+        payload["groups"].append(
+            {
+                "rating_key": "300",
+                "title": "Hash Differ",
+                "kind": "movie",
+                "classification": "different-content",
+                "reclaimable_bytes": 0,
+                "hash_status": "different",
+                "keeper": None,
+                "copies": [
+                    {
+                        "file": "/movies/differ/a.mkv",
+                        "size": 5 * GiB,
+                        "resolution": "1080",
+                        "media_id": 5,
+                        "parts": [{"part_id": 51, "file": "/movies/differ/a.mkv", "size": 5 * GiB}],
+                    },
+                    {
+                        "file": "/movies/differ/b.mkv",
+                        "size": 5 * GiB,
+                        "resolution": "1080",
+                        "media_id": 6,
+                        "parts": [{"part_id": 61, "file": "/movies/differ/b.mkv", "size": 5 * GiB}],
+                    },
+                ],
+            }
+        )
+        html = render_report_html(payload, actions_enabled=True)
+        # Surfaced under the different-content review section.
+        self.assertIn("different content (hash mismatch, excluded)", html)
+        self.assertIn("Hash Differ", html)
+        # Hash totals tiles render.
+        self.assertIn("Different content (excluded)", html)
+        self.assertIn("Hash-confirmed", html)
+        # Excluded from the reclaim form: its parts are never a reclaim checkbox target.
+        self.assertNotIn("300:51", html)
+        self.assertNotIn("300:61", html)
+
     def test_api_returns_wrapped_report_with_delete_target_keys(self) -> None:
         with _serve(lambda: _payload()) as base:
             status, headers, body = _get(base + "/api/report")
