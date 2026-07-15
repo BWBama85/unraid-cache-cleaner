@@ -1149,7 +1149,8 @@ class RealBinaryTests(unittest.TestCase):
             archive = self._nested_fixture_archive(rel)
             clock = lambda: archive.stat().st_mtime + 10_000  # noqa: E731 - past the settle guard
 
-            # First pass materializes the tree (no ledger ⇒ no output bookkeeping).
+            # First pass materializes the tree; with no ledger nothing records the
+            # outputs it reports, so only its on-disk effect matters here.
             first = Extractor(fx.config(), clock=clock)
             self.assertEqual(
                 [r.status for r in first.extract_all((fx.watch_root,), dry_run=False)],

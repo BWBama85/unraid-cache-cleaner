@@ -113,10 +113,11 @@ class ExtractionResult:
     message: str = ""
     output_dir: Optional[Path] = None
     # Files this extraction created or overwrote — never an untouched sibling or
-    # the source archive, and identical whether or not a ledger is configured. The
-    # deletion planner protects these so extracted media survives until *arr
-    # imports it (Child C). Empty for every status that writes nothing (dry-run,
-    # deferred, skipped, and a failure before extraction).
+    # the source archive, and computed the same way with or without a ledger
+    # (#105). The deletion planner protects these so extracted media survives
+    # until *arr imports it (Child C). Empty for any result that never reached the
+    # produced-set walk: dry-run, deferred, skipped, a failed extraction, or a
+    # bookkeeping failure inside the walk.
     outputs: Tuple[Path, ...] = ()
 
 
