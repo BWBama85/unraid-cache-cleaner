@@ -344,6 +344,24 @@ def _esc(value: object) -> str:
     return _escape(str(value))
 
 
+def _js_literal(value: str) -> str:
+    """``value`` as a quoted JS string literal, safe to embed in an inline ``<script>``.
+
+    The enhancement scripts are assembled as one long string, so a hand-wrapped
+    ``'...'`` makes correctness depend on the *content* of every constant it quotes: a
+    single apostrophe in UI copy — the most natural edit these strings ever get — would
+    close the literal early and emit a `SyntaxError` that kills the entire script. On the
+    rescan page that means no poll at all behind a ``<noscript>``-gated meta-refresh: the
+    frozen "Regenerating…" spinner #96 exists to prevent. Worse, it is invisible to tests
+    that interpolate the same constant into their expectation.
+
+    :func:`json.dumps` produces a correctly escaped (and, by default, ASCII-only) literal;
+    ``<`` is additionally escaped so no value can close the enclosing ``<script>`` element.
+    """
+
+    return json.dumps(value).replace("<", "\\u003c")
+
+
 _STYLE = """
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
@@ -919,7 +937,25 @@ _RESCAN_POLL_SECONDS = 4
 #: :data:`Config.web_action_session_seconds` default 3600s) lands on the locked page
 #: instead of a "Regenerating…" spinner that never resolves. A single valid ``running``
 #: response resets the count, so only *sustained* failure ever trips it.
+#:
+#: A *hung* poll (#100) costs its abort deadline (:data:`_RESCAN_POLL_SECONDS`) on top of
+#: the same backoff, so sustained hangs pace at ~2× that — ~2 min to the terminal
+#: navigation rather than ~1. Bounded either way, which is the guarantee that matters;
+#: shortening the deadline to hold a flat 60s would only make a merely-slow proxy look
+#: hung, and skipping the backoff after an abort would hammer a server already failing.
 _RESCAN_POLL_MAX_FAILURES = 15
+
+#: The fixed, self-authored text the live-poll shows while it is failing but has not yet
+#: exhausted :data:`_RESCAN_POLL_MAX_FAILURES` (#99), so a degrading poll reads as such
+#: instead of an unchanging "Regenerating…". Deliberately a *constant*: the script assigns
+#: it via ``textContent``, and no response body, status code, or error detail ever reaches
+#: the DOM. Cleared on the next valid ``running`` poll.
+_RESCAN_POLL_HINT = "still checking… (last attempt failed)"
+
+#: The id of the empty inline element :func:`render_rescan_status_html` pre-renders to
+#: carry :data:`_RESCAN_POLL_HINT`. Emitted only alongside the script (running + nonce),
+#: so it is absent from terminal and non-enhanced pages that have nothing to fill it.
+_RESCAN_POLL_HINT_ID = "rescan-poll-hint"
 
 
 #: The opt-in JS live-poll (#90), admitted only under a matching ``script-src 'nonce-…'``
@@ -938,21 +974,49 @@ _RESCAN_POLL_MAX_FAILURES = 15
 #: transient blip still just retries — only a persistent failure (e.g. a lapsed unlock
 #: session mid-scan) trips the terminal navigation. Read-only: it only ever GETs the
 #: status API, never triggers a scan or submits anything. Kept tiny and self-contained.
+#:
+#: Hung requests (#100): a fetch that opens a connection but never settles would otherwise
+#: neither resolve nor reject — scheduling no next poll and counting toward no budget, so
+#: the poll stalls silently until the browser's own (often minutes-long) network timeout
+#: and #96's terminal-state guarantee quietly lapses. Each poll therefore gets its own
+#: ``AbortController`` armed for ``ms``; the abort rejects the fetch into the *same*
+#: ``fail`` path as every other failure, so a hang counts exactly once and needs no second
+#: counter. The deadline covers body settlement too (a response whose JSON never arrives is
+#: just as hung), and every settle path clears the timer so a finished poll leaves nothing
+#: pending. ``window.AbortController`` is feature-detected rather than assumed: a browser
+#: with ``fetch`` but no ``AbortController`` (Safari 10.1–12.0, Chrome 42–65) would throw
+#: on construction, killing the poll chain outright and stranding the meta-refresh inside
+#: ``<noscript>`` — the exact forever-spinner #96 exists to prevent. There it simply polls
+#: unbounded, as it did before #100.
+#:
+#: Degrade hint (#99): while failing but still under budget the poll writes the fixed
+#: :data:`_RESCAN_POLL_HINT` into the pre-rendered hint element via ``textContent``, so a
+#: struggling poll is visible before it navigates away; a valid ``running`` poll clears it.
 _RESCAN_POLL_SCRIPT = (
     "(function(){"
     "var ms=" + str(_RESCAN_POLL_SECONDS * 1000) + ";"
     "var max=" + str(_RESCAN_POLL_MAX_FAILURES) + ";"
     "var fails=0;"
+    "var hint=function(m){"
+    "var e=document.getElementById(" + _js_literal(_RESCAN_POLL_HINT_ID) + ");"
+    "if(e){e.textContent=m;}};"
     "var fail=function(){"
     "if(++fails>=max){window.location.assign('/actions/rescan');return;}"
+    "hint(" + _js_literal(_RESCAN_POLL_HINT) + ");"
     "setTimeout(poll,ms);};"
     "var poll=function(){"
-    "fetch('/api/rescan',{credentials:'same-origin'}).then(function(r){"
+    "var c=window.AbortController?new AbortController():null;"
+    "var o={credentials:'same-origin'};"
+    "var t=0;"
+    "if(c){o.signal=c.signal;t=setTimeout(function(){c.abort();},ms);}"
+    "var stop=function(){if(t){clearTimeout(t);t=0;}};"
+    "fetch('/api/rescan',o).then(function(r){"
     "return r.ok?r.json():null;}).then(function(s){"
+    "stop();"
     "if(!s){fail();return;}"
-    "if(s.running){fails=0;setTimeout(poll,ms);return;}"
+    "if(s.running){fails=0;hint('');setTimeout(poll,ms);return;}"
     "window.location.assign(s.last_status==='succeeded'?'/':'/actions/rescan');"
-    "}).catch(fail);};"
+    "}).catch(function(){stop();fail();});};"
     "setTimeout(poll,ms);"
     "})();"
 )
@@ -988,8 +1052,11 @@ def render_rescan_status_html(
     live-poll under a matching ``script-src 'nonce-…'`` (with a scoped ``connect-src 'self'``
     on the same response) and wraps the meta-refresh in ``<noscript>`` so a JS browser
     updates via ``fetch`` instead of a full-page reload while a scripts-off browser still
-    polls. Purely additive: with the enhancement off (``None``) the plain no-JS meta-refresh
-    is the sole updater, exactly as before."""
+    polls. It also gates the empty :data:`_RESCAN_POLL_HINT_ID` span the poll fills while
+    degrading (#99) — the span rides the same condition as the script that writes it, so a
+    terminal or non-enhanced page never carries an element nothing can fill. Purely additive:
+    with the enhancement off (``None``) the plain no-JS meta-refresh is the sole updater,
+    exactly as before."""
 
     running = status.running
     head_extra = ""
@@ -1007,10 +1074,15 @@ def render_rescan_status_html(
         parts.append('<div class="warn">A report regeneration was already in progress.</div>')
 
     if running:
+        # #99: an empty hint span, pre-rendered only where something can fill it (the
+        # live-poll enhancement). Inline, so while empty it costs no layout space and the
+        # paragraph reads exactly as it did before; a degrading poll appends the fixed
+        # _RESCAN_POLL_HINT to this same sentence via textContent.
+        hint = f' <span id="{_esc(_RESCAN_POLL_HINT_ID)}"></span>' if script_nonce else ""
         parts.append(
             '<p class="sub">Regenerating the duplicate report&hellip; this fans out to '
             "Plex and can take a minute or two. This page refreshes itself; leave it open "
-            "or come back to the report shortly.</p>"
+            f"or come back to the report shortly.{hint}</p>"
         )
     else:
         parts.append(_rescan_result_block(status))

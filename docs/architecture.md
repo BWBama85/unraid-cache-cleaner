@@ -137,8 +137,11 @@ via a fresh per-response `script-src 'nonce-…'` (no `'unsafe-inline'`, no exte
 Two pages carry one: the reclaim form's select-all + live total (#80, no `fetch`/XHR), and
 the in-flight report-regeneration status page's live-poll of `GET /api/rescan` (#90), which
 reflects completion without the no-JS full-page meta-refresh (a persistent poll failure —
-~15 consecutive non-2xx/rejected polls, e.g. a lapsed unlock session mid-scan — navigates to
-the status/locked page instead of retrying forever, #96). Only that rescan page also
+15 consecutive non-2xx/rejected polls, e.g. a lapsed unlock session mid-scan — navigates to
+the status/locked page instead of retrying forever, #96; a poll that *hangs* is aborted at
+its interval-length deadline via a per-poll `AbortController` so it rejects into that same
+budget rather than stalling the chain silently, #100, and the page shows a fixed
+`textContent` "still checking…" hint while it degrades, #99). Only that rescan page also
 gets a narrowly scoped `connect-src 'self'` so its poll may `fetch` — every other response,
 including the report page and the JSON APIs, leaves `default-src 'none'` to block all
 fetch/XHR. Both enhancements degrade to their no-JS behavior with scripts disabled (the form
