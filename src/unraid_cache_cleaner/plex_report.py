@@ -367,6 +367,21 @@ class PlexDuplicateReporter:
         # keeps its exact prior shape (the key is absent, not empty).
         if include_hash:
             payload["hash_status"] = group.hash_status
+            # Same-size bucket verdicts (#93) exist only on an ``upgrade`` that has one,
+            # so the key is omitted rather than serialized as an empty list on every
+            # other group — absent and ``[]`` would mean the same thing ("no same-size
+            # bucket to report"), and omitting keeps the common group lean.
+            if group.hash_buckets:
+                payload["hash_buckets"] = [
+                    {
+                        "size": bucket.size,
+                        "status": bucket.status,
+                        "copy_count": bucket.copy_count,
+                        "redundant_count": bucket.redundant_count,
+                        "part_ids": list(bucket.part_ids),
+                    }
+                    for bucket in group.hash_buckets
+                ]
         return payload
 
     def build_payload(self, report: DuplicateReport) -> dict:
@@ -412,6 +427,9 @@ class PlexDuplicateReporter:
             payload["totals"]["hash_sample_match_count"] = summary.hash_sample_match_count
             payload["totals"]["hash_unhashable_count"] = summary.hash_unhashable_count
             payload["totals"]["different_content_count"] = summary.different_count
+            payload["totals"]["hash_redundant_upgrade_count"] = (
+                summary.hash_redundant_upgrade_count
+            )
         return payload
 
     def _reclaim_candidates(self, group: DuplicateGroup) -> List[MediaCopy]:
@@ -510,6 +528,7 @@ class PlexDuplicateReporter:
                 f" sample_match={summary.hash_sample_match_count}"
                 f" different={summary.different_count}"
                 f" unhashable={summary.hash_unhashable_count}"
+                f" redundant_upgrades={summary.hash_redundant_upgrade_count}"
             )
         LOGGER.info(
             "Plex duplicates: sections=%s groups=%s reclaimable=%s mismatches=%s%s%s",
@@ -639,16 +658,27 @@ class PlexDuplicateReporter:
 
     @staticmethod
     def _hash_tag(group: DuplicateGroup) -> str:
-        """Per-row content-hash verdict tag (#9): confirmed / sampled / unverified.
+        """Per-row content-hash verdict tag: confirmed / sampled / unverified (#9),
+        or an ``upgrade``'s same-size redundancy (#93).
 
-        Empty for a group the pass did not tag (e.g. an ``upgrade``), so only the
-        ``identical`` candidates carry a marker."""
+        The group-wide verdict wins when present (only an ``identical`` group has one).
+        Otherwise an ``upgrade`` holding provably redundant same-size copies is tagged
+        with how many — the actionable half of the bucket pass. A bucket that merely
+        proved *different* gets no tag: inside an upgrade that is the expected case
+        (a 720p and a 1080p sharing a size are obviously different bytes), so tagging it
+        would add a row-marker to almost every upgrade while telling the operator
+        nothing. The full per-bucket detail is in the JSON report either way.
+        """
 
-        return {
+        tag = {
             hasher.CONFIRMED: "  [hash:confirmed]",
             hasher.SAMPLE_MATCH: "  [hash:sample-match]",
             hasher.UNHASHABLE: "  [hash:unhashable]",
         }.get(group.hash_status, "")
+        if tag:
+            return tag
+        redundant = dedupe.redundant_bucket_copies(group)
+        return f"  [hash:redundant={redundant}]" if redundant else ""
 
     @staticmethod
     def _reclaimable_part_rows(

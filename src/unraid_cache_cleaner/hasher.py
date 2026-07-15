@@ -27,6 +27,15 @@ end-to-end unless ``HASH_MODE=full``). Because the middle is unread, a ``partial
 match is reported as ``sample-match`` — a strong signal, **never** proof — and only
 ``full`` yields the byte-for-byte ``confirmed`` verdict. A ``partial`` *mismatch* is
 still decisive: differing sampled bytes prove the copies differ.
+
+The pass additionally **annotates** ``upgrade`` groups (#93). An upgrade has no
+group-wide verdict to reach — its copies are supposed to differ — but it can still hold
+two copies of the exact same size that are byte-identical. Those same-size buckets are
+hashed and recorded as :class:`~models.HashBucket` verdicts on the group
+(:func:`_confirm_upgrade`); a size unique within the group is never read. This is
+**reporting only**: unlike the ``identical`` path above, it never reclassifies, never
+protects, and never moves a keeper or a reclaimable figure. See
+:func:`_confirm_upgrade` for why that asymmetry is the safe reading.
 """
 
 from __future__ import annotations
@@ -35,12 +44,13 @@ import hashlib
 import logging
 import os
 import stat as stat_mod
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 from . import dedupe
-from .models import DuplicateGroup, MediaCopy
+from .models import DuplicateGroup, HashBucket, MediaCopy
 from .planner import map_media_path
 
 if TYPE_CHECKING:  # only for the type annotation; no runtime coupling to state.py
@@ -340,6 +350,80 @@ def _confirm_one(
     return downgraded, warning
 
 
+def _bucket_verdict(hashes: Sequence[CopyHash], mode: str) -> Tuple[str, int]:
+    """Reduce one same-size bucket's copy hashes to ``(status, redundant_count)`` (#93).
+
+    Mirrors :func:`_confirm_one`'s comparison rules — any unreadable member, or members
+    split into incompatible part layouts, yield ``unhashable`` (no verdict, nothing
+    proven) — but reports redundancy per digest *cluster* rather than collapsing the
+    bucket to a single all-or-nothing answer. A bucket of three where two match and one
+    differs is ``different`` (they do not all agree) yet still reports two redundant
+    copies, which an all-or-nothing verdict would hide.
+    """
+
+    if any(copy_hash.digest is None for copy_hash in hashes):
+        return UNHASHABLE, 0
+    if len({copy_hash.topology for copy_hash in hashes}) > 1:
+        return UNHASHABLE, 0
+    clusters = Counter(copy_hash.digest for copy_hash in hashes)
+    redundant = sum(count for count in clusters.values() if count >= 2)
+    status = _confirm_status(mode) if len(clusters) == 1 else DIFFERENT
+    return status, redundant
+
+
+def _confirm_upgrade(
+    group: DuplicateGroup,
+    path_map: Sequence[Tuple[Path, Path]],
+    mode: str,
+    cache: Optional["HashCache"] = None,
+) -> DuplicateGroup:
+    """Hash the same-size buckets inside one ``upgrade`` group and annotate it (#93).
+
+    An ``upgrade``'s copies differ by design, so there is no group-wide verdict to
+    reach — but two of them can still share an exact size and prove byte-identical.
+    The logical (stack-merged) copies are bucketed by size and only buckets with two
+    or more members are hashed: a size unique within the group can hold no redundancy,
+    so its bytes are **never read**, keeping the added cost proportional to the
+    redundancy actually present rather than to library size.
+
+    Returns the group carrying its :class:`~models.HashBucket` verdicts and **nothing
+    else changed** — same ``classification``, ``keeper``, ``reclaimable_bytes`` and
+    ``reclaimable_keep_smallest``. This is the deliberate asymmetry with
+    :func:`_confirm_one`: differing bytes inside an ``identical`` group mean Plex was
+    wrong and one copy is not redundant (so the group must be protected), whereas
+    differing bytes inside an ``upgrade`` are the *expected* case — a 720p and a 1080p
+    that happen to share a size are obviously not the same bytes, and the reclaim was
+    already keeping the best copy on merit, not on byte-identity. So these verdicts
+    inform; they never protect and never reclaim. Emitting no warnings is part of that
+    contract: the warning list is for things that bear on reclaim safety, and an
+    unreadable upgrade member changes no outcome — its ``unhashable`` bucket status
+    records it in the report instead.
+    """
+
+    buckets: Dict[int, List[Tuple[MediaCopy, List[MediaCopy]]]] = {}
+    for logical, parts in dedupe.rank_copies_with_parts(group):
+        buckets.setdefault(logical.size, []).append((logical, parts))
+
+    verdicts: List[HashBucket] = []
+    for size, members in buckets.items():  # insertion order == the group's best-first rank
+        if len(members) < 2:
+            continue
+        hashes = [_hash_copy(parts, path_map, mode, cache) for _logical, parts in members]
+        status, redundant = _bucket_verdict(hashes, mode)
+        verdicts.append(
+            HashBucket(
+                size=size,
+                status=status,
+                copy_count=len(members),
+                redundant_count=redundant,
+                part_ids=tuple(logical.part_id for logical, _parts in members),
+            )
+        )
+    if not verdicts:
+        return group
+    return replace(group, hash_buckets=tuple(verdicts))
+
+
 def confirm_groups(
     groups: Sequence[DuplicateGroup],
     path_map: Sequence[Tuple[Path, Path]],
@@ -348,9 +432,12 @@ def confirm_groups(
 ) -> Tuple[List[DuplicateGroup], List[str]]:
     """Run the content-hash pass over analyzed groups.
 
-    Only ``identical`` groups are examined (an ``upgrade``'s copies are meant to
-    differ, and a ``mismatch`` is already protected). Every other group is returned
-    unchanged. Returns the re-tagged groups in the same order plus any warnings.
+    An ``identical`` group is confirmed or downgraded outright (:func:`_confirm_one`);
+    an ``upgrade`` gets its same-size buckets annotated, changing nothing else
+    (:func:`_confirm_upgrade`, #93). A ``mismatch`` — and an already-downgraded
+    ``different-content`` — is returned untouched: it is protected from reclaim on
+    identity grounds, so no hash verdict could make it safer. Returns the groups in the
+    same order plus any warnings.
 
     Fail-closed when media is not reachable: with no path map, or with a map whose
     roots are all unmounted, the pass is skipped whole (one warning) and the report
@@ -379,11 +466,13 @@ def confirm_groups(
     result: List[DuplicateGroup] = []
     warnings: List[str] = []
     for group in groups:
-        if group.classification != dedupe.IDENTICAL:
+        if group.classification == dedupe.IDENTICAL:
+            confirmed, warning = _confirm_one(group, path_map, mode, cache)
+            result.append(confirmed)
+            if warning is not None:
+                warnings.append(warning)
+        elif group.classification == dedupe.UPGRADE:
+            result.append(_confirm_upgrade(group, path_map, mode, cache))
+        else:
             result.append(group)
-            continue
-        confirmed, warning = _confirm_one(group, path_map, mode, cache)
-        result.append(confirmed)
-        if warning is not None:
-            warnings.append(warning)
     return result, warnings

@@ -1224,6 +1224,12 @@ def _render_totals(totals: dict, arr_enabled: bool) -> str:
         tiles.append(("Sample-match", totals.get("hash_sample_match_count", 0)))
         tiles.append(("Different content (excluded)", totals.get("different_content_count", 0)))
         tiles.append(("Unhashable (size-only)", totals.get("hash_unhashable_count", 0)))
+        # Upgrades hiding a byte-identical same-size copy (#93). Reporting only — these
+        # groups were already reclaimable at the same figure, so the tile explains a
+        # reclaim rather than changing one.
+        tiles.append(
+            ("Redundant in upgrades", totals.get("hash_redundant_upgrade_count", 0))
+        )
     if arr_enabled:
         tiles.append(("*arr-tracked reclaimable", totals.get("arr_tracked_reclaimable_count", 0)))
     cells = "".join(
@@ -1360,10 +1366,11 @@ def _checkbox(group: dict, copy: dict, actions_enabled: bool) -> str:
 
 #: Allowlisted ``hash_status`` -> (badge label, css modifier, tooltip) for the
 #: reclaimable rows (#94), mirroring the CLI table's ``[hash:…]`` tags. Any value not
-#: listed — ``""`` on an ``HASH_MODE=off`` or ``upgrade`` group, or an unknown status —
-#: renders no badge, so an off report is byte-for-byte unchanged. ``different`` is
-#: absent by design: those groups are excluded from reclaimable (shown in their own
-#: review section), so they never reach a reclaimable row.
+#: listed — ``""`` on an ``HASH_MODE=off`` group, or an unknown status — renders no
+#: badge, so an off report is byte-for-byte unchanged. ``different`` is absent by
+#: design: those groups are excluded from reclaimable (shown in their own review
+#: section), so they never reach a reclaimable row. An ``upgrade`` has no group-wide
+#: status and falls through to the same-size redundancy badge below (#93).
 _HASH_BADGES = {
     "confirmed": ("hash: confirmed", "hash-confirmed", "Byte-for-byte identical (full hash)"),
     "sample-match": (
@@ -1379,12 +1386,44 @@ _HASH_BADGES = {
 }
 
 
+def _redundant_bucket_copies(group: dict) -> int:
+    """Copies in this group's same-size buckets proven redundant (#93), from the payload.
+
+    The JSON mirror of :func:`dedupe.redundant_bucket_copies`. Defensive about shape —
+    the viewer renders whatever report file it is pointed at, including one written by
+    an older version that has no ``hash_buckets`` at all — so anything unexpected reads
+    as ``0`` (no badge) rather than raising.
+    """
+
+    buckets = group.get("hash_buckets")
+    if not isinstance(buckets, list):
+        return 0
+    return sum(
+        _as_int(bucket.get("redundant_count"))
+        for bucket in buckets
+        if isinstance(bucket, dict)
+    )
+
+
 def _hash_badge(group: dict) -> str:
-    """A small inline hash-status badge for a reclaimable row, or ``""`` (#94)."""
+    """A small inline hash-status badge for a reclaimable row, or ``""`` (#94, #93).
+
+    The group-wide verdict wins when present; an ``upgrade`` has none and instead earns
+    a badge when its same-size buckets proved redundant copies. Mirrors the CLI table's
+    tag rules exactly, including staying silent on a merely-``different`` bucket.
+    """
 
     badge = _HASH_BADGES.get(str(group.get("hash_status") or ""))
     if badge is None:
-        return ""
+        redundant = _redundant_bucket_copies(group)
+        if not redundant:
+            return ""
+        badge = (
+            f"hash: redundant ×{redundant}",
+            "hash-confirmed",
+            f"{redundant} same-size copies here are byte-identical to a sibling "
+            "— the keeper is unaffected",
+        )
     label, css, title = badge
     return f' <span class="tag {css}" title="{_esc(title)}">{_esc(label)}</span>'
 
