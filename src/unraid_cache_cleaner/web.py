@@ -344,6 +344,24 @@ def _esc(value: object) -> str:
     return _escape(str(value))
 
 
+def _js_literal(value: str) -> str:
+    """``value`` as a quoted JS string literal, safe to embed in an inline ``<script>``.
+
+    The enhancement scripts are assembled as one long string, so a hand-wrapped
+    ``'...'`` makes correctness depend on the *content* of every constant it quotes: a
+    single apostrophe in UI copy — the most natural edit these strings ever get — would
+    close the literal early and emit a `SyntaxError` that kills the entire script. On the
+    rescan page that means no poll at all behind a ``<noscript>``-gated meta-refresh: the
+    frozen "Regenerating…" spinner #96 exists to prevent. Worse, it is invisible to tests
+    that interpolate the same constant into their expectation.
+
+    :func:`json.dumps` produces a correctly escaped (and, by default, ASCII-only) literal;
+    ``<`` is additionally escaped so no value can close the enclosing ``<script>`` element.
+    """
+
+    return json.dumps(value).replace("<", "\\u003c")
+
+
 _STYLE = """
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
@@ -980,11 +998,11 @@ _RESCAN_POLL_SCRIPT = (
     "var max=" + str(_RESCAN_POLL_MAX_FAILURES) + ";"
     "var fails=0;"
     "var hint=function(m){"
-    "var e=document.getElementById('" + _RESCAN_POLL_HINT_ID + "');"
+    "var e=document.getElementById(" + _js_literal(_RESCAN_POLL_HINT_ID) + ");"
     "if(e){e.textContent=m;}};"
     "var fail=function(){"
     "if(++fails>=max){window.location.assign('/actions/rescan');return;}"
-    "hint('" + _RESCAN_POLL_HINT + "');"
+    "hint(" + _js_literal(_RESCAN_POLL_HINT) + ");"
     "setTimeout(poll,ms);};"
     "var poll=function(){"
     "var c=window.AbortController?new AbortController():null;"
@@ -1060,7 +1078,7 @@ def render_rescan_status_html(
         # live-poll enhancement). Inline, so while empty it costs no layout space and the
         # paragraph reads exactly as it did before; a degrading poll appends the fixed
         # _RESCAN_POLL_HINT to this same sentence via textContent.
-        hint = f' <span id="{_RESCAN_POLL_HINT_ID}"></span>' if script_nonce else ""
+        hint = f' <span id="{_esc(_RESCAN_POLL_HINT_ID)}"></span>' if script_nonce else ""
         parts.append(
             '<p class="sub">Regenerating the duplicate report&hellip; this fans out to '
             "Plex and can take a minute or two. This page refreshes itself; leave it open "

@@ -33,6 +33,7 @@ from unraid_cache_cleaner.web import (
     _RESCAN_POLL_HINT_ID,
     _RESCAN_POLL_MAX_FAILURES,
     _RESCAN_POLL_SECONDS,
+    _js_literal,
     DuplicateReportServer,
     DuplicateReportViewer,
     build_server,
@@ -3178,17 +3179,34 @@ class RescanPollRenderTests(unittest.TestCase):
         # detail is ever rendered: the hint is a fixed, self-authored constant.
         self.assertIn("e.textContent=m;", script)
         self.assertNotIn("innerHTML", script)
-        self.assertIn(f"hint('{_RESCAN_POLL_HINT}');", script)
-        self.assertIn(f"document.getElementById('{_RESCAN_POLL_HINT_ID}')", script)
+        self.assertIn(f"hint({_js_literal(_RESCAN_POLL_HINT)});", script)
+        self.assertIn(f"document.getElementById({_js_literal(_RESCAN_POLL_HINT_ID)})", script)
         # Shown only when the poll will actually retry — past the budget it navigates away,
         # so the hint would be pointless there.
         self.assertIn(
             "if(++fails>=max){window.location.assign('/actions/rescan');return;}"
-            f"hint('{_RESCAN_POLL_HINT}');setTimeout(poll,ms);",
+            f"hint({_js_literal(_RESCAN_POLL_HINT)});setTimeout(poll,ms);",
             script,
         )
         # A recovered poll clears it, so a stale "last attempt failed" never outlives the blip.
         self.assertIn("if(s.running){fails=0;hint('');", script)
+
+    def test_js_literal_survives_copy_a_future_editor_would_plausibly_write(self) -> None:
+        # The poll script is assembled as one long string, so hand-wrapping a constant in
+        # '...' would make the whole enhancement's validity depend on that constant's
+        # content: an apostrophe — the single most likely edit this UI copy will ever get —
+        # closes the literal early and emits a SyntaxError, so NO poll runs and the
+        # meta-refresh is gated inside <noscript>: the frozen "Regenerating…" spinner #96
+        # exists to prevent. Asserting `hint('<constant>')` cannot catch that, because it
+        # interpolates the same broken constant into its own expectation and stays green.
+        # So pin the escaping itself, against values the constants do not currently hold.
+        self.assertEqual(_js_literal("it's"), '"it\'s"')
+        self.assertEqual(_js_literal('say "hi"'), '"say \\"hi\\""')
+        # No value can close the enclosing <script> element.
+        self.assertEqual(_js_literal("</script>"), '"\\u003c/script>"')
+        # Escaping is lossless: what the operator reads is exactly the constant.
+        for value in ("it's", 'say "hi"', "</script>", "back\\slash", _RESCAN_POLL_HINT):
+            self.assertEqual(json.loads(_js_literal(value)), value)
 
     def test_hint_span_is_prerendered_empty_only_under_the_live_poll(self) -> None:
         # #99: the span rides the same condition as the script that fills it.
@@ -3197,7 +3215,8 @@ class RescanPollRenderTests(unittest.TestCase):
         # Pre-rendered EMPTY: the text lives in the script and reaches the DOM only via
         # textContent once a poll actually fails, so the served markup never shows a
         # "last attempt failed" hint on a page whose first poll has not even run yet.
-        markup = html.split("<script", 1)[0] + html.split("</script>", 1)[1]
+        self.assertIn("<script", html)  # else the split below is meaningless, not failing
+        markup = html.split("<script", 1)[0] + html.split("</script>", 1)[-1]
         self.assertNotIn(_RESCAN_POLL_HINT, markup)
 
     def test_hint_span_absent_on_terminal_and_non_enhanced_pages(self) -> None:
