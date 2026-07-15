@@ -1105,11 +1105,15 @@ class RealBinaryTests(unittest.TestCase):
             # The archived spelling is the backslash form; lsar normalized it.
             self.assertNotEqual(gen.NESTED_DEEP_MEMBER, gen.NESTED_DEEP_EXTRACTED)
 
+    @unittest.skipUnless(shutil.which("lsar"), "lsar not installed")
     def test_real_unar_nested_byte_identical_overwrite_is_recorded(self) -> None:
         # #54's acceptance case on the real binaries. `unar` restores each member's
         # archived timestamp, so re-extracting rewrites identical bytes with an
         # identical mtime — invisible to the (mtime, size) diff. The member list must
         # still record the *nested* output so the planner protects it.
+        # Gated on `lsar` for the same reason as the listing tests above: it is what
+        # makes these outputs visible at all, so a host with unar but no lsar would
+        # fail on the assertions below rather than skip.
         gen = _load_fixture_generator()
         with _Fixture() as fx:
             rel = fx.watch_root / "release"
