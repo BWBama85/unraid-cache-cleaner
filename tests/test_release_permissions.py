@@ -82,11 +82,38 @@ class ReleaseAskRulesTests(unittest.TestCase):
             self.assertIn(rule, self.ask_rules)
             self.assertTrue(_matches(rule, command), f"{rule!r} should catch {command!r}")
 
+    def test_annotated_tag_variants_are_all_gated(self) -> None:
+        # #51 review (codex): the annotated-tag checkpoint must survive equivalent spellings
+        # of the SAME tag creation. The skill runs as prompt text (not a fixed script), so
+        # `git tag --annotate`, `-m`/`--message` (both imply -a), `-am`, and the signed forms
+        # must all prompt — otherwise a reworded tag command dodges the checkpoint.
+        variants = [
+            'git tag -a "v1.2.3" -m "v1.2.3"',
+            'git tag --annotate "v1.2.3" -m "v1.2.3"',
+            'git tag -am "v1.2.3" "v1.2.3"',
+            'git tag -m "v1.2.3" "v1.2.3"',
+            'git tag --message "v1.2.3" "v1.2.3"',
+            'git tag -s "v1.2.3" -m "v1.2.3"',
+            'git tag --sign "v1.2.3" -m "v1.2.3"',
+        ]
+        for command in variants:
+            self.assertTrue(
+                any(_matches(rule, command) for rule in self.ask_rules),
+                f"no ask rule gates annotated-tag creation: {command!r}",
+            )
+
     def test_read_only_release_commands_are_not_over_prompted(self) -> None:
         # The preflight/inspection commands allow-listed for the release skill (#28) must
-        # keep running unprompted — no ask rule may catch them.
+        # keep running unprompted — no ask rule may catch them. Includes the read-only
+        # `git tag` query forms that sit next to the gated annotated-creation flags.
         read_only = [
+            "git tag",
             "git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname",
+            "git tag -l 'v*'",
+            "git tag -n5",
+            "git tag --sort=-v:refname",
+            "git tag --merged HEAD",
+            "git tag --contains HEAD",
             "git ls-remote --tags origin",
             "git fetch origin main",
             "gh release list",
