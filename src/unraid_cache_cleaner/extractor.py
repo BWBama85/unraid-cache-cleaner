@@ -152,6 +152,17 @@ def _safe_member_path(dest_dir: Path, member: Path) -> Optional[Path]:
     never dereferences symlinks), matching ``_finalize_output``'s guarantees; the
     result is only ever intersected with paths ``os.walk`` actually visited under
     ``dest_dir``, so it can neither invent a path nor escape the tree.
+
+    Nested members need no special handling (#54). RAR archives spell a member path
+    with a backslash; ``lsar`` reports it normalized to ``/``, and ``unar`` splits on
+    it to recreate that same tree under ``dest_dir`` — so plain concatenation lands
+    on exactly the extracted file, Linux and macOS alike. (``-no-directory`` only
+    suppresses the archive-named *enclosing* dir; it does not flatten members.) The
+    lone exception is a member holding a *literal* ``/``, which is not a path to
+    ``unar`` but one name it sanitizes flat (``sub_deep.mkv`` on Linux,
+    ``sub:deep.mkv`` on macOS). ``lsar`` normalizes both spellings identically, so
+    that member is unmappable in principle and simply misses the walk, degrading to
+    the ``(mtime, size)`` diff rather than guessing.
     """
 
     if member.is_absolute() or ".." in member.parts:
@@ -477,9 +488,12 @@ class Extractor:
             )
 
         # Snapshot the destination *before* extracting so ownership and output
-        # tracking apply only to the files this extraction creates or overwrites
-        # (skipped when neither a ledger nor an owner needs it, so those paths pay
-        # nothing).
+        # tracking apply only to the files this extraction creates or overwrites.
+        # Only the snapshot is conditional: with no ledger and no owner nothing
+        # consumes the produced set, so it is left empty rather than paying a walk.
+        # `_finalize_output` still runs, and against an empty snapshot every walked
+        # file reads as produced — harmless for the callers that ask for neither
+        # (both production call sites pass a ledger), but see #105.
         need_finalize = self.ledger is not None or bool(self.config.extract_owner)
         before_files, before_dirs = _snapshot(dest_dir) if need_finalize else ({}, set())
         try:
