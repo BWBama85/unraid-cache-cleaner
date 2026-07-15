@@ -555,6 +555,34 @@ class LedgerIdempotencyTests(unittest.TestCase):
             protected = store.get_protected_extracted_paths(0.0, protect_seconds=10**9)
             self.assertIn(mkv, protected)
 
+    def test_produced_outputs_exclude_untouched_files_with_or_without_ledger(self) -> None:
+        # #105: `outputs` means "files this extraction produced" for every caller.
+        # A ledger-less, owner-less extractor once skipped the pre-extraction
+        # snapshot; against an empty one every walked file read as produced, so the
+        # untouched sibling and the source archive were both reported. The set is
+        # now exact, and identical to the ledger-backed production path's.
+        for label, make_ledger in (
+            ("ledger-less", lambda fx: None),
+            (
+                "ledger-backed",
+                lambda fx: StateExtractionLedger(StateStore(fx.config().state_db_path)),
+            ),
+        ):
+            with self.subTest(ledger=label), _Fixture() as fx:
+                fx.write_rar("rel/movie.rar")
+                sibling = fx.write_rar("rel/untouched-sibling.mkv", content="pre-existing media")
+                extractor = Extractor(fx.config(), tool=FakeTool(), ledger=make_ledger(fx))
+
+                results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+                self.assertEqual([r.status for r in results], ["extracted"])
+                # Exact set: neither the untouched sibling nor movie.rar itself.
+                self.assertEqual(
+                    results[0].outputs,
+                    (normalize_path(fx.watch_root / "rel" / "movie.mkv"),),
+                )
+                self.assertEqual(sibling.read_text(), "pre-existing media")
+
     def test_dry_run_writes_no_ledger_state(self) -> None:
         with _Fixture() as fx:
             fx.write_rar("rel/movie.rar")
