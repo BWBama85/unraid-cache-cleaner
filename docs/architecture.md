@@ -132,11 +132,17 @@ server is unit-tested end-to-end on an ephemeral port without any network
 service. Safety envelope: every Plex-supplied string is HTML-escaped, routes are
 explicit (no directory serving/CORS/external assets) under a strict
 `Content-Security-Policy` — `default-src 'none'` with scripts blocked entirely, unless the
-opt-in `WEB_ACTION_INLINE_SCRIPT=true` (#80) admits the reclaim form's single
-self-contained enhancement script (select-all + a live total) via a fresh per-response
-`script-src 'nonce-…'` (no `'unsafe-inline'`, no external `src`; the form works with
-JavaScript disabled) — and a missing/truncated/malformed report degrades to an
-empty-state page rather than a `500`. When no action layer is attached (the
+opt-in `WEB_ACTION_INLINE_SCRIPT=true` admits a single self-contained enhancement script
+via a fresh per-response `script-src 'nonce-…'` (no `'unsafe-inline'`, no external `src`).
+Two pages carry one: the reclaim form's select-all + live total (#80, no `fetch`/XHR), and
+the in-flight report-regeneration status page's live-poll of `GET /api/rescan` (#90), which
+reflects completion without the no-JS full-page meta-refresh. Only that rescan page also
+gets a narrowly scoped `connect-src 'self'` so its poll may `fetch` — every other response,
+including the report page and the JSON APIs, leaves `default-src 'none'` to block all
+fetch/XHR. Both enhancements degrade to their no-JS behavior with scripts disabled (the form
+submits; the status page still meta-refreshes, gated behind `<noscript>` so it never competes
+with the poll). A missing/truncated/malformed report degrades to an empty-state page rather
+than a `500`. When no action layer is attached (the
 default), every non-`GET` verb is `405`. Run it standalone with the `web`
 subcommand, or fold it into the `service` loop on a daemon thread with
 `WEB_ENABLED=true`. To keep concurrent reads safe, `write_report` publishes the

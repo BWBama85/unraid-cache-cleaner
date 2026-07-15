@@ -27,13 +27,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.config import Config
-from unraid_cache_cleaner.web_rescan import ReportRescanService
+from unraid_cache_cleaner.web_rescan import ReportRescanService, RescanStatus
 from unraid_cache_cleaner.web import (
     DuplicateReportServer,
     DuplicateReportViewer,
     build_server,
     render_reclaim_result_html,
     render_report_html,
+    render_rescan_status_html,
 )
 from unraid_cache_cleaner.web_actions import (
     _COMMITTED_LEFTOVER_MARKER,
@@ -1511,7 +1512,7 @@ class ActionIndexTests(unittest.TestCase):
 
 @contextmanager
 def _serve(payload, service, *, require_browser_origin=False, allowed_origins=(),
-           rescan_service=None):
+           rescan_service=None, inline_script=False):
     viewer = DuplicateReportViewer(
         lambda: payload,
         actions_enabled=service.enabled,
@@ -1525,6 +1526,7 @@ def _serve(payload, service, *, require_browser_origin=False, allowed_origins=()
         rescan_service=rescan_service,
         require_browser_origin=require_browser_origin,
         allowed_origins=allowed_origins,
+        inline_script=inline_script,
     )
     server.start_background()
     try:
@@ -3060,6 +3062,192 @@ class RescanHttpTests(unittest.TestCase):
         with _serve(payload, service, rescan_service=None) as base:
             _, body = _post(base + "/", None, {}, method="GET")
         self.assertNotIn(b'action="/actions/rescan"', body)
+
+
+# --------------------------------------------------------------------------- #
+# #90 — opt-in JS live-poll of the rescan status surface                        #
+# --------------------------------------------------------------------------- #
+
+def _has_connect_self(headers) -> bool:
+    return "connect-src 'self'" in (headers.get("Content-Security-Policy") or "")
+
+
+class RescanPollRenderTests(unittest.TestCase):
+    """Pure-renderer contract for :func:`render_rescan_status_html` under the #90 nonce."""
+
+    @staticmethod
+    def _status(*, running, last_status=None):
+        return RescanStatus(
+            running=running,
+            last_status=last_status,
+            last_message="",
+            started_at=1.0,
+            finished_at=None if running else 2.0,
+        )
+
+    def test_running_with_nonce_emits_one_poll_script_under_noscript_meta(self) -> None:
+        html = render_rescan_status_html(self._status(running=True), script_nonce="N0nce")
+        # Exactly one inline script, carrying the exact nonce.
+        self.assertEqual(html.count("<script"), 1)
+        self.assertIn('<script nonce="N0nce">', html)
+        # The meta-refresh is gated behind <noscript> so a JS browser never full-page-reloads;
+        # a scripts-off browser still polls.
+        self.assertIn('<noscript><meta http-equiv="refresh"', html)
+        self.assertNotIn('</noscript><meta http-equiv="refresh"', html)  # not also emitted bare
+
+    def test_running_without_nonce_keeps_bare_meta_and_no_script(self) -> None:
+        html = render_rescan_status_html(self._status(running=True), script_nonce=None)
+        self.assertNotIn("<script", html)
+        self.assertIn('<meta http-equiv="refresh"', html)
+        self.assertNotIn("<noscript>", html)  # bare meta, exactly as #77
+
+    def test_terminal_with_nonce_has_no_script_and_no_meta(self) -> None:
+        html = render_rescan_status_html(
+            self._status(running=False, last_status="succeeded"), script_nonce="N0nce"
+        )
+        self.assertNotIn("<script", html)
+        self.assertNotIn('http-equiv="refresh"', html)
+        self.assertIn("Last regeneration: succeeded", html)
+
+    def test_poll_script_only_gets_status_navigates_on_terminal(self) -> None:
+        html = render_rescan_status_html(self._status(running=True), script_nonce="N0nce")
+        script = html.split('<script nonce="N0nce">', 1)[1].split("</script>", 1)[0]
+        # Same-origin GET of the status API only — never a mutation, a token, or an external asset.
+        self.assertIn("fetch('/api/rescan'", script)
+        self.assertIn("credentials:'same-origin'", script)
+        self.assertNotIn("POST", script)
+        self.assertNotIn("X-Action-Token", script)
+        self.assertNotIn("innerHTML", script)
+        self.assertNotIn("src=", script)
+        # running wins over a stale last_status; success reloads /, else back to the status page.
+        self.assertIn("s.running", script)
+        self.assertIn("s.last_status==='succeeded'?'/':'/actions/rescan'", script)
+
+
+class RescanLivePollHttpTests(unittest.TestCase):
+    """The #90 CSP matrix driven over real HTTP: connect-src 'self' rides *only* the
+    in-flight rescan status response that carries the poll script."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.lock_path = Path(self._tmp.name) / "report.json.rescan.lock"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @contextmanager
+    def _running_server(self, *, inline_script):
+        """Serve with a rescan whose run blocks (``running=True``) until released, so the
+        status surface can be probed mid-flight. Kicks the run via the JSON trigger."""
+
+        payload = _untracked_payload()
+        service = _service(payload)
+        release = threading.Event()
+        started = threading.Event()
+        threads: list = []
+
+        def regen():
+            started.set()
+            release.wait(5)
+
+        rescan = ReportRescanService(
+            regen,
+            self.lock_path,
+            spawn=lambda t: threads.append(threading.Thread(target=t, daemon=True)) or threads[-1].start(),
+        )
+        with _serve(payload, service, rescan_service=rescan, inline_script=inline_script) as base:
+            code, _ = _post(
+                base + "/api/rescan", b"{}",
+                {"Content-Type": "application/json", "X-Action-Token": "tok"},
+            )
+            self.assertEqual(code, 202)
+            self.assertTrue(started.wait(2))
+            try:
+                yield base
+            finally:
+                release.set()
+                if threads:
+                    threads[0].join(5)
+
+    _AUTH = {"X-Action-Token": "tok"}
+
+    def test_running_status_page_carries_nonce_and_connect_src(self) -> None:
+        with self._running_server(inline_script=True) as base:
+            status, headers, body = _get_h(base + "/actions/rescan", self._AUTH)
+        self.assertEqual(status, 200)
+        nonce = _csp_nonce(headers)
+        self.assertTrue(nonce)
+        self.assertTrue(_has_connect_self(headers))
+        self.assertIn(f'<script nonce="{nonce}">'.encode(), body)
+        self.assertIn(b"<noscript><meta http-equiv=", body)
+
+    def test_head_of_running_status_page_matches_get_csp(self) -> None:
+        with self._running_server(inline_script=True) as base:
+            status, headers, _ = _post_resp(base + "/actions/rescan", None, self._AUTH, method="HEAD")
+        self.assertEqual(status, 200)
+        self.assertTrue(_csp_nonce(headers))
+        self.assertTrue(_has_connect_self(headers))
+
+    def test_post_status_page_is_enhanced(self) -> None:
+        # A second trigger while the first run blocks renders the running status page (409).
+        with self._running_server(inline_script=True) as base:
+            status, headers, body = _post_resp(
+                base + "/actions/rescan", _form(token="tok"), _FORM_CT
+            )
+        self.assertEqual(status, 409)
+        nonce = _csp_nonce(headers)
+        self.assertTrue(nonce)
+        self.assertTrue(_has_connect_self(headers))
+        self.assertIn(f'<script nonce="{nonce}">'.encode(), body)
+
+    def test_connect_src_never_leaks_to_report_page(self) -> None:
+        # The report page carries the #80 select-all script but must NOT gain connect-src —
+        # least privilege: only the polling rescan page fetches.
+        with self._running_server(inline_script=True) as base:
+            _, headers, body = _get_h(base + "/", self._AUTH)
+        self.assertTrue(_csp_nonce(headers))  # #80 script nonce present
+        self.assertFalse(_has_connect_self(headers))
+        self.assertNotIn(b"fetch(", body)
+
+    def test_connect_src_never_leaks_to_json_api(self) -> None:
+        with self._running_server(inline_script=True) as base:
+            status, headers, _ = _get_h(base + "/api/rescan", self._AUTH)
+        self.assertEqual(status, 200)
+        self.assertFalse(_has_connect_self(headers))
+
+    def test_inline_script_off_running_page_has_no_script_or_connect(self) -> None:
+        with self._running_server(inline_script=False) as base:
+            status, headers, body = _get_h(base + "/actions/rescan", self._AUTH)
+        self.assertEqual(status, 200)
+        csp = headers.get("Content-Security-Policy") or ""
+        self.assertNotIn("script-src", csp)
+        self.assertNotIn("connect-src", csp)
+        self.assertNotIn(b"<script", body)
+        self.assertIn(b'<meta http-equiv="refresh"', body)  # bare no-JS fallback intact
+        self.assertNotIn(b"<noscript>", body)
+
+    def test_terminal_status_page_has_no_connect_src(self) -> None:
+        # A synchronous run finishes before the status GET, so it renders the result block:
+        # no poll script, and connect-src must be absent even with the enhancement on.
+        payload = _untracked_payload()
+        service = _service(payload)
+        rescan = ReportRescanService(lambda: None, self.lock_path, spawn=lambda t: t())
+        with _serve(payload, service, rescan_service=rescan, inline_script=True) as base:
+            _post(base + "/api/rescan", b"{}", {"Content-Type": "application/json", **self._AUTH})
+            status, headers, body = _get_h(base + "/actions/rescan", self._AUTH)
+        self.assertEqual(status, 200)
+        self.assertFalse(_has_connect_self(headers))
+        self.assertNotIn(b"<script", body)
+        self.assertIn(b"Last regeneration: succeeded", body)
+
+    def test_refused_post_stays_strict(self) -> None:
+        payload = _untracked_payload()
+        service = _service(payload)
+        rescan = ReportRescanService(lambda: None, self.lock_path, spawn=lambda t: t())
+        with _serve(payload, service, rescan_service=rescan, inline_script=True) as base:
+            status, headers, _ = _post_resp(base + "/actions/rescan", _form(token="wrong"), _FORM_CT)
+        self.assertEqual(status, 403)
+        self.assertFalse(_has_connect_self(headers))
 
 
 if __name__ == "__main__":
