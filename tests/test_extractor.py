@@ -103,6 +103,15 @@ class FakeTool:
             raise self.test_raises
         return self.test_result
 
+    def _member(self, archive: Path) -> Path:
+        """The archive-relative member ``extract`` writes and ``list_members`` reports.
+
+        Subclasses override this alone to move the output (e.g. into a subdirectory);
+        both paths stay in lockstep, as they are for a real tool.
+        """
+
+        return Path(Path(archive.name).stem + ".mkv")
+
     def extract(self, archive: Path, dest_dir: Path) -> None:
         self.extract_calls.append((archive, dest_dir))
         if self.extract_raises is not None:
@@ -110,14 +119,16 @@ class FakeTool:
         if archive.name in self.fail_names:
             raise ExtractorError(f"boom: {archive.name}")
         # Simulate a real extraction so ownership/os.walk paths have something.
-        (dest_dir / (Path(archive.name).stem + ".mkv")).write_text("extracted")
+        target = dest_dir / self._member(archive)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("extracted")
 
     def list_members(self, archive: Path) -> list[Path] | None:
         self.list_members_calls.append(archive)
         if self.list_members_result is not _DERIVE_MEMBERS:
             return self.list_members_result  # type: ignore[return-value]
-        # Mirror the single .mkv that extract() writes.
-        return [Path(Path(archive.name).stem + ".mkv")]
+        # Mirror what extract() writes.
+        return [self._member(archive)]
 
 
 def _make_config(
@@ -695,7 +706,8 @@ class _IdenticalOverwriteTool(FakeTool):
 
     def extract(self, archive: Path, dest_dir: Path) -> None:
         self.extract_calls.append((archive, dest_dir))
-        target = dest_dir / (Path(archive.name).stem + ".mkv")
+        target = dest_dir / self._member(archive)
+        target.parent.mkdir(parents=True, exist_ok=True)
         old_mtime = target.stat().st_mtime if target.exists() else None
         target.write_text(self.CONTENT)
         if old_mtime is not None:
@@ -713,20 +725,8 @@ class _NestedIdenticalOverwriteTool(_IdenticalOverwriteTool):
 
     MEMBER = Path("sub/deep.mkv")
 
-    def extract(self, archive: Path, dest_dir: Path) -> None:
-        self.extract_calls.append((archive, dest_dir))
-        target = dest_dir / self.MEMBER
-        target.parent.mkdir(parents=True, exist_ok=True)
-        old_mtime = target.stat().st_mtime if target.exists() else None
-        target.write_text(self.CONTENT)
-        if old_mtime is not None:
-            os.utime(target, (old_mtime, old_mtime))  # restore member timestamp
-
-    def list_members(self, archive: Path) -> list[Path] | None:
-        self.list_members_calls.append(archive)
-        if self.list_members_result is not _DERIVE_MEMBERS:
-            return self.list_members_result  # type: ignore[return-value]
-        return [self.MEMBER]
+    def _member(self, archive: Path) -> Path:
+        return self.MEMBER
 
 
 class MemberListOutputTests(unittest.TestCase):
@@ -805,6 +805,31 @@ class MemberListOutputTests(unittest.TestCase):
             self.assertFalse((fx.watch_root / "rel" / "sub").exists())
             # ...while the genuinely produced file is still caught by the diff.
             self.assertIn(normalize_path(fx.watch_root / "rel" / "movie.mkv"), outputs)
+
+    def test_nested_member_behind_symlinked_dir_is_never_recorded(self) -> None:
+        # #54 must not let nesting open a symlink escape: `os.walk` does not follow
+        # symlinked dirs, so a member named `sub/deep.mkv` whose `sub` is a symlink
+        # out of the tree matches no walked path, and the file it points at is
+        # neither recorded nor chowned.
+        with _Fixture() as fx:
+            outside = fx.watch_root.parent / "outside"
+            outside.mkdir()
+            (outside / "deep.mkv").write_text("a file outside the watch root")
+            rel = fx.watch_root / "rel"
+            rel.mkdir()
+            (rel / "movie.rar").write_text("rar")
+            os.symlink(outside, rel / "sub")  # pre-existing symlinked directory
+            store = StateStore(fx.config().state_db_path)
+            tool = FakeTool(list_members_result=[Path("sub/deep.mkv")])
+            extractor = Extractor(fx.config(), tool=tool, ledger=StateExtractionLedger(store))
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            outputs = {p for r in results for p in r.outputs}
+            self.assertNotIn(normalize_path(rel / "sub" / "deep.mkv"), outputs)
+            for path in outputs:
+                self.assertTrue(is_within(path, fx.watch_root), f"{path} escaped dest dir")
+            self.assertEqual((outside / "deep.mkv").read_text(), "a file outside the watch root")
 
     def test_fallback_to_fingerprint_when_members_unavailable(self) -> None:
         # With member enumeration unavailable, the byte-identical overwrite reverts
@@ -1007,29 +1032,34 @@ def _load_fixture_generator():
 class RealBinaryTests(unittest.TestCase):
     """Drive the real ``unar``/``lsar`` binaries against the committed fixture (#39)."""
 
-    def _fixture_archive(self, dest_dir: Path) -> Path:
-        """Copy the committed ``hello.rar`` into ``dest_dir`` (regenerate if absent)."""
+    def _committed_archive(self, dest_dir: Path, name: str, build) -> Path:
+        """Copy the committed fixture ``name`` into ``dest_dir`` (regenerate if absent).
 
-        committed = _FIXTURES_DIR / "hello.rar"
-        archive = dest_dir / "hello.rar"
+        ``build`` takes the generator module and returns the archive bytes — the
+        fallback never shells out to a `rar` creator.
+        """
+
+        committed = _FIXTURES_DIR / name
+        archive = dest_dir / name
         if committed.exists():
             shutil.copyfile(committed, archive)
-        else:  # never shells out to a `rar` creator — reuse the committed generator
-            gen = _load_fixture_generator()
-            archive.write_bytes(gen.build_rar4(gen.FIXTURE_MEMBER, gen.FIXTURE_CONTENT))
+        else:
+            archive.write_bytes(build(_load_fixture_generator()))
         return archive
+
+    def _fixture_archive(self, dest_dir: Path) -> Path:
+        """The committed single-member ``hello.rar``."""
+
+        return self._committed_archive(
+            dest_dir, "hello.rar", lambda gen: gen.build_rar4(gen.FIXTURE_MEMBER, gen.FIXTURE_CONTENT)
+        )
 
     def _nested_fixture_archive(self, dest_dir: Path) -> Path:
-        """Copy the committed ``nested.rar`` into ``dest_dir`` (regenerate if absent)."""
+        """The committed nested-member ``nested.rar``."""
 
-        committed = _FIXTURES_DIR / "nested.rar"
-        archive = dest_dir / "nested.rar"
-        if committed.exists():
-            shutil.copyfile(committed, archive)
-        else:  # never shells out to a `rar` creator — reuse the committed generator
-            gen = _load_fixture_generator()
-            archive.write_bytes(gen.build_rar4_multi(gen.NESTED_MEMBERS))
-        return archive
+        return self._committed_archive(
+            dest_dir, "nested.rar", lambda gen: gen.build_rar4_multi(gen.NESTED_MEMBERS)
+        )
 
     def test_real_unar_extraction_roundtrip(self) -> None:
         with _Fixture() as fx:
@@ -1065,16 +1095,22 @@ class RealBinaryTests(unittest.TestCase):
         # and lsar reports it as `sub/deep.txt` — the exact relative path unar
         # extracts it to. So `_safe_member_path` maps nested members by plain
         # concatenation, with no platform-specific reconstruction to get wrong.
+        gen = _load_fixture_generator()
         with _Fixture() as fx:
             archive = self._nested_fixture_archive(fx.watch_root)
             members = UnarArchiveTool("unar").list_members(archive)
-            self.assertEqual(members, [Path("root.txt"), Path("sub/deep.txt")])
+            self.assertEqual(
+                members, [Path(gen.NESTED_ROOT_MEMBER), Path(gen.NESTED_DEEP_EXTRACTED)]
+            )
+            # The archived spelling is the backslash form; lsar normalized it.
+            self.assertNotEqual(gen.NESTED_DEEP_MEMBER, gen.NESTED_DEEP_EXTRACTED)
 
     def test_real_unar_nested_byte_identical_overwrite_is_recorded(self) -> None:
         # #54's acceptance case on the real binaries. `unar` restores each member's
         # archived timestamp, so re-extracting rewrites identical bytes with an
         # identical mtime — invisible to the (mtime, size) diff. The member list must
         # still record the *nested* output so the planner protects it.
+        gen = _load_fixture_generator()
         with _Fixture() as fx:
             rel = fx.watch_root / "release"
             rel.mkdir()
@@ -1087,7 +1123,7 @@ class RealBinaryTests(unittest.TestCase):
                 [r.status for r in first.extract_all((fx.watch_root,), dry_run=False)],
                 ["extracted"],
             )
-            deep = normalize_path(rel / "sub" / "deep.txt")
+            deep = normalize_path(rel / gen.NESTED_DEEP_EXTRACTED)
             self.assertTrue(deep.exists())  # real unar rebuilt the tree from `sub\deep.txt`
             before = os.stat(deep)
 
@@ -1103,7 +1139,8 @@ class RealBinaryTests(unittest.TestCase):
             self.assertEqual([r.status for r in results], ["extracted"])
             self.assertIn(deep, results[0].outputs)  # caught only by the member list
             self.assertIn(deep, store.get_protected_extracted_paths(0.0, protect_seconds=10**9))
-            self.assertIn(normalize_path(rel / "root.txt"), results[0].outputs)  # no root regression
+            # no regression to the root-level detection #43 shipped
+            self.assertIn(normalize_path(rel / gen.NESTED_ROOT_MEMBER), results[0].outputs)
 
 
 if __name__ == "__main__":

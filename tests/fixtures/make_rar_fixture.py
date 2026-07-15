@@ -25,7 +25,7 @@ from __future__ import annotations
 import binascii
 import struct
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Optional, Tuple
 
 # The single member the fixture archive contains.
 FIXTURE_MEMBER = "hello.txt"

@@ -488,9 +488,12 @@ class Extractor:
             )
 
         # Snapshot the destination *before* extracting so ownership and output
-        # tracking apply only to the files this extraction creates or overwrites
-        # (skipped when neither a ledger nor an owner needs it, so those paths pay
-        # nothing).
+        # tracking apply only to the files this extraction creates or overwrites.
+        # Only the snapshot is conditional: with no ledger and no owner nothing
+        # consumes the produced set, so it is left empty rather than paying a walk.
+        # `_finalize_output` still runs, and against an empty snapshot every walked
+        # file reads as produced — harmless for the callers that ask for neither
+        # (both production call sites pass a ledger), but see #105.
         need_finalize = self.ledger is not None or bool(self.config.extract_owner)
         before_files, before_dirs = _snapshot(dest_dir) if need_finalize else ({}, set())
         try:
