@@ -23,6 +23,17 @@
 		]
 	},
 	"permissions": {
+		"ask": [
+			"Bash(git push:*)",
+			"Bash(git tag -a:*)",
+			"Bash(git tag --annotate:*)",
+			"Bash(git tag -am:*)",
+			"Bash(git tag -m:*)",
+			"Bash(git tag --message:*)",
+			"Bash(git tag -s:*)",
+			"Bash(git tag --sign:*)",
+			"Bash(gh release create:*)"
+		],
 		"allow": [
 			"Bash(python3 -m unittest*)",
 			"Bash(python3 -m compileall*)",
