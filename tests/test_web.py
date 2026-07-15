@@ -989,5 +989,92 @@ class HashBadgeTests(unittest.TestCase):
         self.assertIn('type="checkbox"', html)
 
 
+class UpgradeRedundancyBadgeTests(unittest.TestCase):
+    """The same-size redundancy badge and tile on an ``upgrade`` row (#93)."""
+
+    def _upgrade_payload(
+        self, buckets=None, *, hash_enabled: bool = True, hash_mode: str = "full"
+    ) -> dict:
+        payload = _payload()
+        group = payload["groups"][0]
+        group["classification"] = "upgrade"
+        group["hash_status"] = ""  # an upgrade never earns a group-wide verdict
+        if buckets is not None:
+            group["hash_buckets"] = buckets
+        payload["hash_enabled"] = hash_enabled
+        payload["hash_mode"] = hash_mode
+        return payload
+
+    def test_redundant_bucket_renders_badge(self) -> None:
+        html = render_report_html(
+            self._upgrade_payload(
+                [{"size": 100, "status": "confirmed", "copy_count": 2, "redundant_count": 2}]
+            )
+        )
+        self.assertIn('class="tag hash-confirmed"', html)
+        self.assertIn("hash: redundant ×2", html)
+        self.assertIn("byte-identical", html)
+
+    def test_partial_mode_badge_never_claims_proof(self) -> None:
+        # HASH_MODE=partial reads only the head and tail, so a match is a strong signal,
+        # never proof. The badge must not borrow the confirmed styling or wording.
+        html = render_report_html(
+            self._upgrade_payload(
+                [{"size": 100, "status": "sample-match", "copy_count": 2, "redundant_count": 2}],
+                hash_mode="partial",
+            )
+        )
+        self.assertIn("hash: redundant ×2 (sampled)", html)
+        self.assertIn('class="tag hash-sample"', html)
+        self.assertNotIn('class="tag hash-confirmed"', html)
+        self.assertNotIn("byte-identical", html)
+        self.assertIn("not proof", html)
+
+    def test_several_buckets_sum_into_one_badge(self) -> None:
+        html = render_report_html(
+            self._upgrade_payload(
+                [
+                    {"size": 100, "status": "confirmed", "copy_count": 2, "redundant_count": 2},
+                    {"size": 50, "status": "confirmed", "copy_count": 2, "redundant_count": 2},
+                ]
+            )
+        )
+        self.assertIn("hash: redundant ×4", html)
+
+    def test_different_bucket_renders_no_badge(self) -> None:
+        # Same-size-but-different inside an upgrade is the expected case, so it stays
+        # quiet — mirroring the CLI table.
+        html = render_report_html(
+            self._upgrade_payload(
+                [{"size": 100, "status": "different", "copy_count": 2, "redundant_count": 0}]
+            )
+        )
+        self.assertNotIn('class="tag hash-', html)
+
+    def test_missing_hash_buckets_renders_no_badge(self) -> None:
+        html = render_report_html(self._upgrade_payload(None))
+        self.assertNotIn('class="tag hash-', html)
+
+    def test_malformed_hash_buckets_render_no_badge(self) -> None:
+        # The viewer renders whatever report file it is pointed at, including one from
+        # an older version or a hand-edited file: bad shapes must not raise.
+        for buckets in ("nonsense", [None], [{"redundant_count": "two"}], [[]], {}):
+            with self.subTest(buckets=buckets):
+                html = render_report_html(self._upgrade_payload(buckets))
+                self.assertNotIn('class="tag hash-', html)
+
+    def test_redundant_upgrade_tile_rendered(self) -> None:
+        payload = self._upgrade_payload(None)
+        payload["totals"]["hash_confirmed_count"] = 0
+        payload["totals"]["hash_redundant_upgrade_count"] = 3
+        html = render_report_html(payload)
+        self.assertIn("Redundant in upgrades", html)
+
+    def test_off_report_has_no_redundant_tile(self) -> None:
+        payload = self._upgrade_payload(None, hash_enabled=False)
+        html = render_report_html(payload)
+        self.assertNotIn("Redundant in upgrades", html)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -44,6 +44,24 @@ def is_reclaimable(classification: str) -> bool:
 
     return classification not in PROTECTED_CLASSIFICATIONS
 
+
+def redundant_bucket_copies(group: DuplicateGroup) -> int:
+    """Copies inside ``group``'s same-size buckets proven redundant by hashing (#93).
+
+    Sums every bucket's ``redundant_count``, so it answers "how many of this
+    ``upgrade``'s copies are provably byte-identical to a same-size sibling" across
+    however many buckets the group has. ``0`` for every group the bucket pass did not
+    tag (``identical``, ``mismatch``, an upgrade with no same-size bucket, or any group
+    at all when ``HASH_MODE=off``).
+
+    Reporting only: a non-zero result never changes what a reclaim deletes — an
+    ``upgrade`` already keeps its best copy and drops the rest, so a redundant same-size
+    copy was always going to be reclaimed. It only tells the operator *why* the bytes
+    are safe to drop.
+    """
+
+    return sum(bucket.redundant_count for bucket in group.hash_buckets)
+
 #: Non-numeric Plex ``videoResolution`` labels -> sortable rank. Purely numeric
 #: labels ("1080", "2160", "576", …) are ranked by their integer value instead,
 #: so a value the map does not list still sorts sensibly rather than as unknown.
@@ -340,6 +358,7 @@ def summarize_analyzed(analyzed: List[DuplicateGroup]) -> DedupeSummary:
                 "hash_confirmed_count": 0,
                 "hash_sample_match_count": 0,
                 "hash_unhashable_count": 0,
+                "hash_redundant_upgrade_count": 0,
                 "reclaimable_bytes": 0,
                 "reclaimable_keep_smallest": 0,
             }
@@ -353,6 +372,11 @@ def summarize_analyzed(analyzed: List[DuplicateGroup]) -> DedupeSummary:
         hash_key = _HASH_STATUS_COUNT_KEY.get(group.hash_status)
         if hash_key is not None:
             bucket[hash_key] += 1
+        # Gated on ``upgrade`` so the field can never drift from its name: only
+        # _confirm_upgrade writes buckets today, but a future pass that bucketed some
+        # other classification would otherwise silently inflate an "upgrade" total.
+        if group.classification == UPGRADE and redundant_bucket_copies(group):
+            bucket["hash_redundant_upgrade_count"] += 1
         bucket["reclaimable_bytes"] += group.reclaimable_bytes
         bucket["reclaimable_keep_smallest"] += group.reclaimable_keep_smallest
 
@@ -373,6 +397,9 @@ def summarize_analyzed(analyzed: List[DuplicateGroup]) -> DedupeSummary:
         ),
         hash_unhashable_count=sum(
             section.hash_unhashable_count for section in sections
+        ),
+        hash_redundant_upgrade_count=sum(
+            section.hash_redundant_upgrade_count for section in sections
         ),
         reclaimable_bytes=sum(section.reclaimable_bytes for section in sections),
         reclaimable_keep_smallest=sum(

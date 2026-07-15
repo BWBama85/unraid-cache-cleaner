@@ -367,6 +367,21 @@ class PlexDuplicateReporter:
         # keeps its exact prior shape (the key is absent, not empty).
         if include_hash:
             payload["hash_status"] = group.hash_status
+            # Same-size bucket verdicts (#93) exist only on an ``upgrade`` that has one,
+            # so the key is omitted rather than serialized as an empty list on every
+            # other group — absent and ``[]`` would mean the same thing ("no same-size
+            # bucket to report"), and omitting keeps the common group lean.
+            if group.hash_buckets:
+                payload["hash_buckets"] = [
+                    {
+                        "size": bucket.size,
+                        "status": bucket.status,
+                        "copy_count": bucket.copy_count,
+                        "redundant_count": bucket.redundant_count,
+                        "part_ids": list(bucket.part_ids),
+                    }
+                    for bucket in group.hash_buckets
+                ]
         return payload
 
     def build_payload(self, report: DuplicateReport) -> dict:
@@ -412,6 +427,9 @@ class PlexDuplicateReporter:
             payload["totals"]["hash_sample_match_count"] = summary.hash_sample_match_count
             payload["totals"]["hash_unhashable_count"] = summary.hash_unhashable_count
             payload["totals"]["different_content_count"] = summary.different_count
+            payload["totals"]["hash_redundant_upgrade_count"] = (
+                summary.hash_redundant_upgrade_count
+            )
         return payload
 
     def _reclaim_candidates(self, group: DuplicateGroup) -> List[MediaCopy]:
@@ -510,6 +528,7 @@ class PlexDuplicateReporter:
                 f" sample_match={summary.hash_sample_match_count}"
                 f" different={summary.different_count}"
                 f" unhashable={summary.hash_unhashable_count}"
+                f" redundant_upgrades={summary.hash_redundant_upgrade_count}"
             )
         LOGGER.info(
             "Plex duplicates: sections=%s groups=%s reclaimable=%s mismatches=%s%s%s",
@@ -637,18 +656,38 @@ class PlexDuplicateReporter:
         rows.extend(self._truncation_note(len(groups), len(shown)))
         return rows
 
-    @staticmethod
-    def _hash_tag(group: DuplicateGroup) -> str:
-        """Per-row content-hash verdict tag (#9): confirmed / sampled / unverified.
+    def _hash_tag(self, group: DuplicateGroup) -> str:
+        """Per-row content-hash verdict tag: confirmed / sampled / unverified (#9),
+        or an ``upgrade``'s same-size redundancy (#93).
 
-        Empty for a group the pass did not tag (e.g. an ``upgrade``), so only the
-        ``identical`` candidates carry a marker."""
+        The group-wide verdict wins when present (only an ``identical`` group has one).
+        Otherwise an ``upgrade`` holding redundant same-size copies is tagged with how
+        many — the actionable half of the bucket pass. The tag is graded by the run's
+        ``HASH_MODE`` (``redundant`` under ``full``, ``redundant-sampled`` under
+        ``partial``), because that is what decides whether a match is proof; tagging a
+        sampled match the same as a proven one would claim evidence the pass never
+        gathered, which is exactly the distinction the ``[hash:confirmed]`` /
+        ``[hash:sample-match]`` tags above keep.
 
-        return {
+        A bucket that merely proved *different* gets no tag: inside an upgrade that is
+        the expected case (a 720p and a 1080p sharing a size are obviously different
+        bytes), so tagging it would mark almost every upgrade while saying nothing. The
+        full per-bucket detail is in the JSON report either way.
+        """
+
+        tag = {
             hasher.CONFIRMED: "  [hash:confirmed]",
             hasher.SAMPLE_MATCH: "  [hash:sample-match]",
             hasher.UNHASHABLE: "  [hash:unhashable]",
         }.get(group.hash_status, "")
+        if tag:
+            return tag
+        redundant = dedupe.redundant_bucket_copies(group)
+        if not redundant:
+            return ""
+        if self.config.hash_mode == hasher.HASH_FULL:
+            return f"  [hash:redundant={redundant}]"
+        return f"  [hash:redundant-sampled={redundant}]"
 
     @staticmethod
     def _reclaimable_part_rows(

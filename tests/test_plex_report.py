@@ -1212,6 +1212,125 @@ class HashPassIntegrationTests(unittest.TestCase):
             self.assertGreater(group["reclaimable_bytes"], 0)
             self.assertIn("[hash:confirmed]", reporter.render_table(report))
 
+    def _upgrade_client(self, *specs) -> FakePlexClient:
+        """One movie whose copies differ in resolution => an ``upgrade`` group (#93).
+
+        ``specs`` are ``(name, size, resolution)``; part ids run 10, 11, 12 …
+        """
+
+        medias = [
+            _media(i + 1, res, 1000, [_part(10 + i, f"/plex/{name}", size)])
+            for i, (name, size, res) in enumerate(specs)
+        ]
+        return FakePlexClient(
+            [PlexSection(key="1", type="movie", title="Movies")],
+            {("1", 1): [_movie("100", "Dup", medias)]},
+        )
+
+    def _run_upgrade(self, tmp: Path, media: Path, mode: str, *specs):
+        """specs: ``(name, bytes, resolution)`` — written to disk, then reported."""
+
+        for name, data, _res in specs:
+            (media / name).write_bytes(data)
+        client = self._upgrade_client(*[(name, len(data), res) for name, data, res in specs])
+        reporter = PlexDuplicateReporter(
+            self._hash_config(tmp, media, mode), client, clock=lambda: 1234.5
+        )
+        return reporter, reporter.generate()
+
+    def test_upgrade_same_size_bucket_surfaces_without_moving_reclaim(self) -> None:
+        # #93 end-to-end: a duplicated 1080p (same size, same bytes) alongside an old
+        # 720p. The redundant pair is reported; the upgrade's reclaim math is untouched.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run_upgrade(
+                tmp,
+                media,
+                "full",
+                ("a.mkv", b"X" * 100, "1080"),
+                ("b.mkv", b"X" * 100, "1080"),
+                ("old.mkv", b"Y" * 50, "720"),
+            )
+            payload = reporter.build_payload(report)
+            group = payload["groups"][0]
+            self.assertEqual(group["classification"], "upgrade")
+            self.assertEqual(group["hash_status"], "")  # no group-wide verdict
+            self.assertEqual(
+                group["hash_buckets"],
+                [
+                    {
+                        "size": 100,
+                        "status": "confirmed",
+                        "copy_count": 2,
+                        "redundant_count": 2,
+                        "part_ids": [10, 11],
+                    }
+                ],
+            )
+            self.assertEqual(payload["totals"]["hash_redundant_upgrade_count"], 1)
+            # Reporting only: still reclaimable, and at the same figure the size-only
+            # analysis produced (keep the best 1080p, drop the other 1080p + the 720p).
+            self.assertEqual(group["reclaimable_bytes"], 150)
+            self.assertEqual(payload["totals"]["different_content_count"], 0)
+            self.assertIn("[hash:redundant=2]", reporter.render_table(report))
+
+    def test_partial_mode_tag_never_claims_proof(self) -> None:
+        # HASH_MODE=partial samples head+tail only, so the row tag must not read the
+        # same as a full-mode proof.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run_upgrade(
+                tmp,
+                media,
+                "partial",
+                ("a.mkv", b"X" * 100, "1080"),
+                ("b.mkv", b"X" * 100, "1080"),
+                ("old.mkv", b"Y" * 50, "720"),
+            )
+            payload = reporter.build_payload(report)
+            self.assertEqual(payload["groups"][0]["hash_buckets"][0]["status"], "sample-match")
+            table = reporter.render_table(report)
+            self.assertIn("[hash:redundant-sampled=2]", table)
+            self.assertNotIn("[hash:redundant=2]", table)
+
+    def test_upgrade_without_same_size_bucket_omits_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run_upgrade(
+                tmp,
+                media,
+                "full",
+                ("big.mkv", b"X" * 200, "1080"),
+                ("small.mkv", b"Y" * 100, "720"),
+            )
+            payload = reporter.build_payload(report)
+            self.assertNotIn("hash_buckets", payload["groups"][0])
+            self.assertEqual(payload["totals"]["hash_redundant_upgrade_count"], 0)
+            self.assertNotIn("[hash:redundant", reporter.render_table(report))
+
+    def test_off_omits_hash_buckets_entirely(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run_upgrade(
+                tmp,
+                media,
+                "off",
+                ("a.mkv", b"X" * 100, "1080"),
+                ("b.mkv", b"X" * 100, "1080"),
+                ("old.mkv", b"Y" * 50, "720"),
+            )
+            payload = reporter.build_payload(report)
+            self.assertNotIn("hash_buckets", payload["groups"][0])
+            self.assertNotIn("hash_redundant_upgrade_count", payload["totals"])
+
     def test_cache_created_and_reused_across_generations(self) -> None:
         # #92 end-to-end: the reporter opens the sidecar cache, persists digests, and a
         # second generation reuses them (and still confirms) — proving the cache is

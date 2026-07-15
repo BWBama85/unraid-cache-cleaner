@@ -144,6 +144,43 @@ class MediaCopy:
 
 
 @dataclass(frozen=True)
+class HashBucket:
+    """Content-hash verdict for one same-size bucket inside an ``upgrade`` group (#93).
+
+    An ``upgrade``'s copies are *meant* to differ (that is what makes one the keeper),
+    so the group-wide ``hash_status`` says nothing about it. But an upgrade can still
+    hold two copies of the **exact same size** — an old 720p plus a duplicated 1080p,
+    say — and those may be byte-identical. The hash pass buckets the logical copies by
+    size, hashes only the buckets with two or more members, and records the outcome
+    here. Purely informational: it never moves the keeper or a reclaim figure (see
+    :mod:`hasher`).
+
+    ``size`` is the shared logical size (stack-merged, so a split copy's total).
+    ``part_ids`` identifies the member copies by the same ``part_id`` the report and
+    action layer address them with, in the group's best-first order.
+
+    ``status`` describes whether **all** members agree: ``confirmed`` (every member is
+    byte-for-byte equal, ``full`` mode), ``sample-match`` (their sampled regions agree,
+    ``partial`` mode — a strong signal, never proof), ``different`` (the members do not
+    all share one digest), or ``unhashable`` (a member could not be read, or the members
+    are split into incompatible part layouts, so no verdict is possible).
+
+    ``redundant_count`` is the number of members that provably share their bytes with
+    at least one sibling — the actionable signal, and the reason ``status`` alone is not
+    enough: a three-member bucket holding a matching pair plus one odd copy is
+    ``different`` overall yet still carries two genuinely redundant copies. It is ``0``
+    for an ``unhashable`` bucket (nothing was proven) and never ``1`` (redundancy needs
+    a pair).
+    """
+
+    size: int
+    status: str
+    copy_count: int
+    redundant_count: int = 0
+    part_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class DuplicateGroup:
     """A Plex item that resolves to more than one media copy on disk.
 
@@ -174,6 +211,14 @@ class DuplicateGroup:
     # upgraded to confirmed. A group whose copies proved *different* is reclassified
     # ``different-content`` (see :mod:`dedupe`) and carries ``hash_status="different"``.
     hash_status: str = ""
+    # Per-same-size-bucket verdicts inside an ``upgrade`` group (#93), best-first;
+    # empty for every other group and whenever the pass did not run. Deliberately a
+    # separate field from ``hash_status``: an upgrade's group-wide verdict is
+    # meaningless (its copies are supposed to differ), and folding a bucket verdict
+    # into ``hash_status`` would both mis-tally the ``identical``-group totals and
+    # risk tripping the ``different`` ⇒ never-reclaim safety path. Informational
+    # only — an upgrade's classification, keeper, and reclaim figures are untouched.
+    hash_buckets: tuple[HashBucket, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -198,6 +243,10 @@ class SectionSummary:
     hash_confirmed_count: int = 0
     hash_sample_match_count: int = 0
     hash_unhashable_count: int = 0
+    #: ``upgrade`` groups holding at least one same-size bucket with provably
+    #: redundant copies (#93). Reporting only — these groups stay reclaimable exactly
+    #: as before, so this never moves a reclaimable figure.
+    hash_redundant_upgrade_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -225,6 +274,7 @@ class DedupeSummary:
     hash_confirmed_count: int = 0
     hash_sample_match_count: int = 0
     hash_unhashable_count: int = 0
+    hash_redundant_upgrade_count: int = 0
 
 
 @dataclass

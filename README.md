@@ -111,7 +111,7 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner service
 | `PLEX_TIMEOUT_SECONDS` | `30` | HTTP timeout when querying Plex |
 | `PLEX_VERIFY_TLS` | `true` | Verify TLS certificates (set `false` for a self-signed reverse proxy) |
 | `PLEX_DUPLICATE_REPORT_PATH` | `/config/plex-duplicates.json` | JSON duplicate report output path |
-| `HASH_MODE` | `off` | Opt into the [content-hash confirmation pass](#content-hash-confirmation-hash_mode): `off` (default, no media read), `partial` (size + first/last 4 MiB per copy, constant cost), or `full` (whole-file `sha256`). Confirms `identical` groups are truly byte-identical and downgrades any that aren't to *different-content* (never reclaimable). Reads Plex paths via `WEB_MEDIA_PATH_MAP`, so that map must be set and the media mounted (read-only) |
+| `HASH_MODE` | `off` | Opt into the [content-hash confirmation pass](#content-hash-confirmation-hash_mode): `off` (default, no media read), `partial` (size + first/last 4 MiB per copy, constant cost), or `full` (whole-file `sha256`). Confirms `identical` groups are truly byte-identical and downgrades any that aren't to *different-content* (never reclaimable); also annotates same-size copies inside an `upgrade` (reporting only — no reclaim changes). Reads Plex paths via `WEB_MEDIA_PATH_MAP`, so that map must be set and the media mounted (read-only) |
 | `HASH_CACHE` | `true` | Cache content-hash digests between runs so `HASH_MODE=partial`/`full` doesn't re-read every media file each report. Keyed by each copy's size, mtime, ctime, and inode (a changed file — even a same-size/same-mtime overwrite — is re-hashed); fail-open (a corrupt/locked cache just re-hashes, never a wrong verdict). Inert when `HASH_MODE=off` (no cache DB is opened). Set `false` to always hash live |
 | `HASH_CACHE_PATH` | `/config/hash-cache.sqlite3` | Location of the hash-cache SQLite sidecar (created only when the hash pass runs). Keep it on persistent storage (e.g. `/config`) so the cache survives restarts |
 | `RADARR_URL` | empty | Radarr base URL (e.g. `http://192.168.1.10:7878`); enables movie `*arr`-tracking |
@@ -237,15 +237,44 @@ PYTHONPATH=src python3 -m unraid_cache_cleaner plex-duplicates
   it was, but is never labelled confirmed — an unverified copy is never silently
   called safe.
 
+#### Same-size copies inside an `upgrade`
+
+An `upgrade` group's copies are *meant* to differ — that is what makes one of them the
+keeper — so there is no group-wide verdict to reach. But an upgrade can still hide two
+copies of the **exact same size**: a duplicated 1080p sitting next to an old 720p, say.
+Those same-size copies are bucketed and hashed too, and the report annotates each bucket
+`confirmed` / `sample-match` / `different` / `unhashable`, with `redundant_count` giving
+the copies that match a sibling — byte-for-byte under `full`, on the head/tail samples
+under `partial`, where it stays a strong signal rather than proof. A size that is unique
+within the group can hold no redundancy, so **its bytes are never read** — the added cost
+tracks the redundancy you actually have, not the size of your library.
+
+This is **reporting only, by design** — it changes no reclaim. An upgrade already keeps
+its best copy and drops the rest, so a redundant same-size copy was always going to be
+reclaimed; hashing only explains *why* those bytes are safe to drop. In particular a
+`different` bucket does **not** protect the group the way a different-content `identical`
+group is protected: inside an upgrade, differing bytes are the *expected* case (a 720p
+and a 1080p that happen to share a size are obviously not the same bytes), and the
+keeper was chosen on resolution/bitrate merit, never on byte-identity. So the
+classification, the keeper, and both reclaimable figures come out exactly as they do
+with `HASH_MODE=off`; only the annotation is added. Groups holding redundancy are
+counted by the `hash_redundant_upgrade_count` total and marked per row — tagged
+`[hash:redundant=N]` and badged `hash: redundant ×N` under `full`, versus
+`[hash:redundant-sampled=N]` / `hash: redundant ×N (sampled)` under `partial`, so a
+sampled match is never dressed up as proof. A merely-`different` bucket is left untagged
+in both — it would mark nearly every upgrade while telling you nothing — and stays
+visible in the JSON's `hash_buckets`.
+
 Because the pass reads the media, it must run **where the media is mounted**
 (usually the Unraid container, not a dev box), and it translates Plex-reported
 paths through the same `WEB_MEDIA_PATH_MAP` the browser reclaim uses. With no map,
 or with the media not mounted, the pass is skipped with a warning and the report
 falls back to size-only. Mount the media **read-only** — the pass never writes. The
-JSON gains a per-group `hash_status` and hash totals only when `HASH_MODE` is on, so
-an `off` report is byte-for-byte unchanged. In the [web GUI](#web-gui-for-the-duplicate-report)
-each reclaimable row also carries a small `hash: confirmed` / `sample-match` /
-`unhashable` badge mirroring the CLI table's `[hash:…]` tags.
+JSON gains a per-group `hash_status` (plus `hash_buckets` on an upgrade that has one)
+and hash totals only when `HASH_MODE` is on, so an `off` report is byte-for-byte
+unchanged. In the [web GUI](#web-gui-for-the-duplicate-report) each reclaimable row also
+carries a small `hash: confirmed` / `sample-match` / `unhashable` / `redundant ×N` badge
+mirroring the CLI table's `[hash:…]` tags.
 
 To avoid re-reading the whole library on every report, digests are cached between
 runs (`HASH_CACHE=true`, on by default) in a SQLite sidecar at `HASH_CACHE_PATH`

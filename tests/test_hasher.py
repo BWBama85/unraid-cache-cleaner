@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner import dedupe, hasher
-from unraid_cache_cleaner.models import DuplicateGroup, MediaCopy
+from unraid_cache_cleaner.models import DuplicateGroup, HashBucket, MediaCopy
 from unraid_cache_cleaner.state import HashCache
 
 _MIB = 1024 * 1024
@@ -32,12 +32,39 @@ def _copy(part_id: int, plex_name: str, size: int, *, media_id: int = 0) -> Medi
     )
 
 
+def _res_copy(
+    part_id: int, plex_name: str, size: int, resolution: str, *, media_id: int = 0
+) -> MediaCopy:
+    """A copy at an explicit resolution — what makes a group an ``upgrade`` (#93)."""
+
+    return MediaCopy(
+        part_id=part_id,
+        file=Path("/plex") / plex_name,
+        size=size,
+        resolution=resolution,
+        bitrate=1000,
+        media_id=media_id,
+    )
+
+
 def _identical_group(*copies: MediaCopy, title: str = "Movie", rating_key: str = "rk") -> DuplicateGroup:
     """Analyze a group whose copies share resolution+size => classified identical."""
 
     return dedupe.analyze_group(
         DuplicateGroup(rating_key=rating_key, kind="movie", title=title, copies=tuple(copies))
     )
+
+
+def _upgrade_group(
+    *copies: MediaCopy, title: str = "Movie", rating_key: str = "rk"
+) -> DuplicateGroup:
+    """Analyze a group whose copies differ in resolution/size => classified upgrade."""
+
+    group = dedupe.analyze_group(
+        DuplicateGroup(rating_key=rating_key, kind="movie", title=title, copies=tuple(copies))
+    )
+    assert group.classification == dedupe.UPGRADE, group.classification
+    return group
 
 
 class HashRegionsTests(unittest.TestCase):
@@ -287,7 +314,9 @@ class ConfirmGroupsTests(unittest.TestCase):
     def test_upgrade_and_mismatch_groups_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fx = self._fixture(tmpdir)
-            # An upgrade group (different sizes) is never hashed.
+            # An upgrade group never earns a group-wide verdict. This one holds no
+            # same-size bucket either, so the bucket pass (#93) leaves it completely
+            # alone — see UpgradeBucketTests for the case where it does have one.
             fx.write("big.mkv", b"X" * 200)
             fx.write("small.mkv", b"X" * 100)
             upgrade = dedupe.analyze_group(
@@ -353,6 +382,320 @@ class ConfirmGroupsTests(unittest.TestCase):
             group = _identical_group(_copy(1, "a.mkv", 0), _copy(2, "b.mkv", 0))
             out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
             self.assertEqual(out[0].hash_status, hasher.CONFIRMED)
+
+
+class UpgradeBucketTests(unittest.TestCase):
+    """Same-size bucket confirmation inside ``upgrade`` groups (#93).
+
+    The invariant every test here re-checks: an ``upgrade`` is **annotated, never
+    re-decided**. Its classification, keeper, and both reclaim figures must come out
+    exactly as ``dedupe.analyze_group`` computed them, whatever the bytes say.
+    """
+
+    def _fixture(self, tmpdir: str) -> _MediaFixture:
+        return _MediaFixture(Path(tmpdir))
+
+    def _assert_untouched(self, out: DuplicateGroup, original: DuplicateGroup) -> None:
+        """The reclaim contract: hashing an upgrade moves nothing but ``hash_buckets``."""
+
+        self.assertEqual(out.classification, dedupe.UPGRADE)
+        self.assertEqual(out.keeper, original.keeper)
+        self.assertEqual(out.reclaimable_bytes, original.reclaimable_bytes)
+        self.assertEqual(out.reclaimable_keep_smallest, original.reclaimable_keep_smallest)
+        self.assertEqual(out.hash_status, "")  # the group-wide verdict stays unset
+        self.assertTrue(dedupe.is_reclaimable(out.classification))
+
+    def test_same_size_pair_confirmed_and_keeper_untouched(self) -> None:
+        # 1080p x2 at an identical size (the redundant pair) + a 720p at another size.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            fx.write("old.mkv", b"Y" * 50)
+            group = _upgrade_group(
+                _res_copy(1, "a.mkv", 100, "1080"),
+                _res_copy(2, "b.mkv", 100, "1080"),
+                _res_copy(3, "old.mkv", 50, "720"),
+            )
+            out, warnings = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            self.assertEqual(
+                out[0].hash_buckets,
+                (
+                    HashBucket(
+                        size=100,
+                        status=hasher.CONFIRMED,
+                        copy_count=2,
+                        redundant_count=2,
+                        part_ids=(1, 2),
+                    ),
+                ),
+            )
+            self._assert_untouched(out[0], group)
+            # Informational only: an upgrade bucket never adds to the warning list,
+            # which is reserved for findings that bear on reclaim safety.
+            self.assertEqual(warnings, [])
+
+    def test_singleton_size_is_never_read(self) -> None:
+        # The cost guarantee: a size unique within the group can hold no redundancy, so
+        # its bytes must never be touched. ``hash_regions`` runs once per part on the
+        # read path, so the sizes it sees are exactly the files that were read.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            fx.write("old.mkv", b"Y" * 50)
+            group = _upgrade_group(
+                _res_copy(1, "a.mkv", 100, "1080"),
+                _res_copy(2, "b.mkv", 100, "1080"),
+                _res_copy(3, "old.mkv", 50, "720"),
+            )
+            reads: list[int] = []
+            real = hasher.hash_regions
+
+            def counting(size, mode):
+                reads.append(size)
+                return real(size, mode)
+
+            with mock.patch.object(hasher, "hash_regions", counting):
+                hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            self.assertEqual(reads, [100, 100])
+            self.assertNotIn(50, reads)
+
+    def test_upgrade_with_no_same_size_bucket_reads_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("big.mkv", b"X" * 200)
+            fx.write("small.mkv", b"X" * 100)
+            group = _upgrade_group(
+                _res_copy(1, "big.mkv", 200, "1080"),
+                _res_copy(2, "small.mkv", 100, "720"),
+            )
+            reads: list[int] = []
+            real = hasher.hash_regions
+
+            def counting(size, mode):
+                reads.append(size)
+                return real(size, mode)
+
+            with mock.patch.object(hasher, "hash_regions", counting):
+                out, warnings = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            self.assertEqual(reads, [])
+            self.assertEqual(out[0].hash_buckets, ())
+            self.assertEqual(warnings, [])
+            self._assert_untouched(out[0], group)
+
+    def test_partial_mode_pair_is_sample_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            fx.write("old.mkv", b"Y" * 50)
+            group = _upgrade_group(
+                _res_copy(1, "a.mkv", 100, "1080"),
+                _res_copy(2, "b.mkv", 100, "1080"),
+                _res_copy(3, "old.mkv", 50, "720"),
+            )
+            out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_PARTIAL)
+            self.assertEqual(out[0].hash_buckets[0].status, hasher.SAMPLE_MATCH)
+            self.assertEqual(out[0].hash_buckets[0].redundant_count, 2)
+
+    def test_same_size_different_bytes_is_informational_not_protective(self) -> None:
+        # The deliberate asymmetry with an ``identical`` group: differing bytes here are
+        # expected (a 720p and a 1080p sharing a size), so the group must NOT be
+        # downgraded to different-content or dropped from the reclaimable set.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("hd.mkv", b"X" * 100)
+            fx.write("sd.mkv", b"Y" * 100)  # same size, different bytes, worse res
+            group = _upgrade_group(
+                _res_copy(1, "hd.mkv", 100, "1080"),
+                _res_copy(2, "sd.mkv", 100, "720"),
+            )
+            self.assertGreater(group.reclaimable_bytes, 0)
+            out, warnings = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            self.assertEqual(out[0].hash_buckets[0].status, hasher.DIFFERENT)
+            self.assertEqual(out[0].hash_buckets[0].redundant_count, 0)
+            self.assertNotEqual(out[0].classification, dedupe.DIFFERENT)
+            self._assert_untouched(out[0], group)
+            self.assertEqual(warnings, [])
+
+    def test_mixed_cluster_reports_the_redundant_pair(self) -> None:
+        # Three copies at one size: two identical + one odd. The bucket does not all
+        # agree (=> different), but two copies are still provably redundant — the case a
+        # single all-or-nothing verdict would hide.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            fx.write("c.mkv", b"Z" * 100)
+            group = _upgrade_group(
+                _res_copy(1, "a.mkv", 100, "1080"),
+                _res_copy(2, "b.mkv", 100, "1080"),
+                _res_copy(3, "c.mkv", 100, "720"),
+            )
+            out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            bucket = out[0].hash_buckets[0]
+            self.assertEqual(bucket.status, hasher.DIFFERENT)
+            self.assertEqual(bucket.redundant_count, 2)
+            self.assertEqual(bucket.copy_count, 3)
+            self.assertEqual(dedupe.redundant_bucket_copies(out[0]), 2)
+            self._assert_untouched(out[0], group)
+
+    def test_several_buckets_in_one_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)  # bucket 100: redundant pair
+            fx.write("c.mkv", b"Y" * 50)
+            fx.write("d.mkv", b"Z" * 50)  # bucket 50: same size, different bytes
+            group = _upgrade_group(
+                _res_copy(1, "a.mkv", 100, "1080"),
+                _res_copy(2, "b.mkv", 100, "1080"),
+                _res_copy(3, "c.mkv", 50, "720"),
+                _res_copy(4, "d.mkv", 50, "720"),
+            )
+            out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            self.assertEqual(
+                [(b.size, b.status, b.redundant_count) for b in out[0].hash_buckets],
+                [(100, hasher.CONFIRMED, 2), (50, hasher.DIFFERENT, 0)],
+            )
+            # Buckets are ordered best-first, matching the group's copy ranking.
+            self.assertEqual(dedupe.redundant_bucket_copies(out[0]), 2)
+            self._assert_untouched(out[0], group)
+
+    def test_unreadable_member_is_unhashable_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)  # b.mkv missing
+            fx.write("old.mkv", b"Y" * 50)
+            group = _upgrade_group(
+                _res_copy(1, "a.mkv", 100, "1080"),
+                _res_copy(2, "b.mkv", 100, "1080"),
+                _res_copy(3, "old.mkv", 50, "720"),
+            )
+            out, warnings = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            bucket = out[0].hash_buckets[0]
+            self.assertEqual(bucket.status, hasher.UNHASHABLE)
+            self.assertEqual(bucket.redundant_count, 0)  # nothing was proven
+            self._assert_untouched(out[0], group)
+            self.assertEqual(warnings, [])
+
+    def test_incompatible_part_topology_is_unhashable_bucket(self) -> None:
+        # Two stacked copies with the same total size but different splits: not
+        # comparable, so no verdict — never a false "redundant".
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a1.mkv", b"X" * 50)
+            fx.write("a2.mkv", b"Y" * 70)
+            fx.write("b1.mkv", b"X" * 60)
+            fx.write("b2.mkv", b"Y" * 60)
+            fx.write("old.mkv", b"Z" * 40)
+            group = _upgrade_group(
+                _res_copy(1, "a1.mkv", 50, "1080", media_id=10),
+                _res_copy(2, "a2.mkv", 70, "1080", media_id=10),
+                _res_copy(3, "b1.mkv", 60, "1080", media_id=20),
+                _res_copy(4, "b2.mkv", 60, "1080", media_id=20),
+                _res_copy(5, "old.mkv", 40, "720"),
+            )
+            out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            bucket = out[0].hash_buckets[0]
+            self.assertEqual(bucket.size, 120)  # both stacks merge to one logical size
+            self.assertEqual(bucket.status, hasher.UNHASHABLE)
+            self.assertEqual(bucket.redundant_count, 0)
+            self._assert_untouched(out[0], group)
+
+    def test_stacked_copies_with_same_topology_confirm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            for name in ("a1.mkv", "b1.mkv"):
+                fx.write(name, b"X" * 50)
+            for name in ("a2.mkv", "b2.mkv"):
+                fx.write(name, b"Y" * 70)
+            fx.write("old.mkv", b"Z" * 40)
+            group = _upgrade_group(
+                _res_copy(1, "a1.mkv", 50, "1080", media_id=10),
+                _res_copy(2, "a2.mkv", 70, "1080", media_id=10),
+                _res_copy(3, "b1.mkv", 50, "1080", media_id=20),
+                _res_copy(4, "b2.mkv", 70, "1080", media_id=20),
+                _res_copy(5, "old.mkv", 40, "720"),
+            )
+            out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            bucket = out[0].hash_buckets[0]
+            self.assertEqual(bucket.size, 120)
+            self.assertEqual(bucket.status, hasher.CONFIRMED)
+            self.assertEqual(bucket.redundant_count, 2)
+            # Members are addressed by each logical copy's part_id (a stack's first part).
+            self.assertEqual(bucket.part_ids, (1, 3))
+
+    def test_off_mode_leaves_upgrade_unbucketed(self) -> None:
+        group = _upgrade_group(
+            _res_copy(1, "a.mkv", 100, "1080"),
+            _res_copy(2, "b.mkv", 100, "1080"),
+            _res_copy(3, "old.mkv", 50, "720"),
+        )
+        out, warnings = hasher.confirm_groups([group], (), hasher.HASH_OFF)
+        self.assertEqual(out, [group])
+        self.assertEqual(out[0].hash_buckets, ())
+        self.assertEqual(warnings, [])
+
+    def test_mismatch_group_is_never_bucketed(self) -> None:
+        # A mismatch is protected on identity grounds; no hash verdict could make it
+        # safer, so its bytes are never read.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            group = dedupe.analyze_group(
+                DuplicateGroup(
+                    rating_key="m",
+                    kind="movie",
+                    title="Mixed",
+                    copies=(
+                        _res_copy(1, "{imdb-tt1} a.mkv", 100, "1080"),
+                        _res_copy(2, "{imdb-tt2} b.mkv", 100, "720"),
+                    ),
+                )
+            )
+            self.assertEqual(group.classification, dedupe.MISMATCH)
+            out, _ = hasher.confirm_groups([group], fx.path_map, hasher.HASH_FULL)
+            self.assertEqual(out[0].hash_buckets, ())
+            self.assertEqual(out[0].classification, dedupe.MISMATCH)
+
+    def test_bucket_digests_are_cached_across_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fx = self._fixture(tmpdir)
+            fx.write("a.mkv", b"X" * 100)
+            fx.write("b.mkv", b"X" * 100)
+            fx.write("old.mkv", b"Y" * 50)
+            group = _upgrade_group(
+                _res_copy(1, "a.mkv", 100, "1080"),
+                _res_copy(2, "b.mkv", 100, "1080"),
+                _res_copy(3, "old.mkv", 50, "720"),
+            )
+            cache_path = Path(tmpdir) / "hc.sqlite3"
+            real = hasher.hash_regions
+
+            def run() -> tuple:
+                reads: list[int] = []
+
+                def counting(size, mode):
+                    reads.append(size)
+                    return real(size, mode)
+
+                cache = HashCache(cache_path)
+                with mock.patch.object(hasher, "hash_regions", counting):
+                    out, _ = hasher.confirm_groups(
+                        [group], fx.path_map, hasher.HASH_FULL, cache=cache
+                    )
+                cache.close()
+                return out, reads
+
+            out1, reads1 = run()
+            self.assertEqual(reads1, [100, 100])  # cold: the bucket members are read
+            out2, reads2 = run()
+            self.assertEqual(reads2, [])  # warm: served from cache
+            self.assertEqual(out1[0].hash_buckets, out2[0].hash_buckets)
+            self.assertEqual(out2[0].hash_buckets[0].status, hasher.CONFIRMED)
 
 
 class CacheIntegrationTests(unittest.TestCase):

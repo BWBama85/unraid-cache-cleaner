@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unraid_cache_cleaner import dedupe
-from unraid_cache_cleaner.models import DuplicateGroup, MediaCopy
+from unraid_cache_cleaner.models import DuplicateGroup, HashBucket, MediaCopy
 
 GB = 1_000_000_000
 
@@ -407,6 +408,61 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(summary.copy_count, 1)
         self.assertEqual(summary.reclaimable_bytes, 0)
         self.assertEqual(summary.reclaimable_keep_smallest, 0)
+
+
+class RedundantBucketTests(unittest.TestCase):
+    """``redundant_bucket_copies`` + its summary tally (#93)."""
+
+    def _upgrade(self, *buckets, rating_key: str = "u") -> DuplicateGroup:
+        group = dedupe.analyze_group(
+            _group(
+                "movie",
+                "Up",
+                _copy(1, "/m/film {imdb-tt1}/1080.mkv", 8 * GB, "1080"),
+                _copy(2, "/m/film {imdb-tt1}/720.mkv", 2 * GB, "720"),
+                rating_key=rating_key,
+            )
+        )
+        return replace(group, hash_buckets=tuple(buckets))
+
+    def test_zero_without_buckets(self) -> None:
+        self.assertEqual(dedupe.redundant_bucket_copies(self._upgrade()), 0)
+
+    def test_sums_across_buckets(self) -> None:
+        group = self._upgrade(
+            HashBucket(size=8 * GB, status="confirmed", copy_count=2, redundant_count=2),
+            HashBucket(size=2 * GB, status="different", copy_count=2, redundant_count=0),
+            HashBucket(size=1 * GB, status="confirmed", copy_count=3, redundant_count=3),
+        )
+        self.assertEqual(dedupe.redundant_bucket_copies(group), 5)
+
+    def test_summary_counts_groups_not_copies(self) -> None:
+        # Two upgrades hold redundancy (one with 2 redundant copies, one with 3); a
+        # third holds only a different-bytes bucket and must not be counted.
+        redundant_a = self._upgrade(
+            HashBucket(size=8 * GB, status="confirmed", copy_count=2, redundant_count=2),
+            rating_key="a",
+        )
+        redundant_b = self._upgrade(
+            HashBucket(size=8 * GB, status="different", copy_count=3, redundant_count=3),
+            rating_key="b",
+        )
+        not_redundant = self._upgrade(
+            HashBucket(size=8 * GB, status="different", copy_count=2, redundant_count=0),
+            rating_key="c",
+        )
+        summary = dedupe.summarize_analyzed([redundant_a, redundant_b, not_redundant])
+        self.assertEqual(summary.hash_redundant_upgrade_count, 2)
+        self.assertEqual(summary.upgrade_count, 3)
+        # Reporting only: the tally never touches a reclaimable figure.
+        self.assertEqual(
+            summary.reclaimable_bytes,
+            sum(g.reclaimable_bytes for g in (redundant_a, redundant_b, not_redundant)),
+        )
+
+    def test_summary_zero_when_pass_did_not_run(self) -> None:
+        summary = dedupe.summarize_analyzed([self._upgrade()])
+        self.assertEqual(summary.hash_redundant_upgrade_count, 0)
 
 
 class ImmutabilityTests(unittest.TestCase):
