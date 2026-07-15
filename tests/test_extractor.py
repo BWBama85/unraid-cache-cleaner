@@ -702,8 +702,35 @@ class _IdenticalOverwriteTool(FakeTool):
             os.utime(target, (old_mtime, old_mtime))  # restore member timestamp
 
 
+class _NestedIdenticalOverwriteTool(_IdenticalOverwriteTool):
+    """The nested twin of :class:`_IdenticalOverwriteTool` (#54).
+
+    Real archives spell a nested member with a backslash (``sub\\deep.mkv``) and
+    ``unar`` splits on it to recreate the tree, so the member ``lsar`` reports —
+    normalized to ``sub/deep.mkv`` — is exactly where the file lands. Nesting
+    therefore costs the member-list mapping no precision.
+    """
+
+    MEMBER = Path("sub/deep.mkv")
+
+    def extract(self, archive: Path, dest_dir: Path) -> None:
+        self.extract_calls.append((archive, dest_dir))
+        target = dest_dir / self.MEMBER
+        target.parent.mkdir(parents=True, exist_ok=True)
+        old_mtime = target.stat().st_mtime if target.exists() else None
+        target.write_text(self.CONTENT)
+        if old_mtime is not None:
+            os.utime(target, (old_mtime, old_mtime))  # restore member timestamp
+
+    def list_members(self, archive: Path) -> list[Path] | None:
+        self.list_members_calls.append(archive)
+        if self.list_members_result is not _DERIVE_MEMBERS:
+            return self.list_members_result  # type: ignore[return-value]
+        return [self.MEMBER]
+
+
 class MemberListOutputTests(unittest.TestCase):
-    """Precise produced-output detection via the archive's member list (#43)."""
+    """Precise produced-output detection via the archive's member list (#43, #54)."""
 
     def _seed_identical_output(self, fx: "_Fixture") -> Path:
         """Pre-seed movie.mkv with the exact bytes+mtime a re-extract will restore."""
@@ -730,6 +757,54 @@ class MemberListOutputTests(unittest.TestCase):
             self.assertEqual([r.status for r in results], ["extracted"])
             self.assertIn(mkv, results[0].outputs)  # caught only by the member list
             self.assertIn(mkv, store.get_protected_extracted_paths(0.0, protect_seconds=10**9))
+
+    def test_nested_byte_identical_overwrite_recorded_via_member_list(self) -> None:
+        # #54: the same blind spot one directory down. The nested member maps to the
+        # exact path `unar` writes, so it is recorded and protected like a root one.
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            deep = normalize_path(
+                fx.write_rar("rel/sub/deep.mkv", content=_NestedIdenticalOverwriteTool.CONTENT)
+            )
+            os.utime(deep, (1000.0, 1000.0))
+            before = os.stat(deep)
+            store = StateStore(fx.config().state_db_path)
+            extractor = Extractor(
+                fx.config(),
+                tool=_NestedIdenticalOverwriteTool(),
+                ledger=StateExtractionLedger(store),
+            )
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            after = os.stat(deep)
+            # The fingerprint is genuinely unchanged: the diff alone is blind here.
+            self.assertEqual((before.st_mtime, before.st_size), (after.st_mtime, after.st_size))
+            self.assertEqual([r.status for r in results], ["extracted"])
+            self.assertIn(deep, results[0].outputs)  # caught only by the member list
+            self.assertIn(deep, store.get_protected_extracted_paths(0.0, protect_seconds=10**9))
+
+    def test_member_naming_an_absent_path_is_never_invented(self) -> None:
+        # A member that maps to no walked path is simply dropped. This is the shape
+        # of the one case that stays uncovered (#54): a member stored with a literal
+        # `/` is not a path to `unar`, which sanitizes it to a flat name
+        # (`sub_deep.mkv` on Linux, `sub:deep.mkv` on macOS) that `lsar`'s normalized
+        # `sub/deep.mkv` cannot address. The member list only ever confirms paths the
+        # walk already found — it never conjures one, so the fallback stays safe.
+        with _Fixture() as fx:
+            fx.write_rar("rel/movie.rar")
+            store = StateStore(fx.config().state_db_path)
+            tool = FakeTool(list_members_result=[Path("sub/deep.mkv")])
+            extractor = Extractor(fx.config(), tool=tool, ledger=StateExtractionLedger(store))
+
+            results = extractor.extract_all((fx.watch_root,), dry_run=False)
+
+            self.assertEqual([r.status for r in results], ["extracted"])
+            outputs = {p for r in results for p in r.outputs}
+            self.assertNotIn(normalize_path(fx.watch_root / "rel" / "sub" / "deep.mkv"), outputs)
+            self.assertFalse((fx.watch_root / "rel" / "sub").exists())
+            # ...while the genuinely produced file is still caught by the diff.
+            self.assertIn(normalize_path(fx.watch_root / "rel" / "movie.mkv"), outputs)
 
     def test_fallback_to_fingerprint_when_members_unavailable(self) -> None:
         # With member enumeration unavailable, the byte-identical overwrite reverts
@@ -834,6 +909,9 @@ class UnarArchiveToolTests(unittest.TestCase):
         self.assertEqual(cmd[-1], "/data/rel/movie.rar")
         # nested archives must not be auto-extracted (mirror `unrar x`)
         self.assertIn("-no-recursion", cmd)
+        # Suppresses only unar's *archive-named enclosing* dir, so contents land in
+        # place; it does not flatten members, which keep their nesting (#54).
+        self.assertIn("-no-directory", cmd)
 
     def test_test_uses_integrity_test_flag(self) -> None:
         runner, calls = self._runner(0)
@@ -941,6 +1019,18 @@ class RealBinaryTests(unittest.TestCase):
             archive.write_bytes(gen.build_rar4(gen.FIXTURE_MEMBER, gen.FIXTURE_CONTENT))
         return archive
 
+    def _nested_fixture_archive(self, dest_dir: Path) -> Path:
+        """Copy the committed ``nested.rar`` into ``dest_dir`` (regenerate if absent)."""
+
+        committed = _FIXTURES_DIR / "nested.rar"
+        archive = dest_dir / "nested.rar"
+        if committed.exists():
+            shutil.copyfile(committed, archive)
+        else:  # never shells out to a `rar` creator — reuse the committed generator
+            gen = _load_fixture_generator()
+            archive.write_bytes(gen.build_rar4_multi(gen.NESTED_MEMBERS))
+        return archive
+
     def test_real_unar_extraction_roundtrip(self) -> None:
         with _Fixture() as fx:
             rel = fx.watch_root / "release"
@@ -968,6 +1058,52 @@ class RealBinaryTests(unittest.TestCase):
             archive = self._fixture_archive(fx.watch_root)
             members = UnarArchiveTool("unar").list_members(archive)
             self.assertEqual(members, [Path("hello.txt")])
+
+    @unittest.skipUnless(shutil.which("lsar"), "lsar not installed")
+    def test_real_lsar_normalizes_nested_member_separator(self) -> None:
+        # The linchpin for #54: the fixture archives the member as `sub\deep.txt`,
+        # and lsar reports it as `sub/deep.txt` — the exact relative path unar
+        # extracts it to. So `_safe_member_path` maps nested members by plain
+        # concatenation, with no platform-specific reconstruction to get wrong.
+        with _Fixture() as fx:
+            archive = self._nested_fixture_archive(fx.watch_root)
+            members = UnarArchiveTool("unar").list_members(archive)
+            self.assertEqual(members, [Path("root.txt"), Path("sub/deep.txt")])
+
+    def test_real_unar_nested_byte_identical_overwrite_is_recorded(self) -> None:
+        # #54's acceptance case on the real binaries. `unar` restores each member's
+        # archived timestamp, so re-extracting rewrites identical bytes with an
+        # identical mtime — invisible to the (mtime, size) diff. The member list must
+        # still record the *nested* output so the planner protects it.
+        with _Fixture() as fx:
+            rel = fx.watch_root / "release"
+            rel.mkdir()
+            archive = self._nested_fixture_archive(rel)
+            clock = lambda: archive.stat().st_mtime + 10_000  # noqa: E731 - past the settle guard
+
+            # First pass materializes the tree (no ledger ⇒ no output bookkeeping).
+            first = Extractor(fx.config(), clock=clock)
+            self.assertEqual(
+                [r.status for r in first.extract_all((fx.watch_root,), dry_run=False)],
+                ["extracted"],
+            )
+            deep = normalize_path(rel / "sub" / "deep.txt")
+            self.assertTrue(deep.exists())  # real unar rebuilt the tree from `sub\deep.txt`
+            before = os.stat(deep)
+
+            # Second pass: a fresh ledger re-claims the archive, so it extracts again
+            # over the byte-identical files and records what it produced.
+            store = StateStore(fx.config().state_db_path)
+            second = Extractor(fx.config(), ledger=StateExtractionLedger(store), clock=clock)
+            results = second.extract_all((fx.watch_root,), dry_run=False)
+
+            after = os.stat(deep)
+            # The fingerprint is genuinely unchanged: the diff alone is blind here.
+            self.assertEqual((before.st_mtime, before.st_size), (after.st_mtime, after.st_size))
+            self.assertEqual([r.status for r in results], ["extracted"])
+            self.assertIn(deep, results[0].outputs)  # caught only by the member list
+            self.assertIn(deep, store.get_protected_extracted_paths(0.0, protect_seconds=10**9))
+            self.assertIn(normalize_path(rel / "root.txt"), results[0].outputs)  # no root regression
 
 
 if __name__ == "__main__":
