@@ -992,7 +992,9 @@ class HashBadgeTests(unittest.TestCase):
 class UpgradeRedundancyBadgeTests(unittest.TestCase):
     """The same-size redundancy badge and tile on an ``upgrade`` row (#93)."""
 
-    def _upgrade_payload(self, buckets=None, *, hash_enabled: bool = True) -> dict:
+    def _upgrade_payload(
+        self, buckets=None, *, hash_enabled: bool = True, hash_mode: str = "full"
+    ) -> dict:
         payload = _payload()
         group = payload["groups"][0]
         group["classification"] = "upgrade"
@@ -1000,6 +1002,7 @@ class UpgradeRedundancyBadgeTests(unittest.TestCase):
         if buckets is not None:
             group["hash_buckets"] = buckets
         payload["hash_enabled"] = hash_enabled
+        payload["hash_mode"] = hash_mode
         return payload
 
     def test_redundant_bucket_renders_badge(self) -> None:
@@ -1010,6 +1013,22 @@ class UpgradeRedundancyBadgeTests(unittest.TestCase):
         )
         self.assertIn('class="tag hash-confirmed"', html)
         self.assertIn("hash: redundant ×2", html)
+        self.assertIn("byte-identical", html)
+
+    def test_partial_mode_badge_never_claims_proof(self) -> None:
+        # HASH_MODE=partial reads only the head and tail, so a match is a strong signal,
+        # never proof. The badge must not borrow the confirmed styling or wording.
+        html = render_report_html(
+            self._upgrade_payload(
+                [{"size": 100, "status": "sample-match", "copy_count": 2, "redundant_count": 2}],
+                hash_mode="partial",
+            )
+        )
+        self.assertIn("hash: redundant ×2 (sampled)", html)
+        self.assertIn('class="tag hash-sample"', html)
+        self.assertNotIn('class="tag hash-confirmed"', html)
+        self.assertNotIn("byte-identical", html)
+        self.assertIn("not proof", html)
 
     def test_several_buckets_sum_into_one_badge(self) -> None:
         html = render_report_html(

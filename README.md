@@ -244,9 +244,10 @@ keeper — so there is no group-wide verdict to reach. But an upgrade can still 
 copies of the **exact same size**: a duplicated 1080p sitting next to an old 720p, say.
 Those same-size copies are bucketed and hashed too, and the report annotates each bucket
 `confirmed` / `sample-match` / `different` / `unhashable`, with `redundant_count` giving
-the copies provably identical to a sibling. A size that is unique within the group can
-hold no redundancy, so **its bytes are never read** — the added cost tracks the
-redundancy you actually have, not the size of your library.
+the copies that match a sibling — byte-for-byte under `full`, on the head/tail samples
+under `partial`, where it stays a strong signal rather than proof. A size that is unique
+within the group can hold no redundancy, so **its bytes are never read** — the added cost
+tracks the redundancy you actually have, not the size of your library.
 
 This is **reporting only, by design** — it changes no reclaim. An upgrade already keeps
 its best copy and drops the rest, so a redundant same-size copy was always going to be
@@ -257,10 +258,12 @@ and a 1080p that happen to share a size are obviously not the same bytes), and t
 keeper was chosen on resolution/bitrate merit, never on byte-identity. So the
 classification, the keeper, and both reclaimable figures come out exactly as they do
 with `HASH_MODE=off`; only the annotation is added. Groups holding redundancy are
-tagged `[hash:redundant=N]` in the CLI table, badged `hash: redundant ×N` in the web
-GUI, and counted by the `hash_redundant_upgrade_count` total. A merely-`different`
-bucket is left untagged in both — it would mark nearly every upgrade while telling you
-nothing — and stays visible in the JSON's `hash_buckets`.
+counted by the `hash_redundant_upgrade_count` total and marked per row — tagged
+`[hash:redundant=N]` and badged `hash: redundant ×N` under `full`, versus
+`[hash:redundant-sampled=N]` / `hash: redundant ×N (sampled)` under `partial`, so a
+sampled match is never dressed up as proof. A merely-`different` bucket is left untagged
+in both — it would mark nearly every upgrade while telling you nothing — and stays
+visible in the JSON's `hash_buckets`.
 
 Because the pass reads the media, it must run **where the media is mounted**
 (usually the Unraid container, not a dev box), and it translates Plex-reported

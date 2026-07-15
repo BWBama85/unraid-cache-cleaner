@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 from urllib.parse import parse_qsl, urlparse
 
-from . import dedupe
+from . import dedupe, hasher
 from .config import Config
 from .state import WebActionHistoryReader
 from .web_actions import (
@@ -536,7 +536,13 @@ def render_report_html(
     mismatches = [g for g in groups if g.get("classification") == dedupe.MISMATCH]
     different = [g for g in groups if g.get("classification") == dedupe.DIFFERENT]
 
-    reclaimable_html = _render_reclaimable(reclaimable, actions_enabled=actions_enabled)
+    reclaimable_html = _render_reclaimable(
+        reclaimable,
+        actions_enabled=actions_enabled,
+        # The run's HASH_MODE grades a redundancy badge (proof vs sample), so it rides
+        # from the payload rather than being inferred from a bucket.
+        hash_mode=str(payload.get("hash_mode") or ""),
+    )
     if actions_enabled:
         reclaimable_html = _wrap_reclaim_form(
             reclaimable_html, payload.get("generated_at"), script_nonce=script_nonce
@@ -1405,7 +1411,33 @@ def _redundant_bucket_copies(group: dict) -> int:
     )
 
 
-def _hash_badge(group: dict) -> str:
+def _redundant_badge(redundant: int, hash_mode: str) -> tuple:
+    """The same-size redundancy badge for an ``upgrade`` row (#93).
+
+    Graded by ``hash_mode``, because that — and nothing about the bucket itself — is
+    what decides whether a match is proof: ``full`` read every byte, ``partial`` read
+    only the head and tail. Claiming "byte-identical" for a ``partial`` match would
+    assert proof the pass never obtained, so the two modes get different wording *and*
+    different styling, exactly as the group-wide ``confirmed`` / ``sample-match`` badges
+    above already do.
+    """
+
+    if hash_mode == hasher.HASH_FULL:
+        return (
+            f"hash: redundant ×{redundant}",
+            "hash-confirmed",
+            f"{redundant} same-size copies here are byte-identical to a sibling "
+            "(full hash) — the keeper is unaffected",
+        )
+    return (
+        f"hash: redundant ×{redundant} (sampled)",
+        "hash-sample",
+        f"{redundant} same-size copies here match a sibling on their head and tail "
+        "samples (partial hash) — a strong signal, not proof; the keeper is unaffected",
+    )
+
+
+def _hash_badge(group: dict, hash_mode: str = "") -> str:
     """A small inline hash-status badge for a reclaimable row, or ``""`` (#94, #93).
 
     The group-wide verdict wins when present; an ``upgrade`` has none and instead earns
@@ -1418,17 +1450,14 @@ def _hash_badge(group: dict) -> str:
         redundant = _redundant_bucket_copies(group)
         if not redundant:
             return ""
-        badge = (
-            f"hash: redundant ×{redundant}",
-            "hash-confirmed",
-            f"{redundant} same-size copies here are byte-identical to a sibling "
-            "— the keeper is unaffected",
-        )
+        badge = _redundant_badge(redundant, hash_mode)
     label, css, title = badge
     return f' <span class="tag {css}" title="{_esc(title)}">{_esc(label)}</span>'
 
 
-def _render_reclaimable(groups: List[dict], *, actions_enabled: bool = False) -> str:
+def _render_reclaimable(
+    groups: List[dict], *, actions_enabled: bool = False, hash_mode: str = ""
+) -> str:
     groups = sorted(groups, key=lambda g: -_as_int(g.get("reclaimable_bytes")))
     total = sum(_as_int(g.get("reclaimable_bytes")) for g in groups)
     header = (
@@ -1452,7 +1481,8 @@ def _render_reclaimable(groups: List[dict], *, actions_enabled: bool = False) ->
         rows.append(
             "<tr>"
             f'<td class="num">{_esc(_fmt_gib(group.get("reclaimable_bytes", 0)))}</td>'
-            f'<td>{_esc(group.get("classification", "?"))}{_hash_badge(group)}</td>'
+            f'<td>{_esc(group.get("classification", "?"))}'
+            f"{_hash_badge(group, hash_mode)}</td>"
             f'<td>{_esc(group.get("kind", "?"))}</td>'
             f'<td><span class="tag keep">keep {keep_res}</span></td>'
             f'<td class="num">{len(copies)}</td>'

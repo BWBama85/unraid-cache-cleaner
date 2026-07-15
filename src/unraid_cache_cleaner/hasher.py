@@ -300,6 +300,53 @@ def _confirm_status(mode: str) -> str:
     return CONFIRMED if mode == HASH_FULL else SAMPLE_MATCH
 
 
+@dataclass(frozen=True)
+class _Comparison:
+    """How a set of hashed copies compared — the single rule both callers share.
+
+    ``status`` is the all-or-nothing verdict (``confirmed`` / ``sample-match`` when every
+    copy agrees, ``different`` when they do not, ``unhashable`` when no verdict is
+    possible). ``redundant_count`` additionally counts the copies that share a digest
+    with at least one sibling, which survives a partial disagreement: three copies where
+    two match and one differs are ``different`` overall yet hold two redundant copies.
+
+    ``unreadable`` carries each failed copy's reason and ``incomparable`` marks differing
+    part layouts — the two distinct roads to ``unhashable``, kept apart only so a caller
+    can word a warning; both mean "nothing was proven".
+    """
+
+    status: str
+    redundant_count: int
+    unreadable: Tuple[str, ...] = ()
+    incomparable: bool = False
+
+
+def _compare_copies(hashes: Sequence[CopyHash], mode: str) -> _Comparison:
+    """Decide whether hashed copies are the same bytes (#9, #93).
+
+    The one place the comparability rule lives, so an ``identical`` group
+    (:func:`_confirm_one`) and an ``upgrade``'s same-size bucket
+    (:func:`_confirm_upgrade`) can never drift into disagreeing about the same pair of
+    files. Fail-closed: any copy that could not be read, or copies split into part
+    layouts that cannot be compared without guessing, yield ``unhashable`` and prove
+    nothing — never a false ``different`` for the same content stored differently.
+    """
+
+    unreadable = tuple(
+        copy_hash.error or "could not be hashed"
+        for copy_hash in hashes
+        if copy_hash.digest is None
+    )
+    if unreadable:
+        return _Comparison(UNHASHABLE, 0, unreadable=unreadable)
+    if len({copy_hash.topology for copy_hash in hashes}) > 1:
+        return _Comparison(UNHASHABLE, 0, incomparable=True)
+    clusters = Counter(copy_hash.digest for copy_hash in hashes)
+    redundant = sum(count for count in clusters.values() if count >= 2)
+    status = _confirm_status(mode) if len(clusters) == 1 else DIFFERENT
+    return _Comparison(status, redundant)
+
+
 def _confirm_one(
     group: DuplicateGroup,
     path_map: Sequence[Tuple[Path, Path]],
@@ -310,17 +357,17 @@ def _confirm_one(
 
     pairs = dedupe.rank_copies_with_parts(group)
     hashes = [_hash_copy(parts, path_map, mode, cache) for _logical, parts in pairs]
+    comparison = _compare_copies(hashes, mode)
 
-    unreadable = [h.error for h in hashes if h.digest is None]
-    if unreadable:
+    if comparison.unreadable:
+        unreadable = comparison.unreadable
         warning = (
             f"Content hash: '{group.title}' left size-only (unhashable): "
             f"{unreadable[0]}" + (f" (+{len(unreadable) - 1} more)" if len(unreadable) > 1 else "")
         )
         return replace(group, hash_status=UNHASHABLE), warning
 
-    topologies = {h.topology for h in hashes}
-    if len(topologies) > 1:
+    if comparison.incomparable:
         # Copies split into different part layouts cannot be compared byte-for-byte
         # without guessing; leave the group size-only rather than risk a false
         # different-content downgrade of same content stored differently.
@@ -330,9 +377,8 @@ def _confirm_one(
         )
         return replace(group, hash_status=UNHASHABLE), warning
 
-    digests = {h.digest for h in hashes}
-    if len(digests) == 1:
-        return replace(group, hash_status=_confirm_status(mode)), None
+    if comparison.status != DIFFERENT:
+        return replace(group, hash_status=comparison.status), None
 
     # Digests differ: Plex grouped same-size copies that are not the same bytes. One
     # is not a redundant duplicate, so protect the whole group from reclaim.
@@ -348,27 +394,6 @@ def _confirm_one(
         reclaimable_keep_smallest=0,
     )
     return downgraded, warning
-
-
-def _bucket_verdict(hashes: Sequence[CopyHash], mode: str) -> Tuple[str, int]:
-    """Reduce one same-size bucket's copy hashes to ``(status, redundant_count)`` (#93).
-
-    Mirrors :func:`_confirm_one`'s comparison rules — any unreadable member, or members
-    split into incompatible part layouts, yield ``unhashable`` (no verdict, nothing
-    proven) — but reports redundancy per digest *cluster* rather than collapsing the
-    bucket to a single all-or-nothing answer. A bucket of three where two match and one
-    differs is ``different`` (they do not all agree) yet still reports two redundant
-    copies, which an all-or-nothing verdict would hide.
-    """
-
-    if any(copy_hash.digest is None for copy_hash in hashes):
-        return UNHASHABLE, 0
-    if len({copy_hash.topology for copy_hash in hashes}) > 1:
-        return UNHASHABLE, 0
-    clusters = Counter(copy_hash.digest for copy_hash in hashes)
-    redundant = sum(count for count in clusters.values() if count >= 2)
-    status = _confirm_status(mode) if len(clusters) == 1 else DIFFERENT
-    return status, redundant
 
 
 def _confirm_upgrade(
@@ -409,13 +434,13 @@ def _confirm_upgrade(
         if len(members) < 2:
             continue
         hashes = [_hash_copy(parts, path_map, mode, cache) for _logical, parts in members]
-        status, redundant = _bucket_verdict(hashes, mode)
+        comparison = _compare_copies(hashes, mode)
         verdicts.append(
             HashBucket(
                 size=size,
-                status=status,
+                status=comparison.status,
                 copy_count=len(members),
-                redundant_count=redundant,
+                redundant_count=comparison.redundant_count,
                 part_ids=tuple(logical.part_id for logical, _parts in members),
             )
         )

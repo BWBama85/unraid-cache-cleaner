@@ -1276,6 +1276,27 @@ class HashPassIntegrationTests(unittest.TestCase):
             self.assertEqual(payload["totals"]["different_content_count"], 0)
             self.assertIn("[hash:redundant=2]", reporter.render_table(report))
 
+    def test_partial_mode_tag_never_claims_proof(self) -> None:
+        # HASH_MODE=partial samples head+tail only, so the row tag must not read the
+        # same as a full-mode proof.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            media = tmp / "media"
+            media.mkdir()
+            reporter, report = self._run_upgrade(
+                tmp,
+                media,
+                "partial",
+                ("a.mkv", b"X" * 100, "1080"),
+                ("b.mkv", b"X" * 100, "1080"),
+                ("old.mkv", b"Y" * 50, "720"),
+            )
+            payload = reporter.build_payload(report)
+            self.assertEqual(payload["groups"][0]["hash_buckets"][0]["status"], "sample-match")
+            table = reporter.render_table(report)
+            self.assertIn("[hash:redundant-sampled=2]", table)
+            self.assertNotIn("[hash:redundant=2]", table)
+
     def test_upgrade_without_same_size_bucket_omits_the_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

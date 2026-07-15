@@ -372,7 +372,10 @@ def summarize_analyzed(analyzed: List[DuplicateGroup]) -> DedupeSummary:
         hash_key = _HASH_STATUS_COUNT_KEY.get(group.hash_status)
         if hash_key is not None:
             bucket[hash_key] += 1
-        if redundant_bucket_copies(group):
+        # Gated on ``upgrade`` so the field can never drift from its name: only
+        # _confirm_upgrade writes buckets today, but a future pass that bucketed some
+        # other classification would otherwise silently inflate an "upgrade" total.
+        if group.classification == UPGRADE and redundant_bucket_copies(group):
             bucket["hash_redundant_upgrade_count"] += 1
         bucket["reclaimable_bytes"] += group.reclaimable_bytes
         bucket["reclaimable_keep_smallest"] += group.reclaimable_keep_smallest
