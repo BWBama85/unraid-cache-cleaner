@@ -912,6 +912,15 @@ def render_reclaim_notice_html(title: str, message: str) -> str:
 #: is running, so an operator sees it finish without clicking. Dropped once idle.
 _RESCAN_POLL_SECONDS = 4
 
+#: Consecutive failed polls the live-poll tolerates before it stops retrying and
+#: navigates to the status page (#96). At :data:`_RESCAN_POLL_SECONDS` apart this is
+#: ~1 min of solid failure — long enough to ride out a transient proxy blip, short
+#: enough that an operator whose unlock session lapsed mid-scan (every poll then 403s,
+#: :data:`Config.web_action_session_seconds` default 3600s) lands on the locked page
+#: instead of a "Regenerating…" spinner that never resolves. A single valid ``running``
+#: response resets the count, so only *sustained* failure ever trips it.
+_RESCAN_POLL_MAX_FAILURES = 15
+
 
 #: The opt-in JS live-poll (#90), admitted only under a matching ``script-src 'nonce-…'``
 #: and a scoped ``connect-src 'self'``. Pure progressive enhancement over the no-JS
@@ -920,17 +929,30 @@ _RESCAN_POLL_SECONDS = 4
 #: :data:`_RESCAN_POLL_SECONDS`; when the run leaves ``running`` it navigates to the
 #: report (``/``) on success or back to the status page (which then shows the failed/
 #: skipped result block) — so the operator lands on fresh data without a manual reload
-#: and without the full-page meta-refresh. Read-only: it only ever GETs the status API,
-#: never triggers a scan or submits anything. Kept tiny and self-contained.
+#: and without the full-page meta-refresh.
+#:
+#: Failure handling (#96): a non-2xx response, a null/rejected JSON body, or a network
+#: error is a *failure*; :data:`_RESCAN_POLL_MAX_FAILURES` of them in a row navigates to
+#: ``/actions/rescan`` (which the server renders as the locked or terminal page) rather
+#: than retrying forever. Any valid ``running`` response resets the failure count, so a
+#: transient blip still just retries — only a persistent failure (e.g. a lapsed unlock
+#: session mid-scan) trips the terminal navigation. Read-only: it only ever GETs the
+#: status API, never triggers a scan or submits anything. Kept tiny and self-contained.
 _RESCAN_POLL_SCRIPT = (
     "(function(){"
     "var ms=" + str(_RESCAN_POLL_SECONDS * 1000) + ";"
+    "var max=" + str(_RESCAN_POLL_MAX_FAILURES) + ";"
+    "var fails=0;"
+    "var fail=function(){"
+    "if(++fails>=max){window.location.assign('/actions/rescan');return;}"
+    "setTimeout(poll,ms);};"
     "var poll=function(){"
     "fetch('/api/rescan',{credentials:'same-origin'}).then(function(r){"
     "return r.ok?r.json():null;}).then(function(s){"
-    "if(!s||s.running){setTimeout(poll,ms);return;}"
+    "if(!s){fail();return;}"
+    "if(s.running){fails=0;setTimeout(poll,ms);return;}"
     "window.location.assign(s.last_status==='succeeded'?'/':'/actions/rescan');"
-    "}).catch(function(){setTimeout(poll,ms);});};"
+    "}).catch(fail);};"
     "setTimeout(poll,ms);"
     "})();"
 )

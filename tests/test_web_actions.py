@@ -29,6 +29,7 @@ from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.config import Config
 from unraid_cache_cleaner.web_rescan import ReportRescanService, RescanStatus
 from unraid_cache_cleaner.web import (
+    _RESCAN_POLL_MAX_FAILURES,
     DuplicateReportServer,
     DuplicateReportViewer,
     build_server,
@@ -3123,6 +3124,24 @@ class RescanPollRenderTests(unittest.TestCase):
         self.assertIn("s.running", script)
         self.assertIn("s.last_status==='succeeded'?'/':'/actions/rescan'", script)
 
+    def test_poll_script_bounds_consecutive_failures_then_navigates(self) -> None:
+        # #96: a persistent failure (e.g. the unlock session lapsing mid-scan → every poll
+        # 403s) must land the operator on the status page, not spin "Regenerating…" forever.
+        html = render_rescan_status_html(self._status(running=True), script_nonce="N0nce")
+        script = html.split('<script nonce="N0nce">', 1)[1].split("</script>", 1)[0]
+        # The budget is the module constant, not a magic number baked into the script.
+        self.assertIn(f"var max={_RESCAN_POLL_MAX_FAILURES};", script)
+        # Non-2xx / null-JSON (!s) and network-or-JSON rejection (.catch) share ONE failure
+        # path — a single counter — so any mix of them still trips the same budget.
+        self.assertIn("if(!s){fail();return;}", script)
+        self.assertIn(".catch(fail)", script)
+        # That path counts up and, once the budget is reached, navigates to the status page
+        # (which renders the locked/terminal state) instead of rescheduling.
+        self.assertIn("if(++fails>=max){window.location.assign('/actions/rescan');return;}", script)
+        # A valid running response resets the counter, so only *sustained* failure trips it —
+        # a lone transient blip still just retries (no regression to #90's don't-eject default).
+        self.assertIn("if(s.running){fails=0;setTimeout(poll,ms);return;}", script)
+
 
 class RescanLivePollHttpTests(unittest.TestCase):
     """The #90 CSP matrix driven over real HTTP: connect-src 'self' rides *only* the
@@ -3248,6 +3267,23 @@ class RescanLivePollHttpTests(unittest.TestCase):
             status, headers, _ = _post_resp(base + "/actions/rescan", _form(token="wrong"), _FORM_CT)
         self.assertEqual(status, 403)
         self.assertFalse(_has_connect_self(headers))
+
+    def test_persistent_failure_target_renders_locked_page(self) -> None:
+        # #96: when the budget trips, the poll navigates to /actions/rescan. Prove that
+        # target renders a terminal, explanatory page — not another spinner — for the
+        # unauthorized case a lapsed unlock session produces: the JSON endpoint the script
+        # fetches 403s (the very failure that counts toward the budget), and the navigation
+        # target serves the locked page (still without the connect-src relaxation).
+        payload = _untracked_payload()
+        service = _service(payload)
+        rescan = ReportRescanService(lambda: None, self.lock_path, spawn=lambda t: t())
+        with _serve(payload, service, rescan_service=rescan, inline_script=True) as base:
+            api_status, _, _ = _get_h(base + "/api/rescan")             # no unlock credential
+            page_status, headers, body = _get_h(base + "/actions/rescan")
+        self.assertEqual(api_status, 403)
+        self.assertEqual(page_status, 403)
+        self.assertFalse(_has_connect_self(headers))
+        self.assertIn(b"Report locked", body)
 
 
 if __name__ == "__main__":
