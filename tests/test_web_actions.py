@@ -29,7 +29,10 @@ from unraid_cache_cleaner.arr import ArrClientError
 from unraid_cache_cleaner.config import Config
 from unraid_cache_cleaner.web_rescan import ReportRescanService, RescanStatus
 from unraid_cache_cleaner.web import (
+    _RESCAN_POLL_HINT,
+    _RESCAN_POLL_HINT_ID,
     _RESCAN_POLL_MAX_FAILURES,
+    _RESCAN_POLL_SECONDS,
     DuplicateReportServer,
     DuplicateReportViewer,
     build_server,
@@ -3131,16 +3134,80 @@ class RescanPollRenderTests(unittest.TestCase):
         script = html.split('<script nonce="N0nce">', 1)[1].split("</script>", 1)[0]
         # The budget is the module constant, not a magic number baked into the script.
         self.assertIn(f"var max={_RESCAN_POLL_MAX_FAILURES};", script)
-        # Non-2xx / null-JSON (!s) and network-or-JSON rejection (.catch) share ONE failure
-        # path — a single counter — so any mix of them still trips the same budget.
+        # Non-2xx / null-JSON (!s), network-or-JSON rejection, and a #100 abort all share
+        # ONE failure path — a single counter — so any mix of them still trips the same budget.
         self.assertIn("if(!s){fail();return;}", script)
-        self.assertIn(".catch(fail)", script)
+        self.assertIn("}).catch(function(){stop();fail();});", script)
         # That path counts up and, once the budget is reached, navigates to the status page
         # (which renders the locked/terminal state) instead of rescheduling.
         self.assertIn("if(++fails>=max){window.location.assign('/actions/rescan');return;}", script)
         # A valid running response resets the counter, so only *sustained* failure trips it —
         # a lone transient blip still just retries (no regression to #90's don't-eject default).
-        self.assertIn("if(s.running){fails=0;setTimeout(poll,ms);return;}", script)
+        self.assertIn("if(s.running){fails=0;hint('');setTimeout(poll,ms);return;}", script)
+
+    def test_poll_script_aborts_a_hung_request_into_the_failure_budget(self) -> None:
+        # #100: a fetch that opens a connection but never settles would resolve nothing,
+        # reject nothing, schedule no next poll and count toward no budget — stalling the
+        # poll until the browser's own network timeout and voiding #96's terminal guarantee.
+        html = render_rescan_status_html(self._status(running=True), script_nonce="N0nce")
+        script = html.split('<script nonce="N0nce">', 1)[1].split("</script>", 1)[0]
+        # Each poll arms its OWN controller: a reused one stays aborted and would reject
+        # every subsequent request instantly, burning the budget in one tick.
+        self.assertIn("var poll=function(){var c=window.AbortController?new AbortController():null;", script)
+        # Feature-detected, not assumed. A browser with fetch but no AbortController
+        # (Safari 10.1-12.0) must degrade to pre-#100 unbounded polling — constructing it
+        # blind would throw, kill the poll chain, and strand the meta-refresh in <noscript>:
+        # precisely the forever-spinner #96 exists to prevent.
+        self.assertIn("if(c){o.signal=c.signal;t=setTimeout(function(){c.abort();},ms);}", script)
+        # The deadline is the poll interval — no new knob, no server-side timeout (#100 is
+        # client-only) — and it spans body settlement too: JSON that never arrives is hung.
+        self.assertIn(f"var ms={_RESCAN_POLL_SECONDS * 1000};", script)
+        # The abort rejects into the shared .catch, so it counts exactly once; no second
+        # counter, no double-count of a single request.
+        self.assertIn("}).catch(function(){stop();fail();});", script)
+        # Every settle path clears the deadline, so a finished poll leaves no timer pending.
+        self.assertIn("var stop=function(){if(t){clearTimeout(t);t=0;}};", script)
+        self.assertIn("}).then(function(s){stop();", script)
+
+    def test_poll_script_hint_is_fixed_text_via_textcontent(self) -> None:
+        # #99: while the poll is degrading but still under the #96 budget, the operator
+        # should see it struggling rather than an unchanging "Regenerating...".
+        html = render_rescan_status_html(self._status(running=True), script_nonce="N0nce")
+        script = html.split('<script nonce="N0nce">', 1)[1].split("</script>", 1)[0]
+        # textContent only — never innerHTML, and no response body, status code, or error
+        # detail is ever rendered: the hint is a fixed, self-authored constant.
+        self.assertIn("e.textContent=m;", script)
+        self.assertNotIn("innerHTML", script)
+        self.assertIn(f"hint('{_RESCAN_POLL_HINT}');", script)
+        self.assertIn(f"document.getElementById('{_RESCAN_POLL_HINT_ID}')", script)
+        # Shown only when the poll will actually retry — past the budget it navigates away,
+        # so the hint would be pointless there.
+        self.assertIn(
+            "if(++fails>=max){window.location.assign('/actions/rescan');return;}"
+            f"hint('{_RESCAN_POLL_HINT}');setTimeout(poll,ms);",
+            script,
+        )
+        # A recovered poll clears it, so a stale "last attempt failed" never outlives the blip.
+        self.assertIn("if(s.running){fails=0;hint('');", script)
+
+    def test_hint_span_is_prerendered_empty_only_under_the_live_poll(self) -> None:
+        # #99: the span rides the same condition as the script that fills it.
+        html = render_rescan_status_html(self._status(running=True), script_nonce="N0nce")
+        self.assertIn(f'<span id="{_RESCAN_POLL_HINT_ID}"></span>', html)
+        # Pre-rendered EMPTY: the text lives in the script and reaches the DOM only via
+        # textContent once a poll actually fails, so the served markup never shows a
+        # "last attempt failed" hint on a page whose first poll has not even run yet.
+        markup = html.split("<script", 1)[0] + html.split("</script>", 1)[1]
+        self.assertNotIn(_RESCAN_POLL_HINT, markup)
+
+    def test_hint_span_absent_on_terminal_and_non_enhanced_pages(self) -> None:
+        # Nothing polls on these pages, so an element nothing can fill must not exist.
+        non_enhanced = render_rescan_status_html(self._status(running=True), script_nonce=None)
+        self.assertNotIn(_RESCAN_POLL_HINT_ID, non_enhanced)
+        terminal = render_rescan_status_html(
+            self._status(running=False, last_status="succeeded"), script_nonce="N0nce"
+        )
+        self.assertNotIn(_RESCAN_POLL_HINT_ID, terminal)
 
 
 class RescanLivePollHttpTests(unittest.TestCase):
@@ -3199,6 +3266,8 @@ class RescanLivePollHttpTests(unittest.TestCase):
         self.assertTrue(_has_connect_self(headers))
         self.assertIn(f'<script nonce="{nonce}">'.encode(), body)
         self.assertIn(b"<noscript><meta http-equiv=", body)
+        # #99: the empty hint span ships with the script that fills it.
+        self.assertIn(f'<span id="{_RESCAN_POLL_HINT_ID}"></span>'.encode(), body)
 
     def test_head_of_running_status_page_matches_get_csp(self) -> None:
         with self._running_server(inline_script=True) as base:
@@ -3244,6 +3313,7 @@ class RescanLivePollHttpTests(unittest.TestCase):
         self.assertNotIn(b"<script", body)
         self.assertIn(b'<meta http-equiv="refresh"', body)  # bare no-JS fallback intact
         self.assertNotIn(b"<noscript>", body)
+        self.assertNotIn(_RESCAN_POLL_HINT_ID.encode(), body)  # #99: nothing to fill it
 
     def test_terminal_status_page_has_no_connect_src(self) -> None:
         # A synchronous run finishes before the status GET, so it renders the result block:
