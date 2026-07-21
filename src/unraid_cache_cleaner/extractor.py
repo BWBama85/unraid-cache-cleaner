@@ -112,9 +112,12 @@ class ExtractionResult:
     status: str
     message: str = ""
     output_dir: Optional[Path] = None
-    # Files this extraction created (empty unless a ledger recorded them). The
-    # deletion planner protects these so extracted media survives until *arr
-    # imports it (Child C).
+    # Files this extraction created or overwrote — never an untouched sibling or
+    # the source archive, and computed the same way with or without a ledger
+    # (#105). The deletion planner protects these so extracted media survives
+    # until *arr imports it (Child C). Empty for any result that never reached the
+    # produced-set walk: dry-run, deferred, skipped, a failed extraction, or a
+    # bookkeeping failure inside the walk.
     outputs: Tuple[Path, ...] = ()
 
 
@@ -489,13 +492,12 @@ class Extractor:
 
         # Snapshot the destination *before* extracting so ownership and output
         # tracking apply only to the files this extraction creates or overwrites.
-        # Only the snapshot is conditional: with no ledger and no owner nothing
-        # consumes the produced set, so it is left empty rather than paying a walk.
-        # `_finalize_output` still runs, and against an empty snapshot every walked
-        # file reads as produced — harmless for the callers that ask for neither
-        # (both production call sites pass a ledger), but see #105.
-        need_finalize = self.ledger is not None or bool(self.config.extract_owner)
-        before_files, before_dirs = _snapshot(dest_dir) if need_finalize else ({}, set())
+        # The snapshot is unconditional: it is what makes `outputs` mean "files this
+        # extraction produced" for every caller, ledger or not. Skipping it for
+        # ledger-less callers only emptied `before_files`, which made every walked
+        # file — the untouched siblings and the source archive included — read as
+        # produced (#105).
+        before_files, before_dirs = _snapshot(dest_dir)
         try:
             self.tool.extract(archive, dest_dir)
         except Exception as exc:  # noqa: BLE001 - surface, keep the archive, retry next run
