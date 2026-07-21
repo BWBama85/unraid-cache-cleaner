@@ -2,7 +2,7 @@
 
 __all__ = ["__version__", "USER_AGENT"]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Single source of truth for the HTTP User-Agent every client sends. Deriving it
 # from __version__ keeps a release bump to two files (this one + pyproject.toml).
