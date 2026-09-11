@@ -13,7 +13,8 @@ Refuses when
     mktemp into a temp root in the same text, or a literal path inside the project's
     .claude/state/ (relative paths only when the command does not cd).
 Scripts executed from the trusted roots (~/.claude/scripts and <project>/.claude/scripts,
-or NO_DELETE_GUARD_TRUSTED_ROOTS in the hook's environment) get only the remote check.
+or NO_DELETE_GUARD_TRUSTED_ROOTS in the hook's environment) get only the remote check;
+a script is trusted when either its invoked path or its real path is inside a root.
 The project is CLAUDE_PROJECT_DIR, else the payload's cwd, else the working directory.
 Fails closed: an unreadable payload or an internal error is a refusal.
 """
@@ -53,6 +54,7 @@ HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 INTERPRETER = re.compile(r"python[\d.]*|bash|sh|zsh|source|\.")
 MKTEMP_ASSIGNMENT = re.compile(r"(?<![\w$])([A-Za-z_]\w*)=([\"']?)\$\(\s*mktemp\b([^()]*)\)\2")
 VARIABLE_OPERAND = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))(/.*)?")
+REDIRECTION = re.compile(r"(?:\d+|&)?(?:>>?|<|>&|<&)(.*)")
 
 
 class Context:
@@ -62,7 +64,7 @@ class Context:
         self.state_roots = _both_forms([os.path.join(self.project, ".claude", "state")])
         trusted = os.environ.get("NO_DELETE_GUARD_TRUSTED_ROOTS")
         defaults = [os.path.expanduser("~/.claude/scripts"), os.path.join(self.project, ".claude", "scripts")]
-        self.trusted_roots = {os.path.realpath(r) for r in (trusted.split(os.pathsep) if trusted else defaults) if r}
+        self.trusted_roots = _both_forms([os.path.abspath(r) for r in (trusted.split(os.pathsep) if trusted else defaults) if r])
 
 
 def _both_forms(paths: list[str]) -> set[str]:
@@ -149,8 +151,35 @@ def mktemp_variables(text: str, ctx: Context) -> set[str]:
     return safe
 
 
+def heredoc_feeds_shell(prefix: str) -> bool:
+    """A heredoc body is shell when bash/sh/zsh reads it from stdin or it is written to a shell-script file."""
+    segs = segments(prefix)
+    if not segs:
+        return False
+    tokens, _ = command_words(words(segs[-1]))
+    if not tokens:
+        return False
+    if os.path.basename(tokens[0]) in SHELLS:
+        args, skip_target = [], False
+        for token in tokens[1:]:
+            if skip_target:
+                skip_target = False
+                continue
+            redirect = REDIRECTION.fullmatch(token)
+            if redirect:
+                skip_target = not redirect.group(1)
+                continue
+            args.append(token)
+        return "-c" not in args and ("-s" in args or all(a.startswith("-") for a in args))
+    return any(t.lstrip(">").endswith((".sh", ".bash", ".zsh")) for t in tokens[1:])
+
+
 def split_heredocs(text: str) -> tuple[str, list[str]]:
-    """Separate heredoc bodies (data) from shell text; return (shell_text, body_lines)."""
+    """Separate heredoc bodies from shell text; return (shell_text, body lines that are shell).
+
+    Bodies that do not feed a shell (commit messages, Python, notes) are data and are dropped.
+    A heredoc marker with no terminator line is not a heredoc: its following lines stay shell text.
+    """
     shell, bodies, pos = [], [], 0
     while True:
         m = HEREDOC.search(text, pos)
@@ -160,17 +189,20 @@ def split_heredocs(text: str) -> tuple[str, list[str]]:
         if line_end < 0:
             break
         shell.append(text[pos:line_end + 1])
+        line_start = max(pos, text.rfind("\n", 0, m.start()) + 1)
+        feeds_shell = heredoc_feeds_shell(text[line_start:m.start()])
         strip_tabs = text[m.start():m.start() + 3] == "<<-"
         lines = text[line_end + 1:].split("\n")
         consumed = line_end + 1
         for i, line in enumerate(lines):
             consumed += len(line) + 1
             if (line.lstrip("\t") if strip_tabs else line) == m.group(2):
-                bodies.extend(lines[:i])
+                if feeds_shell:
+                    bodies.extend(lines[:i])
+                pos = min(consumed, len(text))
                 break
         else:
-            bodies.extend(lines)
-        pos = min(consumed, len(text))
+            pos = line_end + 1
     shell.append(text[pos:])
     return "".join(shell), bodies
 
@@ -254,8 +286,15 @@ def local_problems(shell_segments: list[str], ctx: Context, temp_vars: set[str],
             inner = " ".join(tokens[1:])
             problems += local_problems(all_segments(inner), ctx, temp_vars | mktemp_variables(inner, ctx), depth + 1)
         elif name in DELETE_COMMANDS:
-            operands, flags_done = [], False
+            operands, flags_done, skip_target = [], False, False
             for token in tokens[1:]:
+                if skip_target:
+                    skip_target = False
+                    continue
+                redirect = REDIRECTION.fullmatch(token)
+                if redirect:
+                    skip_target = not redirect.group(1)
+                    continue
                 if not flags_done and token == "--":
                     flags_done = True
                 elif not flags_done and token.startswith("-"):
@@ -336,7 +375,8 @@ def evaluate(command: str, project: str) -> list[str]:
     problems = local_problems(shell_segments, ctx, mktemp_variables(command, ctx)) + remote_problems(command)
     for path, text in executed_scripts(shell_segments):
         found = remote_problems(text)
-        trusted = under(os.path.realpath(path), ctx.trusted_roots)
+        trusted = under(os.path.normpath(os.path.abspath(path)), ctx.trusted_roots) or \
+            under(os.path.realpath(path), ctx.trusted_roots)
         if not trusted and not path.endswith(".py"):
             found += local_problems(all_segments(text), ctx, mktemp_variables(text, ctx))
         problems += ["%s (in %s)" % (p, os.path.basename(path)) for p in found]

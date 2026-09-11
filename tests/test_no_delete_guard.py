@@ -58,6 +58,8 @@ DENY = [
     "scp /tmp/x %s:/boot/ && rm -rf /tmp/x" % HOST,
     "T=$(mktemp); ssh %s \"rm -f $T\"" % HOST,
     "rm -f \"$K\"",
+    "rm -f \"$K\" 2>/dev/null",
+    "rm -f /Users/brentwilson/notes 2>/dev/null",
     "rm -rf ~/Library/Caches/whisper",
     "rm -rf /Volumes/External/Code/unraid-cache-cleaner/build",
     "rm -rf /tmp",
@@ -85,14 +87,22 @@ DENY = [
     "rm -rf .claude",
     "rm -f .claude/state/$NAME",
     "cd /Users/brentwilson && rm -f .claude/state/x.json",
+    "cat > /tmp/cleanup.sh <<'EOF'\nrm -rf /Users/brentwilson/Documents\nEOF\nbash /tmp/cleanup.sh",
+    "sh <<'EOF'\nrm -rf /Users/brentwilson/Documents\nEOF",
+    "zsh -s <<EOF\nrm -rf /Users/brentwilson/Documents\nEOF",
+    "echo \"<<EOF\"\nrm -rf /Users/brentwilson/Documents",
 ]
 
 ALLOW = [
     "ls -la /tmp",
+    "git commit -F - <<'EOF'\nfix: ignore redirects\n\nRedirections are no longer read as\nrm operands.\nEOF",
+    "cat > /tmp/notes.md <<'EOF'\nrm -rf /Users/brentwilson/Documents\nEOF",
     "rm -f /tmp/aci_audio/*.wav /tmp/aci_audio/*.err",
     "rm -r /tmp/subcmp /tmp/subcmp13",
     "rm -rf /private/tmp/claude-501/scratch",
     "rm -rf /private/var/folders/zz/guardtest/T/tmpabc",
+    "rm -f /tmp/scratch.log 2>/dev/null",
+    "rm -f /tmp/a /tmp/b >/dev/null 2>&1",
     "find /tmp/claude_subs -name '*.srt' -delete",
     "bash -c 'rm -f /tmp/scratch.txt'",
     "BODY=\"$(mktemp \"${TMPDIR:-/tmp}/issue-body.XXXXXX\")\" || exit 1\n"
@@ -169,6 +179,16 @@ class GuardDecisionTests(unittest.TestCase):
                 script.write_text(body)
                 with self.subTest(script=str(script)):
                     self.assertEqual(decide("bash %s" % script, env=env), expected)
+
+    def test_symlinked_folders_inside_a_trusted_root_stay_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as trusted, tempfile.TemporaryDirectory() as real:
+            Path(real, "helper.sh").write_text('tmp="$1"\nrm -f "$tmp" 2>/dev/null\n')
+            Path(real, "remote.sh").write_text(REMOTE_DELETE)
+            os.symlink(real, os.path.join(trusted, "lib"))
+            env = {"NO_DELETE_GUARD_TRUSTED_ROOTS": trusted}
+            self.assertEqual(decide('bash "%s/lib/helper.sh" wait' % trusted, env=env), "allow")
+            self.assertEqual(decide('bash "%s/lib/remote.sh"' % trusted, env=env), "deny")
+            self.assertEqual(decide('bash "%s/helper.sh"' % real, env=env), "deny")
 
     def test_files_that_are_only_arguments_are_not_inspected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
