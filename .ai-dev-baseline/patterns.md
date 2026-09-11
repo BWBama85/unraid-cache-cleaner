@@ -46,6 +46,9 @@ Sweep each of these before opening a pull request.
 - `path-qualified-command-match` — When matching a command name in text or tokens, compare its basename and accept a leading directory path; add a regression case that invokes the command by absolute path.
 - `script-path-resolution` — Resolve every executed script the way the shell will: expand variables, honour earlier directory changes, ignore the file-name suffix, and refuse when the path cannot be resolved; test a relative-after-cd case and a suffix-less case.
 - `wrapper-hides-command` — Treat any wrapper (sudo, env, xargs, timeout, find -exec, a shell with -c) as hiding the real command: unwrap it fully or refuse, never assume the token after the wrapper is the command; test each wrapper with an option that takes a value.
+- `combined-flag-parsing` — Never test a flag by equality: single-letter options combine (-lc, -xc, -Bc) and long options abbreviate, so match flag clusters by the letters they contain and long options by prefix; add a combined-form case for every flag the code branches on.
+- `quoted-substitution-parsing` — Match command names on text with quote characters and backslashes removed as well as on the raw text, because the shell rejoins r""m and r\m; test each quoted spelling of a name the code matches.
+- `redirect-form-coverage` — Cover every redirect spelling when detecting writes: attached to the previous word, with a file descriptor number, with an ampersand, appending, and force-clobber; add a case per spelling rather than assuming whitespace separates the operator.
 <!-- adb:checklist:end -->
 
 ## Hits
@@ -65,4 +68,15 @@ One line per resolved review thread, newest last.
 - `unchecked-action-operands` `.claude/scripts/no-delete-guard.py:321` `1ba581b` `PRRT_kwDOSJrgbc6hoODt` PR #124 2026-09-11 — find -exec action operands were never validated, only search roots
 - `option-tolerant-subcommand-match` `.claude/scripts/no-delete-guard.py:47` `1ba581b` `PRRT_kwDOSJrgbc6hoODw` PR #124 2026-09-11 — docker global options defeated the prune subcommand match
 - `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:215` `1ba581b` `PRRT_kwDOSJrgbc6hoOD3` PR #124 2026-09-11 — Command substitutions inside double quotes were treated as inert text
+- `redirect-form-coverage` `.claude/scripts/no-delete-guard.py:63` `761725c` `PRRT_kwDOSJrgbc6hpabt` PR #124 2026-09-11 — Redirect attached to the preceding word escaped the overwrite pattern
+- `shell-expansion-escape` `.claude/scripts/no-delete-guard.py:109` `761725c` `PRRT_kwDOSJrgbc6hpabz` PR #124 2026-09-11 — Brace expansion let an operand leave the allowed roots after expansion
+- `wrapper-hides-command` `.claude/scripts/no-delete-guard.py:390` `761725c` `PRRT_kwDOSJrgbc6hpab3` PR #124 2026-09-11 — find action running an ordinary script never had that script inspected
+- `script-path-resolution` `.claude/scripts/no-delete-guard.py:410` `761725c` `PRRT_kwDOSJrgbc6hpab5` PR #124 2026-09-11 — Interpreter option values were mistaken for the script name
+- `script-path-resolution` `.claude/scripts/no-delete-guard.py:426` `761725c` `PRRT_kwDOSJrgbc6hpacA` PR #124 2026-09-11 — A script created later in the same command was treated as inspected
+- `combined-flag-parsing` `.claude/scripts/no-delete-guard.py:466` `761725c` `PRRT_kwDOSJrgbc6hpacF` PR #124 2026-09-11 — Combined Python flags such as -Bc skipped the code check
+- `partial-inspection-treated-complete` `.claude/scripts/no-delete-guard.py:428` `761725c` `PRRT_kwDOSJrgbc6hpacK` PR #124 2026-09-11 — A script past the read limit was treated as fully inspected
+- `guard-tamper-surface` `.claude/settings.json:52` `761725c` `PRRT_kwDOSJrgbc6hpacQ` PR #124 2026-09-11 — Approval rules covered edit tools only, leaving shell writes to guard files open
+- `option-abbreviation` `.claude/scripts/no-delete-guard.py:60` `761725c` `PRRT_kwDOSJrgbc6hpacV` PR #124 2026-09-11 — Abbreviated long options defeated an exact option match
+- `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:500` `761725c` `PRRT_kwDOSJrgbc6hpacc` PR #124 2026-09-11 — Quote characters split an executable name that the remote shell rejoins
+- `script-path-resolution` `.claude/scripts/no-delete-guard.py:440` `761725c` `PRRT_kwDOSJrgbc6hpach` PR #124 2026-09-11 — File name overrode the interpreter when classifying a script
 <!-- adb:hits:end -->
