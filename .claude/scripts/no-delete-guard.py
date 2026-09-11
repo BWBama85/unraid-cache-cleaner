@@ -6,24 +6,31 @@ reason on stderr (exit 2 stops the call before permission rules run).
 
 Fails closed. Refuses when
   * the command, or a script it executes, reaches a remote host (ssh/scp/sftp, also by full path,
-    or rsync to host:path) and contains a deletion or clobbering operation anywhere in its text;
+    or rsync to host:path) and contains a deletion or clobbering operation anywhere in its text,
+    also after quote characters are removed;
   * a deletion word (rm, rmdir, unlink, shred, srm, also by full path, or -delete) cannot be
     verified: it must be the command word of a plain invocation, with no wrapper (sudo, env, xargs,
     ...), whose targets are literal absolute paths inside a temp root (/tmp, /private/tmp,
     /var/folders, $TMPDIR), a variable assigned from mktemp into a temp root by an earlier
     unconditional statement and never reassigned, or literal paths inside the project's
-    .claude/state/ (relative only when the command does not change directory). Deletion words
-    anywhere else (quotes, $( ), backticks, arguments) are refused; bash/sh/zsh -c and eval strings
-    get the same check;
-  * find -exec runs a deletion outside those locations, or a shell, interpreter or wrapper;
+    .claude/state/ (relative only when the command does not change directory). Targets with brace
+    expansion are refused. Deletion words anywhere else (quotes, $( ), backticks, arguments) are
+    refused; bash/sh/zsh -c and eval strings get the same check;
+  * find -exec runs a deletion outside those locations, a shell, interpreter or wrapper, or a script
+    that fails these checks;
   * a Python deletion call (os.remove, shutil.rmtree, .unlink(), ...) in python -c code, a heredoc
     fed to Python or an executed Python script takes anything but a literal allowed path;
   * an executed script (interpreter argument, or a text file run by path, any name) fails these
-    checks, or its path cannot be resolved (variables left, or relative after a directory change).
+    checks, does not exist yet, is too large to inspect, has interpreter options the guard cannot
+    parse, or has a path it cannot resolve (variables left, or relative after a directory change);
+  * a command writes to a guard file (.claude/settings.json, .claude/settings.local.json,
+    .claude/scripts/no-delete-guard.py, tests/test_no_delete_guard.py) by redirect, a writing
+    command (tee, cp, mv, sed -i, chmod, git checkout, ...) or Python file APIs.
 Scripts under the trusted roots (~/.claude/scripts and <project>/.claude/scripts, or
 NO_DELETE_GUARD_TRUSTED_ROOTS in the hook's environment) get only the remote check; a script is
-trusted when its invoked path or its real path is inside a root. Heredoc bodies are checked only
-when fed to a shell or Python (or written to a .sh/.py file); other bodies are data.
+trusted when its invoked path or its real path is inside a root. The interpreter that runs a script
+decides how it is checked, not its file name. Heredoc bodies are checked only when fed to a shell or
+Python (or written to a .sh/.py file); other bodies are data.
 The project is CLAUDE_PROJECT_DIR, else the payload's cwd; scripts resolve against the payload's
 cwd, else the working directory.
 """
@@ -44,6 +51,14 @@ WRAPPERS = {"sudo", "doas", "su", "env", "nohup", "time", "exec", "command", "bu
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 DIRECTORY_CHANGES = {"cd", "pushd", "popd"}
+WRITERS = {"tee", "cp", "mv", "install", "ln", "dd", "truncate", "rsync", "ditto", "patch", "chmod", "chown",
+           "chflags", "xattr"}
+IN_PLACE_EDITORS = {"sed", "perl", "ruby"}
+GIT_OVERWRITES = {"checkout", "restore", "apply", "stash", "reset", "mv"}
+SHELL_VALUE_OPTIONS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+SHELL_LONG_FLAGS = {"--login", "--noprofile", "--norc", "--posix", "--restricted", "--verbose", "--noediting",
+                    "--debugger", "--help", "--version"}
+PYTHON_VALUE_OPTIONS = {"-W", "-X", "--check-hash-based-pycs"}
 SEPARATORS = set("\n;&|()")
 WORD_BREAKS = SEPARATORS | set(" \t`")
 MAX_DEPTH = 4
@@ -53,14 +68,17 @@ SELF = os.path.realpath(__file__)
 DELETE_WORD = r"(?<![\w.$-])(?:[\w.~/-]*/)?(?:rm|rmdir|unlink|shred|srm)(?![\w./-])"
 EMBEDDED_DELETE = re.compile(DELETE_WORD)
 PY_DELETE = re.compile(r"(?:\bos\.(?:remove|unlink|rmdir|removedirs)|\bshutil\.rmtree|\.(?:unlink|rmdir))\s*\(\s*([^),]*)")
+PY_WRITE = re.compile(r"\bopen\s*\([^)]*['\"][rbt]*[wax+][rbt+]*['\"]|\.write_(?:text|bytes)\s*\("
+                      r"|\bos\.(?:replace|rename|chmod)\s*\(|\bshutil\.(?:copy\w*|move)\s*\(")
+PROTECTED = re.compile(r"(?:\.claude/(?:settings(?:\.local)?\.json|scripts/no-delete-guard\.py)|tests/test_no_delete_guard\.py)(?![\w.-])")
 REMOTE = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(?:ssh|scp|sftp)(?![\w./-])|\brsync\b[^\n;|&]*\s[\w.@-]+:")
 REMOTE_RULES = (
     ("delete command", re.compile(DELETE_WORD + r"|(?<![\w.-])truncate(?![\w.-])")),
     ("find -delete", re.compile(r"(?<![\w-])-delete(?![\w-])")),
-    ("rsync delete option", re.compile(r"--(?:delete[\w-]*|remove-source-files)(?![\w-])")),
+    ("rsync delete option", re.compile(r"--(?:del[\w-]*|remove-s[\w-]*)(?![\w-])")),
     ("docker removal", re.compile(r"\bdocker\b[^\n;|&]*?(?<![\w-])(?:rmi|prune)(?![\w-])")),
     ("python file deletion", PY_DELETE),
-    ("overwriting redirect", re.compile(r"(?:^|[\s;|&(])(?:\d+|&)?>\|?(?![>&=])\s*(?!/dev/null(?![\w/.-]))\S")),
+    ("overwriting redirect", re.compile(r"(?<![<>=&\d-])(?:\d+|&)?>\|?(?![>&=])\s*(?!/dev/null(?![\w/.-]))[^\s>&|;]")),
 )
 MOVE_OR_COPY = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(mv|cp)(?=\s)")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
@@ -113,8 +131,8 @@ def operand_ok(operand: str, ctx: Context, safe_vars: set[str], relative_ok: boo
     var = VARIABLE_OPERAND.fullmatch(operand)
     if var:
         rest = var.group(3) or ""
-        return (var.group(1) or var.group(2)) in safe_vars and not re.search(r"[$`]|(^|/)\.\.(/|$)", rest)
-    if any(c in operand for c in "$`~"):
+        return (var.group(1) or var.group(2)) in safe_vars and not re.search(r"[$`{}]|(^|/)\.\.(/|$)", rest)
+    if any(c in operand for c in "$`~{}"):
         return False
     if operand.startswith("/"):
         return inside(operand, ctx.temp_roots) or inside(operand, ctx.state_roots)
@@ -290,7 +308,7 @@ def heredoc_consumer(prefix: str) -> str:
     if names[0] in SHELLS:
         if any(C_FLAG.fullmatch(a) for a in args):
             return "data"
-        return "shell" if "-s" in args or all(a.startswith("-") for a in args) else "data"
+        return "shell" if "-s" in args or all(a.startswith(("-", "+")) for a in args) else "data"
     if PYTHON.fullmatch(names[0]):
         return "python" if "-" in args or all(a.startswith("-") for a in args) else "data"
     targets = [t.lstrip(">") for t in tokens[1:]]
@@ -345,7 +363,33 @@ def python_problems(code: str, ctx: Context) -> list[str]:
         literal = re.fullmatch(r"[rbuRBU]?(['\"])(.*)\1", m.group(1).strip())
         if not literal or not operand_ok(literal.group(2), ctx, set(), False):
             problems.append("a Python deletion the guard cannot verify (%r)" % m.group(0)[:60])
+    for line in code.splitlines():
+        if PROTECTED.search(line) and PY_WRITE.search(line):
+            problems.append("Python code that writes to a guard file (%r)" % line.strip()[:60])
+            break
     return problems
+
+
+def tamper_problems(raw: list[str]) -> list[str]:
+    """Refuse writes to the guard's own files: redirects, writing commands, in-place edits, git restores."""
+    if not any(PROTECTED.search(t) for t in raw):
+        return []
+    names = [base(t) for t in raw]
+    for k, token in enumerate(raw):
+        redirect = REDIRECTION.fullmatch(token)
+        if redirect and ">" in token:
+            target = redirect.group(1) or (raw[k + 1] if k + 1 < len(raw) else "")
+            if PROTECTED.search(target):
+                return ["a redirect onto a guard file (%r)" % target[:60]]
+    if any(n in WRITERS for n in names):
+        return ["a write to a guard file"]
+    if any(n in IN_PLACE_EDITORS for n in names) and any(t.startswith("-i") or t == "--in-place" for t in raw):
+        return ["an in-place edit of a guard file"]
+    if "git" in names:
+        after = raw[names.index("git") + 1:]
+        if any(t in GIT_OVERWRITES for t in after):
+            return ["a git command that can overwrite a guard file"]
+    return []
 
 
 def mktemp_assignments(segs: list[tuple[str, str | None]], text: str, ctx: Context) -> dict[str, int]:
@@ -364,7 +408,7 @@ def mktemp_assignments(segs: list[tuple[str, str | None]], text: str, ctx: Conte
     return safe
 
 
-def find_problems(args: list[str], ctx: Context, safe: set[str], relative_ok: bool) -> list[str]:
+def find_problems(args: list[str], ctx: Context, safe: set[str], relative_ok: bool, depth: int) -> list[str]:
     roots = []
     for token in args:
         if token.startswith("-") or token in ("(", "!", "\\("):
@@ -388,6 +432,7 @@ def find_problems(args: list[str], ctx: Context, safe: set[str], relative_ok: bo
                 problems.append("find %s runs %r, which the guard cannot verify" % (token, name or "nothing"))
             else:
                 outside += action
+                problems += script_problems(action, ctx, relative_ok, depth)
             k = end
         else:
             outside.append(token)
@@ -401,16 +446,57 @@ def find_problems(args: list[str], ctx: Context, safe: set[str], relative_ok: bo
     return problems
 
 
+def interpreter_script(name: str, args: list[str]) -> str | None:
+    """The script an interpreter runs, or None when it runs none; ValueError when options cannot be parsed."""
+    python = bool(PYTHON.fullmatch(name))
+    k = 0
+    while k < len(args):
+        token = args[k]
+        if token == "--":
+            return args[k + 1] if k + 1 < len(args) else None
+        if python and token == "-":
+            return None
+        if token in (PYTHON_VALUE_OPTIONS if python else SHELL_VALUE_OPTIONS):
+            k += 2
+            continue
+        if re.fullmatch(r"[-+][A-Za-z]+", token):
+            letters = token[1:]
+            if python and ("m" in letters or "c" in letters):
+                return None
+            if python and letters[-1] in "WX":
+                k += 2
+                continue
+            if not python and ("o" in letters or "O" in letters):
+                k += 2
+                continue
+            k += 1
+            continue
+        if token.startswith("--"):
+            if python and ("=" in token or token in ("--help", "--version")):
+                k += 1
+                continue
+            if not python and token in SHELL_LONG_FLAGS:
+                k += 1
+                continue
+            raise ValueError(token)
+        return token
+    return None
+
+
 def script_problems(tokens: list[str], ctx: Context, relative_ok: bool, depth: int) -> list[str]:
     name = base(tokens[0])
     if INTERPRETER.fullmatch(name):
         args = drop_redirections(tokens[1:])
-        if "-c" in args or "-m" in args:
-            return []
-        script = next((a for a in args if not a.startswith("-")), None)
+        if name in ("source", "."):
+            script = args[0] if args else None
+        else:
+            try:
+                script = interpreter_script(name, args)
+            except ValueError as exc:
+                return ["%s options the guard cannot parse (%r)" % (name, str(exc))]
         python, by_path = bool(PYTHON.fullmatch(name)), False
     elif "/" in tokens[0]:
-        script, python, by_path = tokens[0], tokens[0].endswith(".py"), True
+        script, python, by_path = tokens[0], False, True
     else:
         return []
     if not script:
@@ -422,19 +508,23 @@ def script_problems(tokens: list[str], ctx: Context, relative_ok: bool, depth: i
         if not relative_ok:
             return ["a relative script path after a directory change (%r)" % script]
         path = os.path.join(ctx.cwd, path)
-    if not os.path.isfile(path) or os.path.realpath(path) == SELF:
+    if os.path.realpath(path) == SELF:
         return []
+    if not os.path.isfile(path):
+        return ["a script that does not exist yet (%r)" % script]
     with open(path, "rb") as handle:
-        raw = handle.read(SCRIPT_READ_LIMIT)
+        raw = handle.read(SCRIPT_READ_LIMIT + 1)
     if by_path and b"\0" in raw[:4096]:
         return []
+    if len(raw) > SCRIPT_READ_LIMIT:
+        return ["a script too large to inspect (%r)" % script]
     text = raw.decode("utf-8", errors="ignore")
     found = remote_problems(text)
     trusted = under(os.path.normpath(os.path.abspath(path)), ctx.trusted_roots) or \
         under(os.path.realpath(path), ctx.trusted_roots)
     if not trusted:
         first_line = text.split("\n", 1)[0]
-        if python or path.endswith(".py") or (first_line.startswith("#!") and "python" in first_line):
+        if python or (by_path and first_line.startswith("#!") and "python" in first_line):
             found += python_problems(text, ctx)
         else:
             found += local_problems(text, ctx, depth + 1)
@@ -443,7 +533,7 @@ def script_problems(tokens: list[str], ctx: Context, relative_ok: bool, depth: i
 
 def segment_problems(raw: list[str], ctx: Context, safe: set[str], relative_ok: bool, depth: int) -> list[str]:
     tokens = strip_prefix(raw)
-    problems = unverified(raw[:len(raw) - len(tokens)])
+    problems = tamper_problems(raw) + unverified(raw[:len(raw) - len(tokens)])
     if not tokens:
         return problems
     name, args = base(tokens[0]), tokens[1:]
@@ -453,17 +543,17 @@ def segment_problems(raw: list[str], ctx: Context, safe: set[str], relative_ok: 
             problems.append("%s outside the allowed locations: %s" % (name, ", ".join(repr(b) for b in bad[:3])))
         return problems
     if name == "find":
-        return problems + find_problems(args, ctx, safe, relative_ok)
+        return problems + find_problems(args, ctx, safe, relative_ok, depth)
     if name == "eval":
         return problems + local_problems(" ".join(args), ctx, depth + 1)
-    if name in SHELLS:
+    if name in SHELLS or PYTHON.fullmatch(name):
         flag = next((k for k, a in enumerate(args) if C_FLAG.fullmatch(a)), None)
-        if flag is not None and flag + 1 < len(args):
-            return problems + unverified(args[:flag] + args[flag + 2:]) + local_problems(args[flag + 1], ctx, depth + 1)
-    if PYTHON.fullmatch(name) and "-c" in args:
-        k = args.index("-c")
-        code = args[k + 1] if k + 1 < len(args) else ""
-        return problems + unverified(args[:k] + args[k + 2:]) + python_problems(code, ctx)
+        if flag is not None:
+            code = args[flag + 1] if flag + 1 < len(args) else ""
+            rest = unverified(args[:flag] + args[flag + 2:])
+            if PYTHON.fullmatch(name):
+                return problems + rest + python_problems(code, ctx)
+            return problems + rest + local_problems(code, ctx, depth + 1)
     if name in WRAPPERS:
         runs = [a for a in args if base(a) in SHELLS or PYTHON.fullmatch(base(a)) or base(a) in ("eval", "find")]
         if runs:
@@ -491,11 +581,12 @@ def local_problems(text: str, ctx: Context, depth: int = 0) -> list[str]:
 
 
 def remote_problems(text: str) -> list[str]:
-    if not REMOTE.search(text):
+    variants = [text, re.sub(r"[\"'\\]", "", text)]
+    if not any(REMOTE.search(v) for v in variants):
         return []
     problems = []
     for label, pattern in REMOTE_RULES:
-        m = pattern.search(text)
+        m = next((hit for hit in (pattern.search(v) for v in variants) if hit), None)
         if m:
             problems.append("%s (%r) in a command that reaches a remote host" % (label, m.group(0).strip()[:40]))
     for m in MOVE_OR_COPY.finditer(text):
