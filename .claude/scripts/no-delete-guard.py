@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """PreToolUse guard for Bash: enforces the project's deletion rule (CLAUDE.md).
 
-Input: the Claude Code hook payload on stdin. Allowed: exit 0, no output. Refused:
-exit 2 with the reason on stderr (exit 2 stops the call before permission rules run).
+Input: the Claude Code hook payload on stdin. Allowed: exit 0, no output. Refused: exit 2 with the
+reason on stderr (exit 2 stops the call before permission rules run).
 
-Refuses when
-  * the command, or a script file it executes, reaches a remote host (ssh/scp/sftp/rsync
-    to host:path) and contains a deletion or clobbering operation anywhere in its text;
-  * a local rm/rmdir/unlink/shred or find -delete/-exec rm (also inside bash -c, sh -c,
-    zsh -c and eval strings) names anything other than a literal absolute path inside a
-    temp root (/tmp, /private/tmp, /var/folders, $TMPDIR), a variable assigned from
-    mktemp into a temp root in the same text, or a literal path inside the project's
-    .claude/state/ (relative paths only when the command does not cd).
-Scripts executed from the trusted roots (~/.claude/scripts and <project>/.claude/scripts,
-or NO_DELETE_GUARD_TRUSTED_ROOTS in the hook's environment) get only the remote check;
-a script is trusted when either its invoked path or its real path is inside a root.
-The project is CLAUDE_PROJECT_DIR, else the payload's cwd, else the working directory.
-Fails closed: an unreadable payload or an internal error is a refusal.
+Fails closed. Refuses when
+  * the command, or a script it executes, reaches a remote host (ssh/scp/sftp, also by full path,
+    or rsync to host:path) and contains a deletion or clobbering operation anywhere in its text;
+  * a deletion word (rm, rmdir, unlink, shred, srm, also by full path, or -delete) cannot be
+    verified: it must be the command word of a plain invocation, with no wrapper (sudo, env, xargs,
+    ...), whose targets are literal absolute paths inside a temp root (/tmp, /private/tmp,
+    /var/folders, $TMPDIR), a variable assigned from mktemp into a temp root by an earlier
+    unconditional statement and never reassigned, or literal paths inside the project's
+    .claude/state/ (relative only when the command does not change directory). Deletion words
+    anywhere else (quotes, $( ), backticks, arguments) are refused; bash/sh/zsh -c and eval strings
+    get the same check;
+  * find -exec runs a deletion outside those locations, or a shell, interpreter or wrapper;
+  * a Python deletion call (os.remove, shutil.rmtree, .unlink(), ...) in python -c code, a heredoc
+    fed to Python or an executed Python script takes anything but a literal allowed path;
+  * an executed script (interpreter argument, or a text file run by path, any name) fails these
+    checks, or its path cannot be resolved (variables left, or relative after a directory change).
+Scripts under the trusted roots (~/.claude/scripts and <project>/.claude/scripts, or
+NO_DELETE_GUARD_TRUSTED_ROOTS in the hook's environment) get only the remote check; a script is
+trusted when its invoked path or its real path is inside a root. Heredoc bodies are checked only
+when fed to a shell or Python (or written to a .sh/.py file); other bodies are data.
+The project is CLAUDE_PROJECT_DIR, else the payload's cwd; scripts resolve against the payload's
+cwd, else the working directory.
 """
 
 from __future__ import annotations
@@ -29,46 +38,60 @@ import sys
 
 TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
 DELETE_COMMANDS = {"rm", "rmdir", "unlink", "shred", "srm"}
-WRAPPERS = {"sudo", "doas", "env", "nohup", "time", "exec", "command", "builtin", "xargs",
-            "do", "then", "else", "elif", "if", "while", "until", "!", "{", "}"}
-SHELLS = {"bash", "sh", "zsh"}
+KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}"}
+WRAPPERS = {"sudo", "doas", "su", "env", "nohup", "time", "exec", "command", "builtin", "xargs", "nice",
+            "ionice", "timeout", "stdbuf", "chroot", "watch", "parallel", "setsid"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 DIRECTORY_CHANGES = {"cd", "pushd", "popd"}
-SEPARATORS = set("\n;&|()`")
-WORD_BREAKS = SEPARATORS | set(" \t")
-SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".py")
+SEPARATORS = set("\n;&|()")
+WORD_BREAKS = SEPARATORS | set(" \t`")
+MAX_DEPTH = 4
 SCRIPT_READ_LIMIT = 2 * 1024 * 1024
 SELF = os.path.realpath(__file__)
 
-REMOTE = re.compile(r"(?<![\w./-])(?:ssh|scp|sftp)(?![\w./-])|\brsync\b[^\n;|&]*\s[\w.@-]+:")
+DELETE_WORD = r"(?<![\w.$-])(?:[\w.~/-]*/)?(?:rm|rmdir|unlink|shred|srm)(?![\w./-])"
+EMBEDDED_DELETE = re.compile(DELETE_WORD)
+PY_DELETE = re.compile(r"(?:\bos\.(?:remove|unlink|rmdir|removedirs)|\bshutil\.rmtree|\.(?:unlink|rmdir))\s*\(\s*([^),]*)")
+REMOTE = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(?:ssh|scp|sftp)(?![\w./-])|\brsync\b[^\n;|&]*\s[\w.@-]+:")
 REMOTE_RULES = (
-    ("delete command", re.compile(r"(?<![\w./-])(?:rm|rmdir|unlink|shred|srm|truncate)(?![\w./-])")),
-    ("find -delete", re.compile(r"\s-delete(?![\w-])")),
+    ("delete command", re.compile(DELETE_WORD + r"|(?<![\w.-])truncate(?![\w.-])")),
+    ("find -delete", re.compile(r"(?<![\w-])-delete(?![\w-])")),
     ("rsync delete option", re.compile(r"--(?:delete[\w-]*|remove-source-files)(?![\w-])")),
-    ("docker removal", re.compile(r"\bdocker\s+(?:\w+\s+)?(?:rmi|prune)(?![\w-])")),
-    ("python file deletion", re.compile(
-        r"\bos\.(?:remove|unlink|rmdir|removedirs)\s*\(|\bshutil\.rmtree\s*\(|\.(?:unlink|rmdir)\s*\(")),
-    ("overwriting redirect", re.compile(r"(?:^|[\s;|&(])>\|?(?![>&=])\s*(?!/dev/null(?![\w/.-]))\S")),
+    ("docker removal", re.compile(r"\bdocker\b[^\n;|&]*?(?<![\w-])(?:rmi|prune)(?![\w-])")),
+    ("python file deletion", PY_DELETE),
+    ("overwriting redirect", re.compile(r"(?:^|[\s;|&(])(?:\d+|&)?>\|?(?![>&=])\s*(?!/dev/null(?![\w/.-]))\S")),
 )
-MOVE_OR_COPY = re.compile(r"(?<![\w./-])(mv|cp)(?=\s)")
+MOVE_OR_COPY = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(mv|cp)(?=\s)")
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
-INTERPRETER = re.compile(r"python[\d.]*|bash|sh|zsh|source|\.")
-MKTEMP_ASSIGNMENT = re.compile(r"(?<![\w$])([A-Za-z_]\w*)=([\"']?)\$\(\s*mktemp\b([^()]*)\)\2")
+INTERPRETER = re.compile(r"python[\d.]*|bash|sh|zsh|dash|ksh|source|\.")
+PYTHON = re.compile(r"python[\d.]*")
+C_FLAG = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+ASSIGNMENT = re.compile(r"[A-Za-z_]\w*\+?=.*")
+MKTEMP_SEGMENT = re.compile(r"\s*([A-Za-z_]\w*)=([\"']?)\$\(\s*mktemp\b([^()]*)\)\2\s*")
 VARIABLE_OPERAND = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))(/.*)?")
 REDIRECTION = re.compile(r"(?:\d+|&)?(?:>>?|<|>&|<&)(.*)")
 
 
 class Context:
-    def __init__(self, project: str) -> None:
-        self.temp_roots = _both_forms(list(TEMP_ROOTS) + [r for r in [os.environ.get("TMPDIR", "")] if r.startswith("/")])
+    def __init__(self, project: str, cwd: str) -> None:
+        tmpdir = os.environ.get("TMPDIR", "")
+        self.temp_roots = both_forms(list(TEMP_ROOTS) + ([tmpdir] if tmpdir.startswith("/") else []))
         self.project = os.path.normpath(project)
-        self.state_roots = _both_forms([os.path.join(self.project, ".claude", "state")])
+        self.cwd = cwd
+        self.state_roots = both_forms([os.path.join(self.project, ".claude", "state")])
         trusted = os.environ.get("NO_DELETE_GUARD_TRUSTED_ROOTS")
         defaults = [os.path.expanduser("~/.claude/scripts"), os.path.join(self.project, ".claude", "scripts")]
-        self.trusted_roots = _both_forms([os.path.abspath(r) for r in (trusted.split(os.pathsep) if trusted else defaults) if r])
+        roots = trusted.split(os.pathsep) if trusted else defaults
+        self.trusted_roots = both_forms([os.path.abspath(r) for r in roots if r])
 
 
-def _both_forms(paths: list[str]) -> set[str]:
+def both_forms(paths: list[str]) -> set[str]:
     return {os.path.normpath(p) for p in paths} | {os.path.realpath(p) for p in paths}
+
+
+def base(token: str) -> str:
+    return os.path.basename(token.rstrip("/"))
 
 
 def under(path: str, roots: set[str]) -> bool:
@@ -80,22 +103,41 @@ def inside(path: str, roots: set[str]) -> bool:
     globs = [path.find(c) for c in "*?[" if c in path]
     if globs:
         prefix = path[:min(globs)]
-        base = os.path.normpath(prefix if prefix.endswith("/") else os.path.dirname(prefix))
-        return all(p in roots or under(p, roots) for p in (base, os.path.realpath(base)))
+        start = os.path.normpath(prefix if prefix.endswith("/") else os.path.dirname(prefix))
+        return all(p in roots or under(p, roots) for p in (start, os.path.realpath(start)))
     norm = os.path.normpath(path)
     return under(norm, roots) and under(os.path.realpath(norm), roots)
 
 
-def operand_ok(operand: str, ctx: Context, temp_vars: set[str], relative_ok: bool) -> bool:
+def operand_ok(operand: str, ctx: Context, safe_vars: set[str], relative_ok: bool) -> bool:
     var = VARIABLE_OPERAND.fullmatch(operand)
     if var:
         rest = var.group(3) or ""
-        return (var.group(1) or var.group(2)) in temp_vars and not re.search(r"[$`]|(^|/)\.\.(/|$)", rest)
+        return (var.group(1) or var.group(2)) in safe_vars and not re.search(r"[$`]|(^|/)\.\.(/|$)", rest)
     if any(c in operand for c in "$`~"):
         return False
     if operand.startswith("/"):
         return inside(operand, ctx.temp_roots) or inside(operand, ctx.state_roots)
     return relative_ok and inside(os.path.join(ctx.project, operand), ctx.state_roots)
+
+
+def operands_of(tokens: list[str]) -> list[str]:
+    found, flags_done, skip_target = [], False, False
+    for token in tokens:
+        if skip_target:
+            skip_target = False
+            continue
+        redirect = REDIRECTION.fullmatch(token)
+        if redirect:
+            skip_target = not redirect.group(1)
+            continue
+        if not flags_done and token == "--":
+            flags_done = True
+        elif not flags_done and token.startswith("-") and token != "-":
+            continue
+        else:
+            found.append(token)
+    return found
 
 
 def mktemp_in_temp(args: str, ctx: Context) -> bool:
@@ -136,88 +178,48 @@ def mktemp_in_temp(args: str, ctx: Context) -> bool:
     return template.startswith("/") and (parent in ctx.temp_roots or inside(parent, ctx.temp_roots))
 
 
-def mktemp_variables(text: str, ctx: Context) -> set[str]:
-    temp_assignments: dict[str, int] = {}
-    for m in MKTEMP_ASSIGNMENT.finditer(text):
-        count = temp_assignments.setdefault(m.group(1), 0)
-        temp_assignments[m.group(1)] = count + 1 if mktemp_in_temp(m.group(3), ctx) else -10 ** 6
-    safe = set()
-    for name, count in temp_assignments.items():
-        escaped = re.escape(name)
-        assignments = len(re.findall(r"(?<![\w$])%s\+?=" % escaped, text))
-        rebound = re.search(r"\b(?:for|read|select|local|declare|typeset)\b[^\n;]*\b%s\b(?!=)" % escaped, text)
-        if count > 0 and assignments == count and not rebound:
-            safe.add(name)
-    return safe
+def split_shell(text: str) -> list[tuple[str, str | None]]:
+    """Quote-, comment- and substitution-aware split into (segment, separator before it)."""
+    out: list[tuple[str, str | None]] = []
+    cur: list[str] = []
+    state = {"sep": None}
+    quote, i = None, 0
 
+    def flush(new_sep: str) -> None:
+        if "".join(cur).strip():
+            out.append(("".join(cur), state["sep"]))
+            state["sep"] = new_sep
+        elif state["sep"] not in ("&&", "||"):
+            state["sep"] = new_sep
+        cur.clear()
 
-def heredoc_feeds_shell(prefix: str) -> bool:
-    """A heredoc body is shell when bash/sh/zsh reads it from stdin or it is written to a shell-script file."""
-    segs = segments(prefix)
-    if not segs:
-        return False
-    tokens, _ = command_words(words(segs[-1]))
-    if not tokens:
-        return False
-    if os.path.basename(tokens[0]) in SHELLS:
-        args, skip_target = [], False
-        for token in tokens[1:]:
-            if skip_target:
-                skip_target = False
-                continue
-            redirect = REDIRECTION.fullmatch(token)
-            if redirect:
-                skip_target = not redirect.group(1)
-                continue
-            args.append(token)
-        return "-c" not in args and ("-s" in args or all(a.startswith("-") for a in args))
-    return any(t.lstrip(">").endswith((".sh", ".bash", ".zsh")) for t in tokens[1:])
-
-
-def split_heredocs(text: str) -> tuple[str, list[str]]:
-    """Separate heredoc bodies from shell text; return (shell_text, body lines that are shell).
-
-    Bodies that do not feed a shell (commit messages, Python, notes) are data and are dropped.
-    A heredoc marker with no terminator line is not a heredoc: its following lines stay shell text.
-    """
-    shell, bodies, pos = [], [], 0
-    while True:
-        m = HEREDOC.search(text, pos)
-        if not m:
-            break
-        line_end = text.find("\n", m.end())
-        if line_end < 0:
-            break
-        shell.append(text[pos:line_end + 1])
-        line_start = max(pos, text.rfind("\n", 0, m.start()) + 1)
-        feeds_shell = heredoc_feeds_shell(text[line_start:m.start()])
-        strip_tabs = text[m.start():m.start() + 3] == "<<-"
-        lines = text[line_end + 1:].split("\n")
-        consumed = line_end + 1
-        for i, line in enumerate(lines):
-            consumed += len(line) + 1
-            if (line.lstrip("\t") if strip_tabs else line) == m.group(2):
-                if feeds_shell:
-                    bodies.extend(lines[:i])
-                pos = min(consumed, len(text))
-                break
-        else:
-            pos = line_end + 1
-    shell.append(text[pos:])
-    return "".join(shell), bodies
-
-
-def segments(text: str) -> list[str]:
-    out, cur, quote, i = [], [], None, 0
     while i < len(text):
         ch = text[i]
-        if quote:
+        if quote == "'":
             cur.append(ch)
-            if ch == "\\" and quote == '"' and i + 1 < len(text):
+            if ch == "'":
+                quote = None
+        elif ch == "$" and text[i + 1:i + 2] == "(":
+            j, depth = i + 2, 1
+            while j < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+            cur.append(text[i:j])
+            i = j
+            continue
+        elif ch == "`":
+            j = text.find("`", i + 1)
+            j = len(text) if j < 0 else j + 1
+            cur.append(text[i:j])
+            i = j
+            continue
+        elif quote == '"':
+            cur.append(ch)
+            if ch == "\\" and i + 1 < len(text):
                 cur.append(text[i + 1])
                 i += 2
                 continue
-            if ch == quote:
+            if ch == '"':
                 quote = None
         elif ch == "#" and (i == 0 or text[i - 1] in WORD_BREAKS):
             end = text.find("\n", i)
@@ -232,96 +234,259 @@ def segments(text: str) -> list[str]:
             cur.extend((ch, text[i + 1]))
             i += 2
             continue
+        elif ch in "&|" and text[i + 1:i + 2] == ch:
+            flush(ch * 2)
+            i += 2
+            continue
         elif ch in SEPARATORS:
-            out.append("".join(cur))
-            cur = []
+            flush(ch)
         else:
             cur.append(ch)
         i += 1
-    out.append("".join(cur))
-    return [s for s in out if s.strip()]
-
-
-def all_segments(text: str) -> list[str]:
-    shell_text, body_lines = split_heredocs(text)
-    return segments(shell_text) + [s for line in body_lines for s in segments(line)]
+    flush("")
+    return out
 
 
 def words(segment: str) -> list[str]:
     try:
-        return shlex.split(segment, comments=True, posix=True)
+        return shlex.split(segment, posix=True)
     except ValueError:
         return segment.replace('"', " ").replace("'", " ").split()
 
 
-def command_words(tokens: list[str]) -> tuple[list[str], bool]:
-    i, via_xargs = 0, False
-    while i < len(tokens):
-        token = tokens[i]
-        if re.fullmatch(r"[A-Za-z_]\w*=.*", token):
-            i += 1
-            continue
-        if token in WRAPPERS:
-            via_xargs = via_xargs or token == "xargs"
-            i += 1
-            while i < len(tokens) and tokens[i].startswith("-"):
-                i += 1
-            continue
-        break
-    return tokens[i:], via_xargs
+def strip_prefix(tokens: list[str]) -> list[str]:
+    i = 0
+    while i < len(tokens) and (tokens[i] in KEYWORDS or ASSIGNMENT.fullmatch(tokens[i])):
+        i += 1
+    return tokens[i:]
 
 
-def local_problems(shell_segments: list[str], ctx: Context, temp_vars: set[str], depth: int = 0) -> list[str]:
-    parsed = [command_words(words(segment)) for segment in shell_segments]
-    relative_ok = not any(tokens and os.path.basename(tokens[0]) in DIRECTORY_CHANGES for tokens, _ in parsed)
+def drop_redirections(tokens: list[str]) -> list[str]:
+    kept, skip_target = [], False
+    for token in tokens:
+        if skip_target:
+            skip_target = False
+            continue
+        redirect = REDIRECTION.fullmatch(token)
+        if redirect:
+            skip_target = not redirect.group(1)
+            continue
+        kept.append(token)
+    return kept
+
+
+def heredoc_consumer(prefix: str) -> str:
+    """'shell', 'python' or 'data': what reads a heredoc whose operator follows prefix."""
+    segs = split_shell(prefix)
+    tokens = strip_prefix(words(segs[-1][0])) if segs else []
+    if not tokens:
+        return "data"
+    names = [base(t) for t in tokens]
+    if names[0] in WRAPPERS:
+        if any(n in SHELLS for n in names):
+            return "shell"
+        return "python" if any(PYTHON.fullmatch(n) for n in names) else "data"
+    args = drop_redirections(tokens[1:])
+    if names[0] in SHELLS:
+        if any(C_FLAG.fullmatch(a) for a in args):
+            return "data"
+        return "shell" if "-s" in args or all(a.startswith("-") for a in args) else "data"
+    if PYTHON.fullmatch(names[0]):
+        return "python" if "-" in args or all(a.startswith("-") for a in args) else "data"
+    targets = [t.lstrip(">") for t in tokens[1:]]
+    if any(t.endswith((".sh", ".bash", ".zsh")) for t in targets):
+        return "shell"
+    return "python" if any(t.endswith(".py") for t in targets) else "data"
+
+
+def split_heredocs(text: str) -> tuple[str, list[str], list[str]]:
+    """Return (shell text, shell heredoc bodies, Python heredoc bodies). Data bodies are dropped;
+    a marker with no terminator line is not a heredoc."""
+    shell, shell_bodies, python_bodies, pos = [], [], [], 0
+    while True:
+        m = HEREDOC.search(text, pos)
+        if not m:
+            break
+        line_end = text.find("\n", m.end())
+        if line_end < 0:
+            break
+        shell.append(text[pos:line_end + 1])
+        line_start = max(pos, text.rfind("\n", 0, m.start()) + 1)
+        kind = heredoc_consumer(text[line_start:m.start()])
+        strip_tabs = text[m.start():m.start() + 3] == "<<-"
+        lines = text[line_end + 1:].split("\n")
+        consumed = line_end + 1
+        for i, line in enumerate(lines):
+            consumed += len(line) + 1
+            if (line.lstrip("\t") if strip_tabs else line) == m.group(2):
+                body = "\n".join(lines[:i])
+                if kind == "shell":
+                    shell_bodies.append(body)
+                elif kind == "python":
+                    python_bodies.append(body)
+                pos = min(consumed, len(text))
+                break
+        else:
+            pos = line_end + 1
+    shell.append(text[pos:])
+    return "".join(shell), shell_bodies, python_bodies
+
+
+def unverified(tokens: list[str]) -> list[str]:
+    for token in tokens:
+        if token == "-delete" or base(token) in DELETE_COMMANDS or EMBEDDED_DELETE.search(token):
+            return ["a deletion the guard cannot verify (%r)" % token[:60]]
+    return []
+
+
+def python_problems(code: str, ctx: Context) -> list[str]:
     problems = []
-    for tokens, via_xargs in parsed:
-        if not tokens:
+    for m in PY_DELETE.finditer(code):
+        literal = re.fullmatch(r"[rbuRBU]?(['\"])(.*)\1", m.group(1).strip())
+        if not literal or not operand_ok(literal.group(2), ctx, set(), False):
+            problems.append("a Python deletion the guard cannot verify (%r)" % m.group(0)[:60])
+    return problems
+
+
+def mktemp_assignments(segs: list[tuple[str, str | None]], text: str, ctx: Context) -> dict[str, int]:
+    found: dict[str, list[int]] = {}
+    for i, (seg, sep) in enumerate(segs):
+        m = MKTEMP_SEGMENT.fullmatch(seg)
+        if m and sep in (None, "\n", ";") and mktemp_in_temp(m.group(3), ctx):
+            found.setdefault(m.group(1), []).append(i)
+    safe = {}
+    for name, where in found.items():
+        escaped = re.escape(name)
+        total = len(re.findall(r"(?<![\w$])%s\+?=" % escaped, text))
+        rebound = re.search(r"\b(?:for|read|select|local|declare|typeset|export|unset)\b[^\n;]*\b%s\b" % escaped, text)
+        if len(where) == 1 and total == 1 and not rebound:
+            safe[name] = where[0]
+    return safe
+
+
+def find_problems(args: list[str], ctx: Context, safe: set[str], relative_ok: bool) -> list[str]:
+    roots = []
+    for token in args:
+        if token.startswith("-") or token in ("(", "!", "\\("):
+            break
+        roots.append(token)
+    problems, outside, deleting, k = [], [], False, len(roots)
+    while k < len(args):
+        token = args[k]
+        if token == "-delete":
+            deleting = True
+        elif token in FIND_ACTIONS:
+            end = next((m for m in range(k + 1, len(args)) if args[m] in (";", "+")), len(args))
+            action = args[k + 1:end]
+            name = base(action[0]) if action else ""
+            if name in DELETE_COMMANDS:
+                deleting = True
+                bad = [op for op in operands_of(action[1:]) if op != "{}" and not operand_ok(op, ctx, safe, relative_ok)]
+                if bad:
+                    problems.append("find %s deletes outside the allowed locations: %s" % (token, ", ".join(repr(b) for b in bad[:3])))
+            elif not name or name in SHELLS or name in WRAPPERS or PYTHON.fullmatch(name) or name in ("eval", "find"):
+                problems.append("find %s runs %r, which the guard cannot verify" % (token, name or "nothing"))
+            else:
+                outside += action
+            k = end
+        else:
+            outside.append(token)
+        k += 1
+    problems += unverified(outside)
+    if deleting:
+        bad = [r for r in roots if not operand_ok(r, ctx, safe, relative_ok)]
+        if not roots or bad:
+            problems.append("find deleting outside the allowed locations: %s"
+                            % (", ".join(repr(b) for b in bad[:3]) or "current directory"))
+    return problems
+
+
+def script_problems(tokens: list[str], ctx: Context, relative_ok: bool, depth: int) -> list[str]:
+    name = base(tokens[0])
+    if INTERPRETER.fullmatch(name):
+        args = drop_redirections(tokens[1:])
+        if "-c" in args or "-m" in args:
+            return []
+        script = next((a for a in args if not a.startswith("-")), None)
+        python, by_path = bool(PYTHON.fullmatch(name)), False
+    elif "/" in tokens[0]:
+        script, python, by_path = tokens[0], tokens[0].endswith(".py"), True
+    else:
+        return []
+    if not script:
+        return []
+    path = os.path.expanduser(os.path.expandvars(script))
+    if "$" in path or "`" in path:
+        return ["a script path the guard cannot resolve (%r)" % script]
+    if not path.startswith("/"):
+        if not relative_ok:
+            return ["a relative script path after a directory change (%r)" % script]
+        path = os.path.join(ctx.cwd, path)
+    if not os.path.isfile(path) or os.path.realpath(path) == SELF:
+        return []
+    with open(path, "rb") as handle:
+        raw = handle.read(SCRIPT_READ_LIMIT)
+    if by_path and b"\0" in raw[:4096]:
+        return []
+    text = raw.decode("utf-8", errors="ignore")
+    found = remote_problems(text)
+    trusted = under(os.path.normpath(os.path.abspath(path)), ctx.trusted_roots) or \
+        under(os.path.realpath(path), ctx.trusted_roots)
+    if not trusted:
+        first_line = text.split("\n", 1)[0]
+        if python or path.endswith(".py") or (first_line.startswith("#!") and "python" in first_line):
+            found += python_problems(text, ctx)
+        else:
+            found += local_problems(text, ctx, depth + 1)
+    return ["%s (in %s)" % (p, os.path.basename(path)) for p in found]
+
+
+def segment_problems(raw: list[str], ctx: Context, safe: set[str], relative_ok: bool, depth: int) -> list[str]:
+    tokens = strip_prefix(raw)
+    problems = unverified(raw[:len(raw) - len(tokens)])
+    if not tokens:
+        return problems
+    name, args = base(tokens[0]), tokens[1:]
+    if name in DELETE_COMMANDS:
+        bad = [op for op in operands_of(args) if not operand_ok(op, ctx, safe, relative_ok)]
+        if bad:
+            problems.append("%s outside the allowed locations: %s" % (name, ", ".join(repr(b) for b in bad[:3])))
+        return problems
+    if name == "find":
+        return problems + find_problems(args, ctx, safe, relative_ok)
+    if name == "eval":
+        return problems + local_problems(" ".join(args), ctx, depth + 1)
+    if name in SHELLS:
+        flag = next((k for k, a in enumerate(args) if C_FLAG.fullmatch(a)), None)
+        if flag is not None and flag + 1 < len(args):
+            return problems + unverified(args[:flag] + args[flag + 2:]) + local_problems(args[flag + 1], ctx, depth + 1)
+    if PYTHON.fullmatch(name) and "-c" in args:
+        k = args.index("-c")
+        code = args[k + 1] if k + 1 < len(args) else ""
+        return problems + unverified(args[:k] + args[k + 2:]) + python_problems(code, ctx)
+    if name in WRAPPERS:
+        runs = [a for a in args if base(a) in SHELLS or PYTHON.fullmatch(base(a)) or base(a) in ("eval", "find")]
+        if runs:
+            problems.append("%s runs %r, which the guard cannot verify" % (name, runs[0]))
+        return problems + unverified(args)
+    return problems + unverified(tokens) + script_problems(tokens, ctx, relative_ok, depth)
+
+
+def local_problems(text: str, ctx: Context, depth: int = 0) -> list[str]:
+    if depth > MAX_DEPTH:
+        return ["commands nested too deeply to verify"]
+    shell_text, shell_bodies, python_bodies = split_heredocs(text)
+    problems = [p for body in shell_bodies for p in local_problems(body, ctx, depth + 1)]
+    problems += [p for body in python_bodies for p in python_problems(body, ctx)]
+    segs = split_shell(shell_text)
+    raws = [words(seg) for seg, _ in segs]
+    relative_ok = not any((lambda t: t and base(t[0]) in DIRECTORY_CHANGES)(strip_prefix(r)) for r in raws)
+    safe_from = mktemp_assignments(segs, shell_text, ctx)
+    for j, ((seg, _), raw) in enumerate(zip(segs, raws)):
+        if MKTEMP_SEGMENT.fullmatch(seg):
             continue
-        name = os.path.basename(tokens[0])
-        if depth < 3 and name in SHELLS and "-c" in tokens[1:-1]:
-            inner = tokens[tokens.index("-c") + 1]
-            problems += local_problems(all_segments(inner), ctx, temp_vars | mktemp_variables(inner, ctx), depth + 1)
-        elif depth < 3 and name == "eval":
-            inner = " ".join(tokens[1:])
-            problems += local_problems(all_segments(inner), ctx, temp_vars | mktemp_variables(inner, ctx), depth + 1)
-        elif name in DELETE_COMMANDS:
-            operands, flags_done, skip_target = [], False, False
-            for token in tokens[1:]:
-                if skip_target:
-                    skip_target = False
-                    continue
-                redirect = REDIRECTION.fullmatch(token)
-                if redirect:
-                    skip_target = not redirect.group(1)
-                    continue
-                if not flags_done and token == "--":
-                    flags_done = True
-                elif not flags_done and token.startswith("-"):
-                    continue
-                else:
-                    operands.append(token)
-            if via_xargs:
-                problems.append("%s fed by xargs (paths cannot be checked)" % name)
-            bad = [op for op in operands if not operand_ok(op, ctx, temp_vars, relative_ok)]
-            if bad:
-                problems.append("%s outside the allowed locations: %s" % (name, ", ".join(repr(b) for b in bad[:3])))
-        elif name == "find":
-            rest = tokens[1:]
-            deleting = "-delete" in rest or any(
-                t in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < len(rest)
-                and os.path.basename(rest[i + 1]) in DELETE_COMMANDS
-                for i, t in enumerate(rest))
-            if deleting:
-                search_roots = []
-                for token in rest:
-                    if token.startswith("-") or token in ("(", "!", "\\("):
-                        break
-                    search_roots.append(token)
-                bad = [r for r in search_roots if not operand_ok(r, ctx, temp_vars, relative_ok)]
-                if not search_roots or bad:
-                    problems.append("find deleting outside the allowed locations: %s"
-                                    % (", ".join(repr(b) for b in bad[:3]) or "current directory"))
+        safe = {name for name, i in safe_from.items() if i < j}
+        problems += segment_problems(raw, ctx, safe, relative_ok, depth)
     return problems
 
 
@@ -346,41 +511,9 @@ def remote_problems(text: str) -> list[str]:
     return problems
 
 
-def executed_scripts(shell_segments: list[str]) -> list[tuple[str, str]]:
-    """Script files a segment runs: the command word itself, or an interpreter's script argument."""
-    found = []
-    for segment in shell_segments:
-        tokens, _ = command_words(words(segment))
-        if not tokens:
-            continue
-        if INTERPRETER.fullmatch(os.path.basename(tokens[0])):
-            args = tokens[1:]
-            if "-c" in args or "-m" in args:
-                continue
-            script = next((t for t in args if not t.startswith("-")), None)
-        else:
-            script = tokens[0]
-        if not script or not script.endswith(SCRIPT_SUFFIXES):
-            continue
-        path = os.path.expanduser(os.path.expandvars(script))
-        if os.path.isfile(path) and os.path.realpath(path) != SELF:
-            with open(path, encoding="utf-8", errors="ignore") as handle:
-                found.append((path, handle.read(SCRIPT_READ_LIMIT)))
-    return found
-
-
-def evaluate(command: str, project: str) -> list[str]:
-    ctx = Context(project)
-    shell_segments = all_segments(command)
-    problems = local_problems(shell_segments, ctx, mktemp_variables(command, ctx)) + remote_problems(command)
-    for path, text in executed_scripts(shell_segments):
-        found = remote_problems(text)
-        trusted = under(os.path.normpath(os.path.abspath(path)), ctx.trusted_roots) or \
-            under(os.path.realpath(path), ctx.trusted_roots)
-        if not trusted and not path.endswith(".py"):
-            found += local_problems(all_segments(text), ctx, mktemp_variables(text, ctx))
-        problems += ["%s (in %s)" % (p, os.path.basename(path)) for p in found]
-    return problems
+def evaluate(command: str, project: str, cwd: str) -> list[str]:
+    ctx = Context(project, cwd)
+    return local_problems(command, ctx) + remote_problems(command)
 
 
 def main() -> int:
@@ -392,9 +525,9 @@ def main() -> int:
         command = (payload.get("tool_input") or {}).get("command")
         if not isinstance(command, str):
             raise ValueError("tool_input.command is missing")
-        cwd = payload.get("cwd")
-        project = os.environ.get("CLAUDE_PROJECT_DIR") or (cwd if isinstance(cwd, str) and cwd else os.getcwd())
-        problems = evaluate(command, project)
+        cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) and payload.get("cwd") else os.getcwd()
+        project = os.environ.get("CLAUDE_PROJECT_DIR") or cwd
+        problems = evaluate(command, project, cwd)
     except Exception as exc:  # fail closed
         problems = ["the deletion guard could not evaluate this command (%s)" % type(exc).__name__]
     if not problems:
@@ -402,9 +535,10 @@ def main() -> int:
     sys.stderr.write(
         "Blocked by the project deletion rule (CLAUDE.md, 'Deletion rule'): " + "; ".join(problems[:5])
         + ". On the Unraid server, delete only through the owning app's API (Sonarr/Radarr, qBittorrent, Plex). "
-          "Locally, rm/find -delete may only name literal paths inside /tmp, /private/tmp, /var/folders, $TMPDIR "
-          "or this project's .claude/state/, or a variable assigned from mktemp into a temp folder in the same "
-          "command. Keep local temp cleanup in a separate command from anything that uses ssh.\n")
+          "Locally, run rm/find -delete as a plain command (no wrapper, substitution or quoting around it) on "
+          "literal paths inside /tmp, /private/tmp, /var/folders, $TMPDIR or this project's .claude/state/, or "
+          "on a variable assigned from mktemp into a temp folder earlier in the same command. Keep local temp "
+          "cleanup in a separate command from anything that uses ssh.\n")
     return 2
 
 
