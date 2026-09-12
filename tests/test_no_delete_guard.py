@@ -100,6 +100,12 @@ DENY = [
     "python3 -c \"import os; os.remove('/tmp/' '../etc/guard-victim')\"",
     "ssh %s \"r$''m -rf /mnt/user/x\"" % HOST,
     "echo \"<<EOF\"\nrm -rf /etc/guard-victim\nEOF",
+    "# <<EOF\nrm -rf /etc/guard-victim\nEOF",
+    "D=$(mktemp -d); printf -v D /etc/guard-victim; rm -rf \"$D\"",
+    "python3 -c \"import os; os.truncate('.claude/settings.json', 0)\"",
+    "python3 -c \"from os import remove; remove('/etc/guard-victim')\"",
+    "python3 -c \"import shutil as s; s.rmtree('/etc/guard-victim')\"",
+    "ssh %s \"python3 -c 'from os import remove; remove(\\\"/mnt/user/x\\\")'\"" % HOST,
     "grep -rn 'rm -rf' docs/",
     "echo \"x; rm -rf /\"",
     "bash -c 'rm -rf /Users/brentwilson/Documents'",
@@ -180,6 +186,8 @@ ALLOW = [
     "python3 -m unittest discover -s tests -v",
     "python3 -c \"import os; os.remove('/tmp/scratch')\"",
     "python3 -c \"import os; os.remove('/tmp/' 'scratch')\"",
+    "python3 -c \"from os import path; print(path.join('a', 'b'))\"",
+    "python3 -X utf8 -c \"import os; os.remove('/tmp/scratch')\"",
     "python3 - <<'EOF'\nimport os\nos.remove('/tmp/a')\nEOF",
     "python3 - <<'EOF'\nGUARD = '.claude/scripts/no-delete-guard.py'\n"
     "with open('/tmp/out.txt', 'w') as handle:\n    handle.write(GUARD)\nEOF",
@@ -243,6 +251,21 @@ class GuardDecisionTests(unittest.TestCase):
                             "bash --unknown-option %s" % danger,
                             "bash %s" % shell_named_py,
                             "bash %s" % big):
+                with self.subTest(command=command):
+                    self.assertEqual(decide(command, env=env), "deny")
+
+    def test_symlinks_and_option_values_do_not_hide_targets(self) -> None:
+        env = {"NO_DELETE_GUARD_TRUSTED_ROOTS": "/nonexistent-trusted-root"}
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            os.mkdir(os.path.join(tmp, "job"))
+            os.symlink("/etc", os.path.join(tmp, "job", "link"))
+            os.symlink(str(SETTINGS), os.path.join(tmp, "guard-link"))
+            danger = Path(tmp, "danger.py")
+            danger.write_text("import os\nos.remove(target)\n")
+            for command in ("rm -f %s/job/*/passwd" % tmp,
+                            "find %s/job/* -name x -delete" % tmp,
+                            "printf '{}' > %s/guard-link" % tmp,
+                            "python3 -X -c %s" % danger):
                 with self.subTest(command=command):
                     self.assertEqual(decide(command, env=env), "deny")
 

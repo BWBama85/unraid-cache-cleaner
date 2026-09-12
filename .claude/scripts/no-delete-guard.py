@@ -38,6 +38,7 @@ cwd, else the working directory.
 from __future__ import annotations
 
 import ast
+import glob
 import json
 import os
 import re
@@ -69,7 +70,11 @@ SELF = os.path.realpath(__file__)
 DELETE_WORD = r"(?<![\w.$-])(?:[\w.~/-]*/)?(?:rm|rmdir|unlink|shred|srm)(?![\w./-])"
 EMBEDDED_DELETE = re.compile(DELETE_WORD)
 PY_DELETE = re.compile(r"(?:\bos\.(?:remove|unlink|rmdir|removedirs)|\bshutil\.rmtree|\.(?:unlink|rmdir))\s*\(\s*([^),]*)")
+PY_DELETE_IMPORT = re.compile(r"\bfrom\s+(?:os|shutil|pathlib)\s+import\b[^\n]*?"
+                              r"\b(?:remove|unlink|rmdir|removedirs|rmtree|truncate)\b")
+PY_MODULE_ALIAS = re.compile(r"\bimport\s+(os|shutil)\s+as\s+(\w+)")
 PY_WRITE = re.compile(r"\bopen\s*\([^)]*['\"][rbt]*[wax+][rbt+]*['\"]|\.write_(?:text|bytes)\s*\("
+                      r"|\bos\.(?:truncate|ftruncate|open|write)\s*\("
                       r"|\bos\.(?:replace|rename|chmod)\s*\(|\bshutil\.(?:copy\w*|move)\s*\(")
 PROTECTED = re.compile(r"(?:\.claude/(?:settings(?:\.local)?\.json|scripts/no-delete-guard\.py)|tests/test_no_delete_guard\.py)(?![\w.-])")
 REMOTE = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(?:ssh|scp|sftp)(?![\w./-])|\brsync\b[^\n;|&]*\s[\w.@-]+:")
@@ -79,6 +84,7 @@ REMOTE_RULES = (
     ("rsync delete option", re.compile(r"--(?:del[\w-]*|remove-s[\w-]*)(?![\w-])")),
     ("docker removal", re.compile(r"\bdocker\b[^\n;|&]*?(?<![\w-])(?:rmi|prune)(?![\w-])")),
     ("python file deletion", PY_DELETE),
+    ("python deletion import", PY_DELETE_IMPORT),
     ("overwriting redirect", re.compile(r"(?<![<>=&\d-])(?:\d+|&)?>\|?(?![>&=])\s*(?!/dev/null(?![\w/.-]))[^\s>&|;]")),
 )
 MOVE_OR_COPY = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(mv|cp)(?=\s)")
@@ -118,12 +124,17 @@ def under(path: str, roots: set[str]) -> bool:
 
 
 def inside(path: str, roots: set[str]) -> bool:
-    """An absolute operand stays inside roots: globs may match the root's entries, others must be below it."""
+    """An absolute operand stays inside roots: a glob may only vary its last component, its literal
+    parent must be inside, and every current match must resolve inside too (a matched symlink does not)."""
     globs = [path.find(c) for c in "*?[" if c in path]
     if globs:
         prefix = path[:min(globs)]
+        if "/" in path[min(globs):]:
+            return False
         start = os.path.normpath(prefix if prefix.endswith("/") else os.path.dirname(prefix))
-        return all(p in roots or under(p, roots) for p in (start, os.path.realpath(start)))
+        if not all(p in roots or under(p, roots) for p in (start, os.path.realpath(start))):
+            return False
+        return all(under(os.path.realpath(match), roots) for match in glob.glob(path))
     norm = os.path.normpath(path)
     return under(norm, roots) and under(os.path.realpath(norm), roots)
 
@@ -333,6 +344,12 @@ def heredoc_operators(text: str) -> list[tuple[int, int, str, bool]]:
             continue
         if ch in "'\"":
             quote = ch
+        elif ch == "#" and (i == 0 or text[i - 1] in WORD_BREAKS):
+            end = text.find("\n", i)
+            if end < 0:
+                break
+            i = end
+            continue
         elif ch == "\\" and i + 1 < len(text):
             i += 2
             continue
@@ -377,6 +394,26 @@ def split_heredocs(text: str) -> tuple[str, list[str], list[str]]:
     return "".join(shell), shell_bodies, python_bodies
 
 
+def command_flag_index(name: str, args: list[str]) -> int | None:
+    """Index of the -c flag that supplies code, skipping options whose value merely looks like one."""
+    python, k = bool(PYTHON.fullmatch(name)), 0
+    value_options = PYTHON_VALUE_OPTIONS if python else SHELL_VALUE_OPTIONS
+    while k < len(args):
+        token = args[k]
+        if token in value_options:
+            k += 2
+            continue
+        if C_FLAG.fullmatch(token):
+            return k
+        if re.fullmatch(r"[-+][A-Za-z]+", token):
+            letters = token[1:]
+            if (python and letters[-1] in "WX") or (not python and ("o" in letters or "O" in letters)):
+                k += 2
+                continue
+        k += 1
+    return None
+
+
 def unverified(tokens: list[str]) -> list[str]:
     for token in tokens:
         if token == "-delete" or base(token) in DELETE_COMMANDS or EMBEDDED_DELETE.search(token):
@@ -386,6 +423,11 @@ def unverified(tokens: list[str]) -> list[str]:
 
 def python_problems(code: str, ctx: Context) -> list[str]:
     problems = []
+    if PY_DELETE_IMPORT.search(code):
+        problems.append("a Python deletion imported under a bare name, which the guard cannot verify")
+    for module, alias in PY_MODULE_ALIAS.findall(code):
+        if re.search(r"\b%s\.(?:remove|unlink|rmdir|removedirs|rmtree|truncate)\s*\(" % re.escape(alias), code):
+            problems.append("a Python deletion through the alias %r, which the guard cannot verify" % alias)
     for m in PY_DELETE.finditer(code):
         try:
             value = ast.literal_eval(m.group(1).strip())
@@ -401,8 +443,12 @@ def python_problems(code: str, ctx: Context) -> list[str]:
 
 
 def protected_path(token: str) -> bool:
-    """A guard file by any spelling: .claude/./settings.json and .claude//scripts/... normalise to one."""
-    return any(PROTECTED.search(form) for form in (token, os.path.normpath(token)))
+    """A guard file by any spelling or alias: odd separators normalise, and a symlink resolves, to one."""
+    forms = [token, os.path.normpath(token)]
+    stripped = token.strip("\"'")
+    if stripped:
+        forms += [stripped, os.path.realpath(os.path.expanduser(stripped))]
+    return any(PROTECTED.search(form) for form in forms)
 
 
 def tamper_problems(raw: list[str]) -> list[str]:
@@ -437,7 +483,9 @@ def mktemp_assignments(segs: list[tuple[str, str | None]], text: str, ctx: Conte
     for name, where in found.items():
         escaped = re.escape(name)
         total = len(re.findall(r"(?<![\w$])%s\+?=" % escaped, text))
-        rebound = re.search(r"\b(?:for|read|select|local|declare|typeset|export|unset)\b[^\n;]*\b%s\b" % escaped, text)
+        rebound = re.search(r"\b(?:for|read|select|local|declare|typeset|export|unset|eval|mapfile|readarray)\b"
+                            r"[^\n;]*\b%s\b" % escaped, text) \
+            or re.search(r"\bprintf\b[^\n;]*-v\s+%s\b" % escaped, text)
         if len(where) == 1 and total == 1 and not rebound:
             safe[name] = where[0]
     return safe
@@ -589,7 +637,7 @@ def segment_problems(raw: list[str], ctx: Context, safe: set[str], relative_ok: 
     if name == "eval":
         return problems + local_problems(" ".join(args), ctx, depth + 1)
     if name in SHELLS or PYTHON.fullmatch(name):
-        flag = next((k for k, a in enumerate(args) if C_FLAG.fullmatch(a)), None)
+        flag = command_flag_index(name, args)
         if flag is not None:
             code = args[flag + 1] if flag + 1 < len(args) else ""
             rest = unverified(args[:flag] + args[flag + 2:])
