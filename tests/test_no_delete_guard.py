@@ -101,6 +101,11 @@ DENY = [
     "ssh %s \"r$''m -rf /mnt/user/x\"" % HOST,
     "echo \"<<EOF\"\nrm -rf /etc/guard-victim\nEOF",
     "# <<EOF\nrm -rf /etc/guard-victim\nEOF",
+    "ssh %s \"python3 -c 'import os; os.truncate(\\\"/mnt/user/x\\\", 0)'\"" % HOST,
+    "ssh %s \"r$'m' -rf /mnt/user/x\"" % HOST,
+    "rsync -a --delete /tmp/out/ '[::1]:/mnt/user/out/'",
+    "rsync -a --delete /tmp/out/ /Users/brentwilson/backup/",
+    "find /tmp/tree -execdir ./cleanup {} +",
     "D=$(mktemp -d); printf -v D /etc/guard-victim; rm -rf \"$D\"",
     "python3 -c \"import os; os.truncate('.claude/settings.json', 0)\"",
     "python3 -c \"from os import remove; remove('/etc/guard-victim')\"",
@@ -187,6 +192,8 @@ ALLOW = [
     "python3 -c \"import os; os.remove('/tmp/scratch')\"",
     "python3 -c \"import os; os.remove('/tmp/' 'scratch')\"",
     "python3 -c \"from os import path; print(path.join('a', 'b'))\"",
+    "python3 -c \"import os; os.truncate('/tmp/scratch', 0)\"",
+    "rsync -a /tmp/out/ /tmp/backup/",
     "python3 -X utf8 -c \"import os; os.remove('/tmp/scratch')\"",
     "python3 - <<'EOF'\nimport os\nos.remove('/tmp/a')\nEOF",
     "python3 - <<'EOF'\nGUARD = '.claude/scripts/no-delete-guard.py'\n"
@@ -262,7 +269,10 @@ class GuardDecisionTests(unittest.TestCase):
             os.symlink(str(SETTINGS), os.path.join(tmp, "guard-link"))
             danger = Path(tmp, "danger.py")
             danger.write_text("import os\nos.remove(target)\n")
-            for command in ("rm -f %s/job/*/passwd" % tmp,
+            danger_sh = Path(tmp, "danger.sh")
+            danger_sh.write_text("rm -rf /etc/guard-victim\n")
+            for command in ("< %s bash" % danger_sh,
+                            "rm -f %s/job/*/passwd" % tmp,
                             "find %s/job/* -name x -delete" % tmp,
                             "printf '{}' > %s/guard-link" % tmp,
                             "python3 -X -c %s" % danger):

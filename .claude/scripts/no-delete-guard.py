@@ -69,7 +69,8 @@ SELF = os.path.realpath(__file__)
 
 DELETE_WORD = r"(?<![\w.$-])(?:[\w.~/-]*/)?(?:rm|rmdir|unlink|shred|srm)(?![\w./-])"
 EMBEDDED_DELETE = re.compile(DELETE_WORD)
-PY_DELETE = re.compile(r"(?:\bos\.(?:remove|unlink|rmdir|removedirs)|\bshutil\.rmtree|\.(?:unlink|rmdir))\s*\(\s*([^),]*)")
+PY_DELETE = re.compile(r"(?:\bos\.(?:remove|unlink|rmdir|removedirs|truncate)|\bshutil\.rmtree|\.(?:unlink|rmdir))"
+                       r"\s*\(\s*([^),]*)")
 PY_DELETE_IMPORT = re.compile(r"\bfrom\s+(?:os|shutil|pathlib)\s+import\b[^\n]*?"
                               r"\b(?:remove|unlink|rmdir|removedirs|rmtree|truncate)\b")
 PY_MODULE_ALIAS = re.compile(r"\bimport\s+(os|shutil)\s+as\s+(\w+)")
@@ -77,7 +78,7 @@ PY_WRITE = re.compile(r"\bopen\s*\([^)]*['\"][rbt]*[wax+][rbt+]*['\"]|\.write_(?
                       r"|\bos\.(?:truncate|ftruncate|open|write)\s*\("
                       r"|\bos\.(?:replace|rename|chmod)\s*\(|\bshutil\.(?:copy\w*|move)\s*\(")
 PROTECTED = re.compile(r"(?:\.claude/(?:settings(?:\.local)?\.json|scripts/no-delete-guard\.py)|tests/test_no_delete_guard\.py)(?![\w.-])")
-REMOTE = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(?:ssh|scp|sftp)(?![\w./-])|\brsync\b[^\n;|&]*\s[\w.@-]+:")
+REMOTE = re.compile(r"(?<![\w.-])(?:[\w.~/-]*/)?(?:ssh|scp|sftp)(?![\w./-])|\brsync\b[^\n;|&]*\s['\"]?(?:\[[0-9A-Fa-f:.%]+\]|[\w.@-]+):|\brsync://")
 REMOTE_RULES = (
     ("delete command", re.compile(DELETE_WORD + r"|(?<![\w.-])truncate(?![\w.-])")),
     ("find -delete", re.compile(r"(?<![\w-])-delete(?![\w-])")),
@@ -285,10 +286,21 @@ def words(segment: str) -> list[str]:
 
 
 def strip_prefix(tokens: list[str]) -> list[str]:
-    i = 0
-    while i < len(tokens) and (tokens[i] in KEYWORDS or ASSIGNMENT.fullmatch(tokens[i])):
-        i += 1
-    return tokens[i:]
+    """Drop leading keywords and assignments; move leading redirections after the command word,
+    where they mean the same thing, so '< file bash' is read as 'bash < file'."""
+    i, moved = 0, []
+    while i < len(tokens):
+        token = tokens[i]
+        redirect = REDIRECTION.fullmatch(token)
+        if token in KEYWORDS or ASSIGNMENT.fullmatch(token):
+            i += 1
+        elif redirect and not token.startswith("<<"):
+            takes_target = not redirect.group(1) and i + 1 < len(tokens)
+            moved += tokens[i:i + 2] if takes_target else [token]
+            i += 2 if takes_target else 1
+        else:
+            break
+    return tokens[i:] + moved if i < len(tokens) else []
 
 
 def drop_redirections(tokens: list[str]) -> list[str]:
@@ -513,6 +525,9 @@ def find_problems(args: list[str], ctx: Context, safe: set[str], relative_ok: bo
                     problems.append("find %s deletes outside the allowed locations: %s" % (token, ", ".join(repr(b) for b in bad[:3])))
             elif not name or name in SHELLS or name in WRAPPERS or PYTHON.fullmatch(name) or name in ("eval", "find"):
                 problems.append("find %s runs %r, which the guard cannot verify" % (token, name or "nothing"))
+            elif token in ("-execdir", "-okdir") and not action[0].startswith("/"):
+                problems.append("find %s runs %r from each match's directory, which the guard cannot inspect"
+                                % (token, action[0]))
             else:
                 outside += action
                 problems += script_problems(action, ctx, relative_ok, depth)
@@ -632,6 +647,8 @@ def segment_problems(raw: list[str], ctx: Context, safe: set[str], relative_ok: 
         if bad:
             problems.append("%s outside the allowed locations: %s" % (name, ", ".join(repr(b) for b in bad[:3])))
         return problems
+    if name == "rsync" and any(re.fullmatch(r"--(?:del[\w-]*|remove-s[\w-]*)", a) for a in args):
+        return problems + ["rsync with a deletion option, which the guard cannot verify"]
     if name == "find":
         return problems + find_problems(args, ctx, safe, relative_ok, depth)
     if name == "eval":
@@ -670,9 +687,18 @@ def local_problems(text: str, ctx: Context, depth: int = 0) -> list[str]:
     return problems
 
 
+def ansi_c_value(body: str) -> str:
+    """The text a Bash $'...' fragment stands for; undecodable escapes are kept as written."""
+    try:
+        return body.encode("latin-1", "backslashreplace").decode("unicode_escape")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return body
+
+
 def remote_problems(text: str) -> list[str]:
     unquoted = re.sub(r"\$(?:''|\"\")", "", text)
-    variants = [text, unquoted, re.sub(r"[\"'\\]", "", unquoted)]
+    ansi = re.sub(r"\$'((?:[^'\\]|\\.)*)'", lambda m: ansi_c_value(m.group(1)), unquoted)
+    variants = [text, unquoted, ansi, re.sub(r"[\"'\\]", "", ansi)]
     if not any(REMOTE.search(v) for v in variants):
         return []
     problems = []
