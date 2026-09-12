@@ -97,4 +97,9 @@ One line per resolved review thread, newest last.
 - `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:342` `20ebd89` `PRRT_kwDOSJrgbc6hyHtV` PR #124 2026-09-12 — Heredoc discovery ignored the shell comment rule
 - `guard-tamper-surface` `.claude/scripts/no-delete-guard.py:73` `20ebd89` `PRRT_kwDOSJrgbc6hyHtW` PR #124 2026-09-12 — Descriptor and truncation APIs were missing from the tamper check
 - `literal-expression-not-evaluated` `.claude/scripts/no-delete-guard.py:71` `20ebd89` `PRRT_kwDOSJrgbc6hyHtX` PR #124 2026-09-12 — Deletions imported bare or aliased were invisible to a qualified-name match
+- `script-path-resolution` `.claude/scripts/no-delete-guard.py:518` `6f1deaf` `PRRT_kwDOSJrgbc6hyuvN` PR #124 2026-09-12 — find -execdir resolves a relative action beside each match, not in the caller
+- `path-qualified-command-match` `.claude/scripts/no-delete-guard.py:82` `6f1deaf` `PRRT_kwDOSJrgbc6hyuvP` PR #124 2026-09-12 — A module-qualified truncation call defeated the plain word match
+- `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:675` `6f1deaf` `PRRT_kwDOSJrgbc6hyuvR` PR #124 2026-09-12 — Non-empty ANSI-C quoted fragments hid an executable name
+- `remote-target-form-coverage` `.claude/scripts/no-delete-guard.py:80` `6f1deaf` `PRRT_kwDOSJrgbc6hyuvT` PR #124 2026-09-12 — A bracketed IPv6 rsync destination was not recognised as remote
+- `redirect-form-coverage` `.claude/scripts/no-delete-guard.py:629` `6f1deaf` `PRRT_kwDOSJrgbc6hyuvX` PR #124 2026-09-12 — A redirection before the command word hid the interpreter it feeds
 <!-- adb:hits:end -->
