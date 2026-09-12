@@ -50,6 +50,10 @@ Sweep each of these before opening a pull request.
 - `quoted-substitution-parsing` — Match command names on text with quote characters and backslashes removed as well as on the raw text, because the shell rejoins r""m and r\m; test each quoted spelling of a name the code matches.
 - `redirect-form-coverage` — Cover every redirect spelling when detecting writes: attached to the previous word, with a file descriptor number, with an ampersand, appending, and force-clobber; add a case per spelling rather than assuming whitespace separates the operator.
 - `shell-expansion-escape` — Check an operand as the shell will expand it, not as written: reject parent-directory segments anywhere, brace expansion, and anything after a glob metacharacter rather than validating only the static prefix; add a case per expansion form.
+- `execution-order-ignored` — Prove a value's safety from the statements that run before it, not from the text as a whole: treat every construct that can bind a name (assignment, printf -v, read, mapfile, for, eval) as a rebinding, and treat a conditional or grouped assignment as unproven; add a case per binding form.
+- `guard-tamper-surface` — When protecting a file, enumerate every write path to it rather than the obvious one: redirects, copying and moving commands, in-place editors, permission changes, version-control restores, and language file APIs including descriptor and truncation calls; add a case per path.
+- `literal-expression-not-evaluated` — Evaluate an expression to its runtime value before validating it: concatenated literals, escapes and aliases must resolve first, and anything that will not evaluate is refused rather than matched as written.
+- `path-normalization-before-match` — Compare paths after normalising and resolving them, never by spelling: collapse redundant separators and dot segments and follow symlinks before matching, so an alias for a protected path is recognised.
 <!-- adb:checklist:end -->
 
 ## Hits
@@ -86,4 +90,11 @@ One line per resolved review thread, newest last.
 - `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:584` `6588141` `PRRT_kwDOSJrgbc6hpxy3` PR #124 2026-09-12 — Empty-quote forms survived normalisation and hid an executable name
 - `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:325` `6588141` `PRRT_kwDOSJrgbc6hpxy7` PR #124 2026-09-12 — Heredoc operators were located without quote awareness, hiding later lines
 - `redirect-form-coverage` `.claude/scripts/no-delete-guard.py:489` `6588141` `PRRT_kwDOSJrgbc6hpxzA` PR #124 2026-09-12 — A program supplied by input redirection was never inspected
+- `shell-expansion-escape` `.claude/scripts/no-delete-guard.py:126` `20ebd89` `PRRT_kwDOSJrgbc6hyHtN` PR #124 2026-09-12 — A glob could match a symlinked directory that resolves outside the roots
+- `path-normalization-before-match` `.claude/scripts/no-delete-guard.py:405` `20ebd89` `PRRT_kwDOSJrgbc6hyHtP` PR #124 2026-09-12 — A symlink pointing at a guard file was not resolved before matching
+- `execution-order-ignored` `.claude/scripts/no-delete-guard.py:440` `20ebd89` `PRRT_kwDOSJrgbc6hyHtS` PR #124 2026-09-12 — printf -v reassigned a trusted variable without an equals sign
+- `wrapper-hides-command` `.claude/scripts/no-delete-guard.py:592` `20ebd89` `PRRT_kwDOSJrgbc6hyHtU` PR #124 2026-09-12 — An option value that looked like the code flag shadowed the real script
+- `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:342` `20ebd89` `PRRT_kwDOSJrgbc6hyHtV` PR #124 2026-09-12 — Heredoc discovery ignored the shell comment rule
+- `guard-tamper-surface` `.claude/scripts/no-delete-guard.py:73` `20ebd89` `PRRT_kwDOSJrgbc6hyHtW` PR #124 2026-09-12 — Descriptor and truncation APIs were missing from the tamper check
+- `literal-expression-not-evaluated` `.claude/scripts/no-delete-guard.py:71` `20ebd89` `PRRT_kwDOSJrgbc6hyHtX` PR #124 2026-09-12 — Deletions imported bare or aliased were invisible to a qualified-name match
 <!-- adb:hits:end -->
