@@ -49,6 +49,7 @@ Sweep each of these before opening a pull request.
 - `combined-flag-parsing` — Never test a flag by equality: single-letter options combine (-lc, -xc, -Bc) and long options abbreviate, so match flag clusters by the letters they contain and long options by prefix; add a combined-form case for every flag the code branches on.
 - `quoted-substitution-parsing` — Match command names on text with quote characters and backslashes removed as well as on the raw text, because the shell rejoins r""m and r\m; test each quoted spelling of a name the code matches.
 - `redirect-form-coverage` — Cover every redirect spelling when detecting writes: attached to the previous word, with a file descriptor number, with an ampersand, appending, and force-clobber; add a case per spelling rather than assuming whitespace separates the operator.
+- `shell-expansion-escape` — Check an operand as the shell will expand it, not as written: reject parent-directory segments anywhere, brace expansion, and anything after a glob metacharacter rather than validating only the static prefix; add a case per expansion form.
 <!-- adb:checklist:end -->
 
 ## Hits
@@ -79,4 +80,10 @@ One line per resolved review thread, newest last.
 - `option-abbreviation` `.claude/scripts/no-delete-guard.py:60` `761725c` `PRRT_kwDOSJrgbc6hpacV` PR #124 2026-09-11 — Abbreviated long options defeated an exact option match
 - `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:500` `761725c` `PRRT_kwDOSJrgbc6hpacc` PR #124 2026-09-11 — Quote characters split an executable name that the remote shell rejoins
 - `script-path-resolution` `.claude/scripts/no-delete-guard.py:440` `761725c` `PRRT_kwDOSJrgbc6hpach` PR #124 2026-09-11 — File name overrode the interpreter when classifying a script
+- `shell-expansion-escape` `.claude/scripts/no-delete-guard.py:125` `6588141` `PRRT_kwDOSJrgbc6hpxys` PR #124 2026-09-12 — Only a glob's static prefix was checked, so the expansion could leave the roots
+- `path-normalization-before-match` `.claude/scripts/no-delete-guard.py:73` `6588141` `PRRT_kwDOSJrgbc6hpxyx` PR #124 2026-09-12 — Guard files were matched by spelling, so equivalent paths slipped past
+- `literal-expression-not-evaluated` `.claude/scripts/no-delete-guard.py:364` `6588141` `PRRT_kwDOSJrgbc6hpxy1` PR #124 2026-09-12 — Adjacent string literals were validated as written, not as concatenated
+- `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:584` `6588141` `PRRT_kwDOSJrgbc6hpxy3` PR #124 2026-09-12 — Empty-quote forms survived normalisation and hid an executable name
+- `quoted-substitution-parsing` `.claude/scripts/no-delete-guard.py:325` `6588141` `PRRT_kwDOSJrgbc6hpxy7` PR #124 2026-09-12 — Heredoc operators were located without quote awareness, hiding later lines
+- `redirect-form-coverage` `.claude/scripts/no-delete-guard.py:489` `6588141` `PRRT_kwDOSJrgbc6hpxzA` PR #124 2026-09-12 — A program supplied by input redirection was never inspected
 <!-- adb:hits:end -->
