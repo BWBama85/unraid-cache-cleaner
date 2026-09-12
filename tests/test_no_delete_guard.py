@@ -93,6 +93,13 @@ DENY = [
     "echo \"$(rm -rf /etc/guard-victim)\"",
     "x=\"$(rm -rf /etc/guard-victim)\"",
     "x=`rm -rf /etc/guard-victim`",
+    "rm -f /tmp/guard-dir*/../../etc/guard-victim",
+    "find /tmp/work/.. -name '*.log' -delete",
+    "cp /tmp/replacement .claude/./settings.json",
+    "printf x > .claude//scripts/no-delete-guard.py",
+    "python3 -c \"import os; os.remove('/tmp/' '../etc/guard-victim')\"",
+    "ssh %s \"r$''m -rf /mnt/user/x\"" % HOST,
+    "echo \"<<EOF\"\nrm -rf /etc/guard-victim\nEOF",
     "grep -rn 'rm -rf' docs/",
     "echo \"x; rm -rf /\"",
     "bash -c 'rm -rf /Users/brentwilson/Documents'",
@@ -172,6 +179,7 @@ ALLOW = [
     "python3 -m py_compile .claude/scripts/no-delete-guard.py",
     "python3 -m unittest discover -s tests -v",
     "python3 -c \"import os; os.remove('/tmp/scratch')\"",
+    "python3 -c \"import os; os.remove('/tmp/' 'scratch')\"",
     "python3 - <<'EOF'\nimport os\nos.remove('/tmp/a')\nEOF",
     "python3 - <<'EOF'\nGUARD = '.claude/scripts/no-delete-guard.py'\n"
     "with open('/tmp/out.txt', 'w') as handle:\n    handle.write(GUARD)\nEOF",
@@ -230,6 +238,7 @@ class GuardDecisionTests(unittest.TestCase):
             big = Path(tmp, "big.sh")
             big.write_text("echo ok\n" * 300000)
             for command in ("find %s -name x -exec %s {} +" % (tmp, danger),
+                            "bash < %s" % danger,
                             "bash -O extglob %s" % danger,
                             "bash --unknown-option %s" % danger,
                             "bash %s" % shell_named_py,

@@ -37,6 +37,7 @@ cwd, else the working directory.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -132,7 +133,7 @@ def operand_ok(operand: str, ctx: Context, safe_vars: set[str], relative_ok: boo
     if var:
         rest = var.group(3) or ""
         return (var.group(1) or var.group(2)) in safe_vars and not re.search(r"[$`{}]|(^|/)\.\.(/|$)", rest)
-    if any(c in operand for c in "$`~{}"):
+    if any(c in operand for c in "$`~{}") or re.search(r"(^|/)\.\.(/|$)", operand):
         return False
     if operand.startswith("/"):
         return inside(operand, ctx.temp_roots) or inside(operand, ctx.state_roots)
@@ -317,26 +318,52 @@ def heredoc_consumer(prefix: str) -> str:
     return "python" if any(t.endswith(".py") for t in targets) else "data"
 
 
+def heredoc_operators(text: str) -> list[tuple[int, int, str, bool]]:
+    """(start, end, delimiter, strip tabs) for each heredoc operator that is not inside quotes."""
+    found, quote, i = [], None, 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(text):
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch == "\\" and i + 1 < len(text):
+            i += 2
+            continue
+        elif ch == "<" and text[i + 1:i + 2] == "<":
+            m = HEREDOC.match(text, i)
+            if m:
+                found.append((m.start(), m.end(), m.group(2), text[i:i + 3] == "<<-"))
+                i = m.end()
+                continue
+        i += 1
+    return found
+
+
 def split_heredocs(text: str) -> tuple[str, list[str], list[str]]:
     """Return (shell text, shell heredoc bodies, Python heredoc bodies). Data bodies are dropped;
     a marker with no terminator line is not a heredoc."""
     shell, shell_bodies, python_bodies, pos = [], [], [], 0
-    while True:
-        m = HEREDOC.search(text, pos)
-        if not m:
-            break
-        line_end = text.find("\n", m.end())
+    for start, end, delimiter, strip_tabs in heredoc_operators(text):
+        if start < pos:
+            continue
+        line_end = text.find("\n", end)
         if line_end < 0:
             break
         shell.append(text[pos:line_end + 1])
-        line_start = max(pos, text.rfind("\n", 0, m.start()) + 1)
-        kind = heredoc_consumer(text[line_start:m.start()])
-        strip_tabs = text[m.start():m.start() + 3] == "<<-"
+        line_start = max(pos, text.rfind("\n", 0, start) + 1)
+        kind = heredoc_consumer(text[line_start:start])
         lines = text[line_end + 1:].split("\n")
         consumed = line_end + 1
         for i, line in enumerate(lines):
             consumed += len(line) + 1
-            if (line.lstrip("\t") if strip_tabs else line) == m.group(2):
+            if (line.lstrip("\t") if strip_tabs else line) == delimiter:
                 body = "\n".join(lines[:i])
                 if kind == "shell":
                     shell_bodies.append(body)
@@ -360,8 +387,11 @@ def unverified(tokens: list[str]) -> list[str]:
 def python_problems(code: str, ctx: Context) -> list[str]:
     problems = []
     for m in PY_DELETE.finditer(code):
-        literal = re.fullmatch(r"[rbuRBU]?(['\"])(.*)\1", m.group(1).strip())
-        if not literal or not operand_ok(literal.group(2), ctx, set(), False):
+        try:
+            value = ast.literal_eval(m.group(1).strip())
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            value = None
+        if not isinstance(value, str) or not operand_ok(value, ctx, set(), False):
             problems.append("a Python deletion the guard cannot verify (%r)" % m.group(0)[:60])
     for line in code.splitlines():
         if PROTECTED.search(line) and PY_WRITE.search(line):
@@ -370,16 +400,21 @@ def python_problems(code: str, ctx: Context) -> list[str]:
     return problems
 
 
+def protected_path(token: str) -> bool:
+    """A guard file by any spelling: .claude/./settings.json and .claude//scripts/... normalise to one."""
+    return any(PROTECTED.search(form) for form in (token, os.path.normpath(token)))
+
+
 def tamper_problems(raw: list[str]) -> list[str]:
     """Refuse writes to the guard's own files: redirects, writing commands, in-place edits, git restores."""
-    if not any(PROTECTED.search(t) for t in raw):
+    if not any(protected_path(t) for t in raw):
         return []
     names = [base(t) for t in raw]
     for k, token in enumerate(raw):
         redirect = REDIRECTION.fullmatch(token)
         if redirect and ">" in token:
             target = redirect.group(1) or (raw[k + 1] if k + 1 < len(raw) else "")
-            if PROTECTED.search(target):
+            if protected_path(target):
                 return ["a redirect onto a guard file (%r)" % target[:60]]
     if any(n in WRITERS for n in names):
         return ["a write to a guard file"]
@@ -486,8 +521,15 @@ def interpreter_script(name: str, args: list[str]) -> str | None:
 def script_problems(tokens: list[str], ctx: Context, relative_ok: bool, depth: int) -> list[str]:
     name = base(tokens[0])
     if INTERPRETER.fullmatch(name):
+        stdin_source = None
+        for k, token in enumerate(tokens[1:], 1):
+            redirect = re.fullmatch(r"(?:\d+)?<(?!<)(.*)", token)
+            if redirect:
+                stdin_source = redirect.group(1) or (tokens[k + 1] if k + 1 < len(tokens) else "")
         args = drop_redirections(tokens[1:])
-        if name in ("source", "."):
+        if stdin_source:
+            script = stdin_source
+        elif name in ("source", "."):
             script = args[0] if args else None
         else:
             try:
@@ -581,7 +623,8 @@ def local_problems(text: str, ctx: Context, depth: int = 0) -> list[str]:
 
 
 def remote_problems(text: str) -> list[str]:
-    variants = [text, re.sub(r"[\"'\\]", "", text)]
+    unquoted = re.sub(r"\$(?:''|\"\")", "", text)
+    variants = [text, unquoted, re.sub(r"[\"'\\]", "", unquoted)]
     if not any(REMOTE.search(v) for v in variants):
         return []
     problems = []
