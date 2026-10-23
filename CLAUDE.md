@@ -35,6 +35,14 @@ Tests live in `tests/` and run with `unittest`.
 - **Safety-first / fail-closed:** default to the safe mode (`DRY_RUN=true`; the Plex report is **read-only**). Missing credentials or mounts should stop with a clear message, not guess.
 - **Sparse comments** — code is self-documenting; comment only subtle logic. Full type hints; `from __future__ import annotations`.
 
+## Deletion rule — enforced, no exceptions
+
+- **Never delete anything on the Unraid server from a shell.** In any command that reaches the server (`ssh`, `scp`, `sftp`, `rsync host:`) there is no `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `find -delete`, `rsync --delete`, `docker rmi`/`prune`, Python `os.remove`/`shutil.rmtree`, `mv`/`cp` without `-n`, or `>` redirect onto a file. Whatever must go is removed through the API of the software that owns it: Sonarr/Radarr for media files, qBittorrent for torrents and their data, Plex for library items and downloaded subtitles.
+- **Locally, `rm`/`rmdir`/`unlink`/`shred` and `find -delete` may only name:** a literal absolute path inside `/tmp`, `/private/tmp`, `/var/folders` or `$TMPDIR`; a variable assigned from `mktemp` into one of those in the same command (and never reassigned); or a literal path inside this project's gitignored `.claude/state/` (relative paths only when the command doesn't `cd`). No other variables, `~`, relative paths, or `xargs`.
+- **Plan server work so nothing is left to clean up:** stream results back over SSH into local `/tmp`, and bring replacement media in through the owning app's import instead of swapping files by hand.
+- **Enforced by** the `PreToolUse` hook `.claude/scripts/no-delete-guard.py` (exit 2 refuses the call before permission rules run), guarded by `tests/test_no_delete_guard.py`. `permissions.ask` rules make Claude Code prompt before any edit to the guard, its test or `.claude/settings.json`. A command that reaches a remote host is refused if a deletion token appears *anywhere* in it or in a script it executes, so keep local temp cleanup in a separate command. Scripts run from `~/.claude/scripts/` or `.claude/scripts/` get only that remote check; any other script gets the full check.
+- **Limits:** it reads command text; it is not a sandbox. It cannot see commands assembled at runtime, or deletions by a local Python script that never touches the network. The command runs anyway if the hook times out or can't start (for example, no `python3`), the hook loads only for sessions started at the repo root, and `bypassPermissions` mode skips the edit prompts. In remote mode it scans heredoc data too, so a heredoc commit message that names a remote client can be refused; pass long messages with `git commit -F` and a message file. Five review rounds on #124 fixed 41 bypasses and findings kept arriving, so enforcement that does not depend on command text (the OS sandbox locally, a restricted key on the server) is tracked in #125.
+
 ## Dev commands
 
 ```bash
@@ -64,8 +72,9 @@ There is **no** typecheck or lint tooling (stdlib-only, minimal). The Stop-hook 
 
 ## Agent workflow — skills & gates (ported from the `getrich` project)
 
-Two Stop hooks are wired in `.claude/settings.json`:
+Hooks wired in `.claude/settings.json`:
 
+- **`.claude/scripts/no-delete-guard.py`** (`PreToolUse`, `Bash`) — denies deletions that break the Deletion rule above; fails closed.
 - **`.claude/scripts/precommit-gate.sh`** — blocks ending a turn on a feature branch if `compileall`/`unittest` fail (no-op on `main` and on docs-only/`.claude`-only turns).
 - **`.claude/scripts/implement-issue-gate.sh`** — during a `/implement-issue` run, keeps the turn going until a PR is open or the run is declared blocked. State lives in `.claude/state/` (gitignored).
 

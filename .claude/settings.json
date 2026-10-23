@@ -1,6 +1,20 @@
 {
 	"$schema": "https://json.schemastore.org/claude-code-settings.json",
 	"hooks": {
+		"PreToolUse": [
+			{
+				"matcher": "Bash",
+				"hooks": [
+					{
+						"type": "command",
+						"command": ".claude/scripts/no-delete-guard.py",
+						"args": [],
+						"timeout": 15,
+						"statusMessage": "Checking the project deletion rule"
+					}
+				]
+			}
+		],
 		"Stop": [
 			{
 				"hooks": [
@@ -32,7 +46,10 @@
 			"Bash(git tag --message:*)",
 			"Bash(git tag -s:*)",
 			"Bash(git tag --sign:*)",
-			"Bash(gh release create:*)"
+			"Bash(gh release create:*)",
+			"Edit(/.claude/scripts/no-delete-guard.py)",
+			"Edit(/tests/test_no_delete_guard.py)",
+			"Edit(/.claude/settings.json)"
 		],
 		"allow": [
 			"Bash(python3 -m unittest*)",

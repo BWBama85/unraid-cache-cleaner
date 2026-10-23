@@ -16,6 +16,9 @@ of the read-only preflight/inspection commands the release skill also runs do.
 They do NOT prove Claude Code's real runtime precedence (that is the manual
 verification noted in the issue); they DO fail loudly if a rule is dropped or a
 release write is reworded out from under its rule.
+
+The ask list also holds ``Edit(path)`` rules (the deletion-guard files, #123);
+only the ``Bash(...)`` rules take part in command matching.
 """
 
 from __future__ import annotations
@@ -54,19 +57,23 @@ class ReleaseAskRulesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
         self.ask_rules = self.settings.get("permissions", {}).get("ask", [])
+        self.bash_ask_rules = [rule for rule in self.ask_rules if rule.startswith("Bash(")]
 
     def test_the_three_ask_rules_are_present(self) -> None:
         for rule in _EXPECTED_ASK_RULES:
             self.assertIn(rule, self.ask_rules, f"missing release ask rule: {rule}")
 
-    def test_ask_rules_are_valid_bash_prefix_patterns(self) -> None:
+    def test_ask_rules_are_valid_patterns(self) -> None:
         # A malformed pattern (e.g. a missing ``:*``) would silently never match and
-        # re-open the hole, so pin the shape.
+        # re-open the hole, so pin the shape of every Bash rule and the Edit(path) form.
         for rule in self.ask_rules:
-            self.assertTrue(
-                rule.startswith("Bash(") and rule.endswith(":*)"),
-                f"ask rule is not a Bash(prefix:*) pattern: {rule}",
-            )
+            if rule.startswith("Bash("):
+                self.assertTrue(rule.endswith(":*)"), f"ask rule is not a Bash(prefix:*) pattern: {rule}")
+            else:
+                self.assertTrue(
+                    rule.startswith("Edit(") and rule.endswith(")") and len(rule) > len("Edit()"),
+                    f"ask rule is neither Bash(prefix:*) nor Edit(path): {rule}",
+                )
 
     def test_each_release_write_is_caught_by_an_ask_rule(self) -> None:
         # The realized commands the release skill runs (VERSION substituted).
@@ -98,7 +105,7 @@ class ReleaseAskRulesTests(unittest.TestCase):
         ]
         for command in variants:
             self.assertTrue(
-                any(_matches(rule, command) for rule in self.ask_rules),
+                any(_matches(rule, command) for rule in self.bash_ask_rules),
                 f"no ask rule gates annotated-tag creation: {command!r}",
             )
 
@@ -125,7 +132,7 @@ class ReleaseAskRulesTests(unittest.TestCase):
             "gh label create release-blocker --color FF0000",
         ]
         for command in read_only:
-            for rule in self.ask_rules:
+            for rule in self.bash_ask_rules:
                 self.assertFalse(
                     _matches(rule, command),
                     f"ask rule {rule!r} would over-prompt read-only {command!r}",

@@ -1764,6 +1764,7 @@ class CsrfHardeningHttpTests(unittest.TestCase):
         config = _config(
             web_actions_dry_run=True,
             web_bind_address="127.0.0.1",  # loopback
+            web_port=0,  # ephemeral, like every other server test: a fixed port collides
             web_allowed_origins=("https://ext.example",),
         )
         service = _service(payload, config=config)
